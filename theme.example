@@ -35,3 +35,15 @@ bluetooth_off       = #585b70
 # обои и питание
 wallpaper = #cdd6f4
 power     = #f38ba8
+
+# меню Wi-Fi (zwifi)
+menu_background  = #1e1e2ef2
+menu_backdrop    = #00000059    # затемнение экрана вокруг меню
+menu_text        = #cdd6f4
+menu_muted       = #7f849c
+menu_accent      = #89b4fa
+menu_accent_text = #1e1e2e      # текст на синей кнопке
+menu_field       = #313244      # поля ввода и вторичные кнопки
+menu_border      = #45475a
+menu_hover       = #ffffff14
+menu_error       = #f38ba8

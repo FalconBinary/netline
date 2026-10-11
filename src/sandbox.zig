@@ -8,19 +8,26 @@
 //!    TCP запрещён, сигналы и абстрактные unix-сокеты — только внутри песочницы.
 //! 3. seccomp-bpf: белый список системных вызовов. Нет exec, fork, socket, connect,
 //!    ptrace, mprotect; mmap без PROT_EXEC; openat только на чтение; ioctl — только
-//!    HCIGETDEVINFO. Всё остальное — немедленное завершение процесса.
+//!    явно разрешённый запрос. Всё остальное — немедленное завершение процесса.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
-const status = @import("status.zig");
 
-pub fn apply(read_paths: []const [:0]const u8) void {
+/// Что ещё разрешить процессу (у панели и меню Wi‑Fi немного разные нужды).
+pub const Opts = struct {
+    /// единственный разрешённый ioctl (null — никаких)
+    ioctl: ?u32 = null,
+    /// дополнительные системные вызовы без проверки аргументов
+    extra: []const linux.SYS = &.{},
+};
+
+pub fn apply(read_paths: []const [:0]const u8, comptime opts: Opts) void {
     _ = sys.prctl(38, 1, 0) catch sys.log("PR_SET_NO_NEW_PRIVS не удался", .{}); // PR_SET_NO_NEW_PRIVS
     _ = sys.prctl(4, 0, 0) catch {}; // PR_SET_DUMPABLE = 0: нельзя подключиться ptrace'ом и снять дамп
     landlock(read_paths);
-    seccomp();
+    seccomp(opts);
 }
 
 // ================================================================= Landlock
@@ -120,7 +127,7 @@ fn arg(i: u32) u32 {
     return 16 + 8 * i; // seccomp_data.args[i], младшие 32 бита (little-endian)
 }
 
-fn seccomp() void {
+fn seccomp(comptime opts: Opts) void {
     const arch = audit_arch orelse {
         sys.log("seccomp: архитектура не поддерживается фильтром", .{});
         return;
@@ -142,7 +149,7 @@ fn seccomp() void {
         p[n] = .{ .code = JGE, .k = 0x40000000, .t = .kill }; // x32 ABI
         n += 1;
     }
-    inline for (simple) |s| {
+    inline for (simple ++ opts.extra) |s| {
         p[n] = .{ .code = JEQ, .k = nr(s), .t = .allow };
         n += 1;
     }
@@ -167,11 +174,11 @@ fn seccomp() void {
     p[n] = .{ .code = JEQ, .k = 0, .t = .allow, .f = .kill };
     n += 1;
 
-    // ioctl: только HCIGETDEVINFO (состояние Bluetooth)
+    // ioctl: только один разрешённый запрос (у панели — HCIGETDEVINFO для Bluetooth)
     at.set(.ioctl, n);
     p[n] = .{ .code = LD_W_ABS, .k = arg(1) };
     n += 1;
-    p[n] = .{ .code = JEQ, .k = status.HCIGETDEVINFO, .t = .allow, .f = .kill };
+    p[n] = .{ .code = JEQ, .k = opts.ioctl orelse 0xffffffff, .t = .allow, .f = .kill };
     n += 1;
 
     // openat: только на чтение

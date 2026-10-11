@@ -25,6 +25,7 @@ pub fn start(cmds: []const ?[*:0]const u8) bool {
     };
     if (pid == 0) {
         sys.close(pair[0]);
+        sys.prependExeDirToPath(); // zwifi рядом с zpanel найдётся без настройки PATH
         serve(pair[1], cmds);
     }
     sys.close(pair[1]);

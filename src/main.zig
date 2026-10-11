@@ -181,7 +181,7 @@ pub fn main() void {
 
     if (cfg.sandbox) {
         const paths = [_][:0]const u8{ "/sys", "/proc", "/usr/share/zoneinfo", "/etc/localtime", tz.path, theme.dir };
-        sandbox.apply(&paths);
+        sandbox.apply(&paths, .{ .ioctl = status.HCIGETDEVINFO });
     }
 
     while (true) {

@@ -86,6 +86,17 @@ pub const Theme = struct {
     // обои и питание
     wallpaper: u32,
     power: u32,
+    // меню Wi‑Fi (zwifi)
+    menu_background: u32,
+    menu_backdrop: u32, // затемнение экрана вокруг меню
+    menu_text: u32,
+    menu_muted: u32,
+    menu_accent: u32,
+    menu_accent_text: u32, // текст на акцентной кнопке
+    menu_field: u32, // поля ввода и вторичные кнопки
+    menu_border: u32,
+    menu_hover: u32,
+    menu_error: u32,
 };
 
 pub const theme = Theme{
@@ -107,7 +118,35 @@ pub const theme = Theme{
     .bluetooth_off = hex("#585b70"),
     .wallpaper = hex("#cdd6f4"),
     .power = hex("#f38ba8"),
+    .menu_background = hex("#1e1e2ef2"),
+    .menu_backdrop = hex("#00000059"),
+    .menu_text = hex("#cdd6f4"),
+    .menu_muted = hex("#7f849c"),
+    .menu_accent = hex("#89b4fa"),
+    .menu_accent_text = hex("#1e1e2e"),
+    .menu_field = hex("#313244"),
+    .menu_border = hex("#45475a"),
+    .menu_hover = hex("#ffffff14"),
+    .menu_error = hex("#f38ba8"),
 };
+
+// ---------------------------------------------------------------- меню Wi‑Fi (zwifi)
+
+/// Шрифты TrueType (.ttf, контуры glyf) — берётся первый найденный.
+/// CFF/OTF не поддерживаются. Вставьте свой путь первой строкой.
+pub const font_paths = [_][]const u8{
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf", // Arch
+    "/usr/share/fonts/TTF/DejaVuSans.ttf", // Arch
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", // Debian/Ubuntu
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // Debian/Ubuntu
+    "/usr/share/fonts/google-noto/NotoSans-Regular.ttf", // Fedora
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", // Fedora
+    "/usr/share/fonts/TTF/Inter-Regular.ttf",
+};
+pub const menu_width: u32 = 400;
+pub const menu_height: u32 = 500;
+pub const menu_radius: f32 = 16;
+pub const menu_font_size: f32 = 14;
 
 // ---------------------------------------------------------------- действия
 // Команды выполняются через /bin/sh -c процессом-брокером. Сама панель запускать
@@ -130,26 +169,12 @@ pub const launcher = Action{
 
 pub const clock = Action{};
 
-pub const wifi = Action{ .left = wifi_menu, .right = wifi_toggle };
+pub const wifi = Action{ .left = "zwifi", .right = wifi_toggle };
 pub const bluetooth = Action{ .left = bt_menu, .right = bt_toggle };
 pub const wallpaper = Action{ .left = wall_random, .right = wall_pick };
 pub const power = Action{ .left = power_menu, .right = lock_cmd };
 
-// Wi‑Fi: список сетей через nmcli → rofi; пароль спрашивается, только если он нужен.
-// Имена сетей приходят из эфира, поэтому везде в кавычках.
-const wifi_menu =
-    \\list=$(nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list --rescan auto 2>/dev/null |
-    \\  awk -F: '{ s=$0; sub(/^[^:]*:[^:]*:/, "", s); gsub(/\\:/, ":", s)
-    \\             if (s != "" && !seen[s]++) printf "%s %3d%%  %s\n", ($1 == "*" ? "*" : " "), $2, s }')
-    \\[ -n "$list" ] || exit 0
-    \\sel=$(printf '%s\n' "$list" | rofi -dmenu -i -p wifi) || exit 0
-    \\ssid=${sel#*%  }
-    \\nmcli dev wifi connect "$ssid" >/dev/null 2>&1 || {
-    \\  pass=$(rofi -dmenu -password -p "$ssid") || exit 0
-    \\  nmcli dev wifi connect "$ssid" password "$pass"
-    \\}
-;
-
+// Wi‑Fi: ЛКМ — своё меню zwifi (см. src/wifi.zig), ПКМ — включить/выключить радио.
 const wifi_toggle =
     \\if [ "$(nmcli radio wifi)" = enabled ]; then nmcli radio wifi off; else nmcli radio wifi on; fi
 ;

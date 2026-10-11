@@ -236,6 +236,70 @@ pub fn recvmsgFd(fd: i32, buf: []u8, out_fd: *i32) Error!usize {
     return n;
 }
 
+/// recvmsg, собирающий до out_fds.len дескрипторов (лишние закрываются).
+pub fn recvmsgFds(fd: i32, buf: []u8, out_fds: []i32, nfds: *usize) Error!usize {
+    nfds.* = 0;
+    const iov = [1]Iovec{.{ .base = buf.ptr, .len = buf.len }};
+    var cbuf: [CMSG_HDR + 4 * 16]u8 align(8) = [_]u8{0} ** (CMSG_HDR + 4 * 16);
+    var msg = Msghdr{ .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len };
+    const MSG_CMSG_CLOEXEC = 0x40000000;
+    const n = try check(linux.syscall3(.recvmsg, ufd(fd), @intFromPtr(&msg), MSG_CMSG_CLOEXEC));
+    var off: usize = 0;
+    while (off + CMSG_HDR <= msg.controllen and off + CMSG_HDR <= cbuf.len) {
+        const len = std.mem.readInt(usize, cbuf[off..][0..@sizeOf(usize)], .little);
+        const level = std.mem.readInt(i32, cbuf[off + @sizeOf(usize) ..][0..4], .little);
+        const kind = std.mem.readInt(i32, cbuf[off + @sizeOf(usize) + 4 ..][0..4], .little);
+        if (len < CMSG_HDR or off + len > cbuf.len) break;
+        if (level == 1 and kind == 1) {
+            var p = off + CMSG_HDR;
+            while (p + 4 <= off + len) : (p += 4) {
+                const f = std.mem.readInt(i32, cbuf[p..][0..4], .little);
+                if (nfds.* < out_fds.len) {
+                    out_fds[nfds.*] = f;
+                    nfds.* += 1;
+                } else close(f);
+            }
+        }
+        off += (len + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
+    }
+    return n;
+}
+
+pub fn pipe() Error![2]i32 {
+    var fds: [2]i32 = .{ -1, -1 };
+    _ = try check(linux.syscall2(.pipe2, @intFromPtr(&fds), O_CLOEXEC));
+    return fds;
+}
+
+const SockaddrAbs = extern struct { family: u16, path: [108]u8 };
+
+fn abstractAddr(name: []const u8, out: *SockaddrAbs) usize {
+    out.* = .{ .family = 1, .path = [_]u8{0} ** 108 };
+    const k = @min(name.len, 100);
+    @memcpy(out.path[1 .. 1 + k], name[0..k]); // path[0] = 0 — абстрактное имя
+    return 2 + 1 + k;
+}
+
+/// Слушающий сокет в абстрактном пространстве имён (без файла на диске).
+pub fn listenAbstract(name: []const u8) Error!i32 {
+    var addr: SockaddrAbs = undefined;
+    const len = abstractAddr(name, &addr);
+    const fd = try socket(1, 1, 0);
+    errdefer close(fd);
+    _ = try check(linux.syscall3(.bind, ufd(fd), @intFromPtr(&addr), len));
+    _ = try check(linux.syscall2(.listen, ufd(fd), 1));
+    return fd;
+}
+
+pub fn connectAbstract(name: []const u8) bool {
+    var addr: SockaddrAbs = undefined;
+    const len = abstractAddr(name, &addr);
+    const fd = socket(1, 1, 0) catch return false;
+    defer close(fd);
+    _ = check(linux.syscall3(.connect, ufd(fd), @intFromPtr(&addr), len)) catch return false;
+    return true;
+}
+
 pub fn ioctl(fd: i32, req: usize, arg: usize) Error!usize {
     return check(linux.syscall3(.ioctl, ufd(fd), req, arg));
 }
@@ -255,6 +319,16 @@ pub fn mmap(len: usize, fd: i32) Error![*]u8 {
     // PROT_READ|PROT_WRITE, MAP_SHARED
     const rc = try check(linux.syscall6(.mmap, 0, len, 3, 1, ufd(fd), 0));
     return @ptrFromInt(rc);
+}
+
+/// Только чтение, MAP_PRIVATE (шрифты, keymap от композитора).
+pub fn mmapRead(len: usize, fd: i32) Error![*]const u8 {
+    const rc = try check(linux.syscall6(.mmap, 0, len, 1, 2, ufd(fd), 0));
+    return @ptrFromInt(rc);
+}
+
+pub fn fileSize(fd: i32) Error!usize {
+    return check(linux.syscall3(.lseek, ufd(fd), 0, 2)); // SEEK_END
 }
 
 pub fn munmap(ptr: [*]u8, len: usize) void {
@@ -301,6 +375,16 @@ pub fn timerfdArm(fd: i32, flags: usize, value_s: i64, interval_s: u32) Error!vo
         .value = .{ .sec = @intCast(value_s), .nsec = 0 },
     };
     _ = try check(linux.syscall4(.timerfd_settime, ufd(fd), flags, @intFromPtr(&its), 0));
+}
+
+/// Взвести монотонный таймер: первое срабатывание через first_ms, затем каждые every_ms (0 — один раз).
+pub fn timerfdArmMs(fd: i32, first_ms: u32, every_ms: u32) void {
+    const Its = extern struct { interval: Timespec, value: Timespec };
+    const its = Its{
+        .interval = .{ .sec = every_ms / 1000, .nsec = @as(isize, every_ms % 1000) * 1_000_000 },
+        .value = .{ .sec = first_ms / 1000, .nsec = @as(isize, first_ms % 1000) * 1_000_000 },
+    };
+    _ = linux.syscall4(.timerfd_settime, ufd(fd), 0, @intFromPtr(&its), 0);
 }
 
 // ---------------------------------------------------------------- inotify
@@ -381,6 +465,30 @@ pub fn initEnv() void {
         env_count += 1;
     }
     env_ptrs[env_count] = null;
+}
+
+var path_env: [4096]u8 = undefined;
+
+/// Добавить папку исполняемого файла в начало PATH (для дочерних процессов).
+pub fn prependExeDirToPath() void {
+    var exe: [512]u8 = undefined;
+    const rc = linux.syscall4(.readlinkat, ufd(AT_FDCWD), @intFromPtr("/proc/self/exe"), @intFromPtr(&exe), exe.len);
+    const n = check(rc) catch return;
+    const dir_end = std.mem.lastIndexOfScalar(u8, exe[0..n], '/') orelse return;
+    const dir = exe[0..dir_end];
+    const old = getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+    const z = joinZ(&path_env, &.{ "PATH=", dir, ":", old });
+    for (env_ptrs[0..env_count]) |*p| {
+        if (std.mem.startsWith(u8, std.mem.span(p.*.?), "PATH=")) {
+            p.* = z.ptr;
+            return;
+        }
+    }
+    if (env_count < env_ptrs.len) {
+        env_ptrs[env_count] = z.ptr;
+        env_count += 1;
+        env_ptrs[env_count] = null;
+    }
 }
 
 pub fn envp() [*:null]const ?[*:0]const u8 {

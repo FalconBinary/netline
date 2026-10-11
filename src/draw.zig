@@ -16,7 +16,7 @@ pub const Canvas = struct {
         @memset(self.px, premul(color));
     }
 
-    inline fn blend(self: *Canvas, x: i32, y: i32, color: u32, cov: f32) void {
+    pub inline fn blend(self: *Canvas, x: i32, y: i32, color: u32, cov: f32) void {
         if (cov <= 0.0) return;
         const i: usize = @intCast(y * self.w + x);
         const a = @as(f32, @floatFromInt(color >> 24)) / 255.0 * @min(cov, 1.0);
@@ -35,6 +35,22 @@ pub const Canvas = struct {
         const da: f32 = @floatFromInt(d >> 24);
         out |= @as(u32, @intFromFloat(@min(255.0, 255.0 * a + da * inv + 0.5))) << 24;
         self.px[i] = out;
+    }
+
+    /// Наложить 8-битную маску покрытия (глиф шрифта) цветом `color`.
+    pub fn blit(self: *Canvas, bmp: []const u8, w: u16, h: u16, x: i32, y: i32, color: u32) void {
+        var row: i32 = 0;
+        while (row < h) : (row += 1) {
+            const py = y + row;
+            if (py < 0 or py >= self.h) continue;
+            var col: i32 = 0;
+            while (col < w) : (col += 1) {
+                const px = x + col;
+                if (px < 0 or px >= self.w) continue;
+                const c = bmp[@as(usize, @intCast(row)) * w + @as(usize, @intCast(col))];
+                if (c != 0) self.blend(px, py, color, @as(f32, @floatFromInt(c)) / 255.0);
+            }
+        }
     }
 
     /// Обходит пиксели прямоугольника и красит с покрытием clamp(0.5 - dist).

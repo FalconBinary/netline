@@ -66,6 +66,8 @@ pub const Conn = struct {
     in: [65536]u8 = undefined,
     ilen: usize = 0,
     ipos: usize = 0,
+    in_fds: [8]i32 = undefined,
+    nin_fds: usize = 0,
     next_id: u32 = 2, // 1 — wl_display
     free_ids: [MAX_IDS]u32 = undefined,
     nfree: usize = 0,
@@ -176,10 +178,27 @@ pub const Conn = struct {
             self.ipos = 0;
         }
         if (self.ilen == self.in.len) return error.BufferFull;
-        const n = try sys.read(self.fd, self.in[self.ilen..]);
+        var fds: [8]i32 = undefined;
+        var nfds: usize = 0;
+        const n = try sys.recvmsgFds(self.fd, self.in[self.ilen..], &fds, &nfds);
+        for (fds[0..nfds]) |f| {
+            if (self.nin_fds < self.in_fds.len) {
+                self.in_fds[self.nin_fds] = f;
+                self.nin_fds += 1;
+            } else sys.close(f);
+        }
         if (n == 0) return false;
         self.ilen += n;
         return true;
+    }
+
+    /// Забрать дескриптор, пришедший с событием (например, wl_keyboard.keymap).
+    pub fn takeFd(self: *Conn) ?i32 {
+        if (self.nin_fds == 0) return null;
+        const f = self.in_fds[0];
+        std.mem.copyForwards(i32, self.in_fds[0 .. self.nin_fds - 1], self.in_fds[1..self.nin_fds]);
+        self.nin_fds -= 1;
+        return f;
     }
 
     /// Следующее полностью прочитанное событие (или null).
