@@ -1,0 +1,37 @@
+# Тема zpanel. Скопируйте в ~/.config/zpanel/theme и меняйте —
+# панель перечитает файл сразу после сохранения, перезапуск не нужен.
+#
+# Формат: имя = #RRGGBB или #RRGGBBAA (AA — непрозрачность: ff — сплошной, 00 — невидимый).
+# Строки можно удалять: всё, чего нет в файле, берётся из config.zig.
+
+# панель
+background = #1e1e2eeb
+border     = #45475a        # видна, если border_width > 0 в config.zig
+hover      = #ffffff1f      # подсветка кнопки под курсором
+
+# лаунчер
+launcher   = #cdd6f4
+
+# теги mango
+tag_active      = #89b4fa
+tag_occupied    = #cdd6f4
+tag_empty       = #585b70
+tag_urgent      = #f38ba8
+tag_active_text = #1e1e2e  # цифра на активном теге (tag_style = .numbers)
+
+# часы
+clock = #cdd6f4
+
+# Wi-Fi
+wifi          = #cdd6f4     # горящие дуги
+wifi_inactive = #585b70     # негорящие дуги
+wifi_off      = #f38ba8     # перечёркивание, когда радио выключено
+
+# Bluetooth
+bluetooth_on        = #cdd6f4
+bluetooth_connected = #89b4fa
+bluetooth_off       = #585b70
+
+# обои и питание
+wallpaper = #cdd6f4
+power     = #f38ba8
