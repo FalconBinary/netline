@@ -19,6 +19,10 @@ const broker = @import("broker.zig");
 const sandbox = @import("sandbox.zig");
 const theme = @import("theme.zig");
 const cfg = @import("config.zig");
+const rt = @import("rt.zig");
+
+pub const panic = rt.panic;
+pub const std_options = rt.std_options;
 
 const MAX_BARS = mango.MAX_MONS;
 
@@ -137,8 +141,8 @@ var burst: u32 = 0; // сколько ещё быстрых (раз в секу�
 
 // ================================================================= main
 
-pub fn main() void {
-    sys.initEnv();
+pub fn main(init: std.process.Init.Minimal) void {
+    sys.init(init);
     if (sys.getuid() == 0) {
         sys.log("запуск от root запрещён", .{});
         sys.exit(1);

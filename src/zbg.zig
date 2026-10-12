@@ -19,6 +19,10 @@ const img = @import("img.zig");
 const theme = @import("theme.zig");
 const cfg = @import("config.zig");
 const sandbox = @import("sandbox.zig");
+const rt = @import("rt.zig");
+
+pub const panic = rt.panic;
+pub const std_options = rt.std_options;
 
 const MAX_OUT = 8;
 
@@ -80,8 +84,8 @@ const Client = struct {
 };
 var clients: [MAX_CLIENTS]Client = [_]Client{.{}} ** MAX_CLIENTS;
 
-pub fn main() void {
-    sys.initEnv();
+pub fn main(init: std.process.Init.Minimal) void {
+    sys.init(init);
     my_uid = @intCast(sys.getuid());
     if (my_uid == 0) {
         sys.log("запуск от root запрещён", .{});

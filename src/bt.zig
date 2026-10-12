@@ -14,6 +14,10 @@ const theme = @import("theme.zig");
 const cfg = @import("config.zig");
 const bz = @import("bz.zig");
 const ui = @import("ui.zig");
+const rt = @import("rt.zig");
+
+pub const panic = rt.panic;
+pub const std_options = rt.std_options;
 
 const PAD = ui.PAD;
 const ROW_H: f32 = 52;
@@ -46,8 +50,8 @@ fn wid(w: ui.Widget) Wid {
 
 // ================================================================= запуск
 
-pub fn main() void {
-    sys.initEnv();
+pub fn main(init: std.process.Init.Minimal) void {
+    sys.init(init);
     if (sys.argIs(1, "toggle")) {
         if (!bz.init()) fatalCli();
         _ = bz.refresh(&devs);

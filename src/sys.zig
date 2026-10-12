@@ -520,8 +520,8 @@ pub fn spawnShell(cmd: [*:0]const u8) void {
         _ = linux.syscall0(.setsid);
         const pid2 = fork() catch exit(1);
         if (pid2 == 0) {
-            const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd };
-            _ = linux.syscall3(.execve, @intFromPtr("/bin/sh"), @intFromPtr(&argv), @intFromPtr(envp()));
+            const sh_argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd };
+            _ = linux.syscall3(.execve, @intFromPtr("/bin/sh"), @intFromPtr(&sh_argv), @intFromPtr(envp()));
             exit(127);
         }
         exit(0);
@@ -530,83 +530,58 @@ pub fn spawnShell(cmd: [*:0]const u8) void {
     _ = linux.syscall4(.wait4, pid, @intFromPtr(&status), 0, 0);
 }
 
-// ---------------------------------------------------------------- окружение
-// Читаем /proc/self/environ сами — так не зависим от того, как std отдаёт environ.
+// ---------------------------------------------------------------- окружение и аргументы
+// В Zig 0.16 стартовый код отдаёт argv и envp прямо в main (std.process.Init.Minimal) —
+// это те же строки, что ядро положило на стек: ничего не копируется и не читается из /proc.
 
-var env_buf: [64 * 1024]u8 = undefined;
-var env_ptrs: [1024:null]?[*:0]const u8 = undefined;
-var env_count: usize = 0;
+var argv: []const [*:0]const u8 = &.{};
+var environ: [:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
 
-var proc_ready = false;
-var arg_buf: [8 * 1024]u8 = undefined;
-var arg_list: [64][]const u8 = undefined;
-var arg_count: usize = 0;
-
-/// Окружение и аргументы — прямо из /proc/self, без std.os.argv/environ
-/// (их нет без libc в новых версиях Zig). Повторный вызов ничего не делает.
-pub fn initEnv() void {
-    if (proc_ready) return;
-    proc_ready = true;
-    const data = readFile("/proc/self/environ", env_buf[0 .. env_buf.len - 1]) orelse &[_]u8{};
-    env_buf[data.len] = 0;
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < data.len) : (i += 1) {
-        if (data[i] == 0) {
-            if (i > start and env_count < env_ptrs.len) {
-                env_ptrs[env_count] = @ptrCast(&env_buf[start]);
-                env_count += 1;
-            }
-            start = i + 1;
-        }
-    }
-    if (start < data.len and env_count < env_ptrs.len) {
-        env_ptrs[env_count] = @ptrCast(&env_buf[start]);
-        env_count += 1;
-    }
-    env_ptrs[env_count] = null;
-
-    // аргументы: строки через \0
-    const args = readFile("/proc/self/cmdline", &arg_buf) orelse &[_]u8{};
-    var it = std.mem.splitScalar(u8, args, 0);
-    while (it.next()) |a| {
-        if (arg_count == arg_list.len) break;
-        if (it.index == null and a.len == 0) break; // хвостовой \0
-        arg_list[arg_count] = a;
-        arg_count += 1;
-    }
+/// Вызывается первой строкой main: `pub fn main(init: std.process.Init.Minimal) void`.
+pub fn init(m: std.process.Init.Minimal) void {
+    argv = m.args.vector;
+    environ = m.environ.block.slice;
 }
 
+/// Окружение для execve с PATH, в начале которого папка исполняемого файла
+/// (меню и zbg рядом с zpanel найдутся без настройки PATH). Нужно только брокеру.
+var env_ptrs: [1024:null]?[*:0]const u8 = undefined;
+var env_ready = false;
 var path_env: [4096]u8 = undefined;
 
-/// Добавить папку исполняемого файла в начало PATH (для дочерних процессов).
 pub fn prependExeDirToPath() void {
+    var n: usize = 0;
+    var path_at: ?usize = null;
+    for (environ) |p| {
+        if (n == env_ptrs.len) break;
+        if (std.mem.startsWith(u8, std.mem.span(p.?), "PATH=")) path_at = n;
+        env_ptrs[n] = p;
+        n += 1;
+    }
+    env_ptrs[n] = null;
+    env_ready = true;
+
     var exe: [512]u8 = undefined;
     const rc = linux.syscall4(.readlinkat, ufd(AT_FDCWD), @intFromPtr("/proc/self/exe"), @intFromPtr(&exe), exe.len);
-    const n = check(rc) catch return;
-    const dir_end = std.mem.lastIndexOfScalar(u8, exe[0..n], '/') orelse return;
-    const dir = exe[0..dir_end];
+    const len = check(rc) catch return;
+    const dir_end = std.mem.lastIndexOfScalar(u8, exe[0..len], '/') orelse return;
     const old = getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
-    const z = joinZ(&path_env, &.{ "PATH=", dir, ":", old });
-    for (env_ptrs[0..env_count]) |*p| {
-        if (std.mem.startsWith(u8, std.mem.span(p.*.?), "PATH=")) {
-            p.* = z.ptr;
-            return;
-        }
-    }
-    if (env_count < env_ptrs.len) {
-        env_ptrs[env_count] = z.ptr;
-        env_count += 1;
-        env_ptrs[env_count] = null;
+    const z = joinZ(&path_env, &.{ "PATH=", exe[0..dir_end], ":", old });
+    if (path_at) |i| {
+        env_ptrs[i] = z.ptr;
+    } else if (n < env_ptrs.len) {
+        env_ptrs[n] = z.ptr;
+        env_ptrs[n + 1] = null;
     }
 }
 
 pub fn envp() [*:null]const ?[*:0]const u8 {
-    return &env_ptrs;
+    if (env_ready) return &env_ptrs;
+    return environ.ptr;
 }
 
 pub fn getenv(name: []const u8) ?[]const u8 {
-    for (env_ptrs[0..env_count]) |p| {
+    for (environ) |p| {
         const s = std.mem.span(p.?);
         if (s.len > name.len and s[name.len] == '=' and std.mem.eql(u8, s[0..name.len], name))
             return s[name.len + 1 ..];
@@ -623,9 +598,8 @@ pub fn argIs(i: usize, s: []const u8) bool {
 }
 
 pub fn argAt(i: usize) ?[]const u8 {
-    initEnv();
-    if (i >= arg_count) return null;
-    return arg_list[i];
+    if (i >= argv.len) return null;
+    return std.mem.span(argv[i]);
 }
 
 /// Затереть память так, чтобы компилятор не выбросил запись.

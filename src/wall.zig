@@ -16,6 +16,10 @@ const theme = @import("theme.zig");
 const cfg = @import("config.zig");
 const ui = @import("ui.zig");
 const zbg = @import("zbg.zig");
+const rt = @import("rt.zig");
+
+pub const panic = rt.panic;
+pub const std_options = rt.std_options;
 
 const PAD = ui.PAD;
 const COLS = 4;
@@ -59,8 +63,8 @@ const Wid = enum(u8) { none, tile, random };
 
 // ================================================================= запуск
 
-pub fn main() void {
-    sys.initEnv();
+pub fn main(init: std.process.Init.Minimal) void {
+    sys.init(init);
     if (sys.argIs(1, "random")) return randomCli();
     ui.begin("zwall");
     prepare();

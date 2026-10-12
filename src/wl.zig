@@ -57,19 +57,26 @@ pub const Args = struct {
     }
 };
 
+// Буферы соединения — отдельные глобальные массивы: так они попадают в .bss (ни места
+// в файле, ни памяти, пока не тронуты). Внутри структуры с другими значениями по
+// умолчанию они уходили в .data целиком. Соединение с Wayland в процессе одно.
+var out_buf: [16384]u8 = undefined;
+var in_buf: [65536]u8 = undefined;
+var free_buf: [MAX_IDS]u32 = undefined;
+
 pub const Conn = struct {
     fd: i32 = -1,
-    out: [16384]u8 = undefined,
+    out: *[16384]u8 = &out_buf,
     olen: usize = 0,
     ofds: [8]i32 = undefined,
     nofds: usize = 0,
-    in: [65536]u8 = undefined,
+    in: *[65536]u8 = &in_buf,
     ilen: usize = 0,
     ipos: usize = 0,
     in_fds: [8]i32 = undefined,
     nin_fds: usize = 0,
     next_id: u32 = 2, // 1 — wl_display
-    free_ids: [MAX_IDS]u32 = undefined,
+    free_ids: *[MAX_IDS]u32 = &free_buf,
     nfree: usize = 0,
 
     pub fn connect(self: *Conn) !void {

@@ -193,7 +193,6 @@ pub var kbd_nav = false;
 /// Первая часть запуска: окружение, «повторный запуск закрывает», шрифт, тема.
 /// После неё меню подключается к своим службам (D-Bus и т.п.), затем вызывает run().
 pub fn begin(menu_name: []const u8) void {
-    sys.initEnv();
     my_uid = @intCast(sys.getuid());
     if (my_uid == 0) {
         sys.log("запуск от root запрещён", .{});

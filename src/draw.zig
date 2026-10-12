@@ -4,6 +4,10 @@
 //! Программная отрисовка в ARGB8888 (premultiplied): заливки, скруглённые прямоугольники
 //! и векторные примитивы с антиалиасингом через функции расстояния (SDF).
 //! Цифры и иконки — свои, векторные, поэтому масштабируются без потерь.
+//!
+//! Скорость: смешивание целочисленное, по два канала за раз в одном 32-битном слове;
+//! у скруглённых прямоугольников (фон панели и меню, кнопки, рамки) функция расстояния
+//! считается только у краёв, середина строки заливается подряд.
 
 const std = @import("std");
 
@@ -16,39 +20,32 @@ pub const Canvas = struct {
         @memset(self.px, premul(color));
     }
 
+    /// Наложить цвет (ARGB без предумножения) с покрытием cov (0..1).
     pub inline fn blend(self: *Canvas, x: i32, y: i32, color: u32, cov: f32) void {
         if (cov <= 0.0) return;
         const i: usize = @intCast(y * self.w + x);
-        const a = @as(f32, @floatFromInt(color >> 24)) / 255.0 * @min(cov, 1.0);
-        if (a >= 0.999) {
-            self.px[i] = color | 0xff000000;
-            return;
-        }
-        const d = self.px[i];
-        const inv = 1.0 - a;
-        var out: u32 = 0;
-        inline for (.{ 0, 8, 16 }) |sh| {
-            const s: f32 = @floatFromInt((color >> sh) & 0xff);
-            const dv: f32 = @floatFromInt((d >> sh) & 0xff);
-            out |= @as(u32, @intFromFloat(@min(255.0, s * a + dv * inv + 0.5))) << sh;
-        }
-        const da: f32 = @floatFromInt(d >> 24);
-        out |= @as(u32, @intFromFloat(@min(255.0, 255.0 * a + da * inv + 0.5))) << 24;
-        self.px[i] = out;
+        blendPx(&self.px[i], color, coverAlpha(color >> 24, cov));
+    }
+
+    fn row(self: *Canvas, y: i32) []u32 {
+        const w: usize = @intCast(self.w);
+        return self.px[@as(usize, @intCast(y)) * w ..][0..w];
     }
 
     /// Наложить 8-битную маску покрытия (глиф шрифта) цветом `color`.
     pub fn blit(self: *Canvas, bmp: []const u8, w: u16, h: u16, x: i32, y: i32, color: u32) void {
-        var row: i32 = 0;
-        while (row < h) : (row += 1) {
-            const py = y + row;
-            if (py < 0 or py >= self.h) continue;
-            var col: i32 = 0;
-            while (col < w) : (col += 1) {
-                const px = x + col;
-                if (px < 0 or px >= self.w) continue;
-                const c = bmp[@as(usize, @intCast(row)) * w + @as(usize, @intCast(col))];
-                if (c != 0) self.blend(px, py, color, @as(f32, @floatFromInt(c)) / 255.0);
+        const alpha = color >> 24;
+        const c0: i32 = @max(0, -x);
+        const c1: i32 = @min(@as(i32, w), self.w - x);
+        const r0: i32 = @max(0, -y);
+        const r1: i32 = @min(@as(i32, h), self.h - y);
+        if (c0 >= c1 or r0 >= r1) return;
+        var r = r0;
+        while (r < r1) : (r += 1) {
+            const src = bmp[@as(usize, @intCast(r)) * w ..][@intCast(c0)..@intCast(c1)];
+            const dst = self.row(y + r)[@intCast(x + c0)..][0..src.len];
+            for (src, dst) |c, *d| {
+                if (c != 0) blendPx(d, color, div255(alpha * c));
             }
         }
     }
@@ -61,37 +58,49 @@ pub const Canvas = struct {
         const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(y))));
         const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x + w))));
         const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(y + h))));
+        if (x0 >= x1 or y0 >= y1) return;
         const fx: f32 = @as(f32, @floatFromInt(sw)) / w;
         const fy: f32 = @as(f32, @floatFromInt(sh)) / h;
-        const rr = @min(r, @min(w, h) / 2);
+        const b = Box{ .cx = x + w / 2, .cy = y + h / 2, .hw = w / 2, .hh = h / 2, .r = @min(r, @min(w, h) / 2) };
+        // столбцы исходника для каждого столбца назначения — один раз на картинку
+        var cols: [4096][2]u32 = undefined;
+        const ncols: usize = @intCast(x1 - x0);
+        if (ncols > cols.len) return;
+        for (cols[0..ncols], 0..) |*c, i| {
+            const lx = @as(f32, @floatFromInt(x0 + @as(i32, @intCast(i)))) - x;
+            c[0] = @intFromFloat(std.math.clamp(@floor(lx * fx), 0, @as(f32, @floatFromInt(sw - 1))));
+            c[1] = @max(c[0] + 1, @min(sw, @as(u32, @intFromFloat(@max(0, @floor((lx + 1) * fx))))));
+        }
         var py = y0;
         while (py < y1) : (py += 1) {
             const ly = @as(f32, @floatFromInt(py)) - y;
             const sy0: u32 = @intFromFloat(std.math.clamp(@floor(ly * fy), 0, @as(f32, @floatFromInt(sh - 1))));
             const sy1: u32 = @max(sy0 + 1, @min(sh, @as(u32, @intFromFloat(@max(0, @floor((ly + 1) * fy))))));
+            const span = b.fullSpan(py, x0, x1, 0.5);
+            const dst = self.row(py);
             var px = x0;
             while (px < x1) : (px += 1) {
-                const lx = @as(f32, @floatFromInt(px)) - x;
-                const d = sdBox(lx + 0.5 - w / 2, ly + 0.5 - h / 2, w / 2, h / 2, rr);
-                const cov = 0.5 - d;
-                if (cov <= 0) continue;
-                const sx0: u32 = @intFromFloat(std.math.clamp(@floor(lx * fx), 0, @as(f32, @floatFromInt(sw - 1))));
-                const sx1: u32 = @max(sx0 + 1, @min(sw, @as(u32, @intFromFloat(@max(0, @floor((lx + 1) * fx))))));
+                var cov: f32 = 1;
+                if (px < span[0] or px >= span[1]) {
+                    cov = 0.5 - b.sdf(@as(f32, @floatFromInt(px)) + 0.5, @as(f32, @floatFromInt(py)) + 0.5);
+                    if (cov <= 0) continue;
+                }
+                const c = cols[@intCast(px - x0)];
                 var acc: [3]u32 = .{ 0, 0, 0 };
-                var cnt: u32 = 0;
                 var sy = sy0;
                 while (sy < sy1) : (sy += 1) {
-                    var sx = sx0;
-                    while (sx < sx1) : (sx += 1) {
-                        const i = (@as(usize, sy) * sw + sx) * 3;
+                    var i = (@as(usize, sy) * sw + c[0]) * 3;
+                    var sx = c[0];
+                    while (sx < c[1]) : (sx += 1) {
                         acc[0] += rgb[i];
                         acc[1] += rgb[i + 1];
                         acc[2] += rgb[i + 2];
-                        cnt += 1;
+                        i += 3;
                     }
                 }
-                const c = 0xff000000 | ((acc[0] / cnt) << 16) | ((acc[1] / cnt) << 8) | (acc[2] / cnt);
-                self.blend(px, py, c, cov);
+                const cnt = (sy1 - sy0) * (c[1] - c[0]);
+                const col = 0xff000000 | ((acc[0] / cnt) << 16) | ((acc[1] / cnt) << 8) | (acc[2] / cnt);
+                blendPx(&dst[@intCast(px)], col, coverAlpha(255, cov));
             }
         }
     }
@@ -102,24 +111,80 @@ pub const Canvas = struct {
         const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(y0f))));
         const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x1f))));
         const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(y1f))));
+        const alpha = color >> 24;
         var y = y0;
         while (y < y1) : (y += 1) {
+            const dst = self.row(y);
+            const fy = @as(f32, @floatFromInt(y)) + 0.5;
             var x = x0;
             while (x < x1) : (x += 1) {
-                const d = dist(ctx, @as(f32, @floatFromInt(x)) + 0.5, @as(f32, @floatFromInt(y)) + 0.5);
-                self.blend(x, y, color, 0.5 - d);
+                const cov = 0.5 - dist(ctx, @as(f32, @floatFromInt(x)) + 0.5, fy);
+                if (cov > 0) blendPx(&dst[@intCast(x)], color, coverAlpha(alpha, cov));
             }
         }
     }
 
+    /// Пиксели строки y в [xa, xb) — с покрытием по функции расстояния прямоугольника b
+    /// (заливка или контур с полутолщиной hw).
+    fn boxEdges(self: *Canvas, b: Box, y: i32, xa: i32, xb: i32, color: u32, comptime outline: bool, hw: f32) void {
+        const dst = self.row(y);
+        const fy = @as(f32, @floatFromInt(y)) + 0.5;
+        const alpha = color >> 24;
+        var x = xa;
+        while (x < xb) : (x += 1) {
+            const d = b.sdf(@as(f32, @floatFromInt(x)) + 0.5, fy);
+            const cov = 0.5 - (if (outline) @abs(d) - hw else d);
+            if (cov > 0) blendPx(&dst[@intCast(x)], color, coverAlpha(alpha, cov));
+        }
+    }
+
     pub fn fillRoundRect(self: *Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, color: u32) void {
-        const ctx = Box{ .cx = x + w / 2, .cy = y + h / 2, .hw = w / 2, .hh = h / 2, .r = @min(r, @min(w, h) / 2) };
-        self.paint(x - 1, y - 1, x + w + 1, y + h + 1, color, ctx, Box.sdf);
+        if (!(w > 0 and h > 0)) return;
+        const b = Box{ .cx = x + w / 2, .cy = y + h / 2, .hw = w / 2, .hh = h / 2, .r = @max(0, @min(r, @min(w, h) / 2)) };
+        const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x - 1))));
+        const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(y - 1))));
+        const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x + w + 1))));
+        const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(y + h + 1))));
+        if (x0 >= x1) return;
+        var py = y0;
+        while (py < y1) : (py += 1) {
+            // полностью покрытая середина строки — подряд, края — по функции расстояния
+            const s = b.fullSpan(py, x0, x1, 0.5);
+            self.boxEdges(b, py, x0, s[0], color, false, 0);
+            fillSpan(self.row(py)[@intCast(s[0])..@intCast(s[1])], color);
+            self.boxEdges(b, py, s[1], x1, color, false, 0);
+        }
+    }
+
+    /// Контур скруглённого прямоугольника толщиной `stroke` (по центру линии — границе b).
+    fn strokeBox(self: *Canvas, b: Box, stroke: f32, color: u32) void {
+        const hw = stroke / 2;
+        const pad = hw + 1;
+        const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(b.cx - b.hw - pad))));
+        const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(b.cy - b.hh - pad))));
+        const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(b.cx + b.hw + pad))));
+        const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(b.cy + b.hh + pad))));
+        if (x0 >= x1) return;
+        var py = y0;
+        while (py < y1) : (py += 1) {
+            // внутри «дырки» (дальше полутолщины + 0,5 от линии) покрытие нулевое — пропускаем
+            const s = b.fullSpan(py, x0, x1, hw + 0.5);
+            self.boxEdges(b, py, x0, s[0], color, true, hw);
+            self.boxEdges(b, py, s[1], x1, color, true, hw);
+        }
     }
 
     /// Рисует набор примитивов. Координаты примитивов в «единицах»,
     /// пиксель = (ox, oy) + единица * s. stroke — толщина линий в пикселях.
     pub fn prims(self: *Canvas, list: []const Prim, ox: f32, oy: f32, s: f32, stroke: f32, color: u32) void {
+        // одиночный контур прямоугольника (рамка меню, фокус) — середину не обходим
+        if (list.len == 1 and list[0] == .box) {
+            const v = list[0].box;
+            const w = v.w * s;
+            const h = v.h * s;
+            const b = Box{ .cx = ox + v.x * s + w / 2, .cy = oy + v.y * s + h / 2, .hw = w / 2, .hh = h / 2, .r = v.r * s };
+            return self.strokeBox(b, stroke, color);
+        }
         var buf: [24]Prim = undefined;
         const n = @min(list.len, buf.len);
         var bx0: f32 = 1e9;
@@ -151,6 +216,52 @@ pub fn premul(c: u32) u32 {
     return out;
 }
 
+/// x / 255 с округлением, точно для 0..65535.
+inline fn div255(x: u32) u32 {
+    return (x + 128 + ((x + 128) >> 8)) >> 8;
+}
+
+/// Непрозрачность 0..255: альфа цвета × покрытие.
+inline fn coverAlpha(alpha: u32, cov: f32) u32 {
+    if (cov >= 1) return alpha;
+    return div255(alpha * @as(u32, @intFromFloat(cov * 255 + 0.5)));
+}
+
+/// d = c·a + d·(1 − a) во всех четырёх каналах сразу (c — без предумножения,
+/// в канал альфы идёт 255): два канала на 16-битную половину слова.
+inline fn blendPx(d: *u32, color: u32, a: u32) void {
+    if (a == 0) return;
+    if (a >= 255) {
+        d.* = color | 0xff000000;
+        return;
+    }
+    const s = color | 0xff000000;
+    const dv = d.*;
+    const inv = 255 - a;
+    const rb = (s & 0x00ff00ff) * a + (dv & 0x00ff00ff) * inv + 0x00800080;
+    const ag = ((s >> 8) & 0x00ff00ff) * a + ((dv >> 8) & 0x00ff00ff) * inv + 0x00800080;
+    d.* = (((rb + ((rb >> 8) & 0x00ff00ff)) >> 8) & 0x00ff00ff) | ((ag + ((ag >> 8) & 0x00ff00ff)) & 0xff00ff00);
+}
+
+/// Залить строку цветом с полным покрытием. Подряд идущие одинаковые пиксели фона
+/// (а после clear — вся строка) смешиваются один раз.
+fn fillSpan(dst: []u32, color: u32) void {
+    const a = color >> 24;
+    if (a >= 255) return @memset(dst, color | 0xff000000);
+    if (a == 0) return;
+    var last_in: u32 = 0;
+    var last_out: u32 = 0;
+    var have = false;
+    for (dst) |*d| {
+        if (!have or d.* != last_in) {
+            last_in = d.*;
+            blendPx(d, color, a);
+            last_out = d.*;
+            have = true;
+        } else d.* = last_out;
+    }
+}
+
 const Box = struct {
     cx: f32,
     cy: f32,
@@ -159,6 +270,32 @@ const Box = struct {
     r: f32,
     fn sdf(b: Box, x: f32, y: f32) f32 {
         return sdBox(x - b.cx, y - b.cy, b.hw, b.hh, b.r);
+    }
+
+    /// Пиксели строки y из [x0, x1), у которых расстояние до края ≤ −t (для t = 0,5 — полностью
+    /// покрытые). Возвращает [начало, конец) — пустой отрезок, если таких нет.
+    fn fullSpan(b: Box, y: i32, x0: i32, x1: i32, t: f32) [2]i32 {
+        // радиус больше половины стороны — формула ниже неверна, считаем всё по расстоянию
+        if (b.r > @min(b.hw, b.hh)) return .{ x1, x1 };
+        const dy = @abs(@as(f32, @floatFromInt(y)) + 0.5 - b.cy);
+        var ih: f32 = undefined;
+        if (b.r >= t) {
+            const qy = dy - (b.hh - b.r);
+            const rt = b.r - t;
+            if (qy <= 0) {
+                ih = b.hw - t;
+            } else if (qy <= rt) {
+                ih = b.hw - b.r + @sqrt(rt * rt - qy * qy);
+            } else return .{ x1, x1 };
+        } else if (dy <= b.hh - t) {
+            ih = b.hw - t;
+        } else return .{ x1, x1 };
+        ih -= 1e-3; // запас на погрешность: пограничные пиксели посчитает функция расстояния
+        if (ih < 0) return .{ x1, x1 };
+        // центр пикселя x + 0,5 в [cx − ih, cx + ih]
+        const lo = std.math.clamp(@ceil(b.cx - ih - 0.5), @as(f32, @floatFromInt(x0)), @as(f32, @floatFromInt(x1)));
+        const hi = std.math.clamp(@floor(b.cx + ih - 0.5) + 1, lo, @as(f32, @floatFromInt(x1)));
+        return .{ @intFromFloat(lo), @intFromFloat(hi) };
     }
 };
 
@@ -202,7 +339,7 @@ const TAU: f32 = 6.28318531;
 /// дуга идёт по часовой стрелке от a0 к a1.
 pub const Prim = union(enum) {
     seg: struct { x0: f32, y0: f32, x1: f32, y1: f32 },
-    arc: struct { cx: f32, cy: f32, r: f32, a0: f32, a1: f32 },
+    arc: struct { cx: f32, cy: f32, r: f32, a0: f32, a1: f32, ends: [4]f32 = .{ 0, 0, 0, 0 } }, // ends — концы, считаются в transform
     ring: struct { cx: f32, cy: f32, r: f32 },
     dot: struct { cx: f32, cy: f32, r: f32 }, // заливка
     box: struct { x: f32, y: f32, w: f32, h: f32, r: f32 }, // контур
@@ -211,7 +348,14 @@ pub const Prim = union(enum) {
     fn transform(p: Prim, ox: f32, oy: f32, s: f32) Prim {
         return switch (p) {
             .seg => |v| .{ .seg = .{ .x0 = ox + v.x0 * s, .y0 = oy + v.y0 * s, .x1 = ox + v.x1 * s, .y1 = oy + v.y1 * s } },
-            .arc => |v| .{ .arc = .{ .cx = ox + v.cx * s, .cy = oy + v.cy * s, .r = v.r * s, .a0 = v.a0 * TAU / 360.0, .a1 = v.a1 * TAU / 360.0 } },
+            .arc => |v| blk: {
+                const cx = ox + v.cx * s;
+                const cy = oy + v.cy * s;
+                const r = v.r * s;
+                const a0 = v.a0 * TAU / 360.0;
+                const a1 = v.a1 * TAU / 360.0;
+                break :blk .{ .arc = .{ .cx = cx, .cy = cy, .r = r, .a0 = a0, .a1 = a1, .ends = .{ cx + r * @cos(a0), cy + r * @sin(a0), cx + r * @cos(a1), cy + r * @sin(a1) } } };
+            },
             .ring => |v| .{ .ring = .{ .cx = ox + v.cx * s, .cy = oy + v.cy * s, .r = v.r * s } },
             .dot => |v| .{ .dot = .{ .cx = ox + v.cx * s, .cy = oy + v.cy * s, .r = v.r * s } },
             .box => |v| .{ .box = .{ .x = ox + v.x * s, .y = oy + v.y * s, .w = v.w * s, .h = v.h * s, .r = v.r * s } },
@@ -250,10 +394,10 @@ pub const Prim = union(enum) {
                 var t = atan2(dy, dx) - v.a0;
                 t -= TAU * @floor(t / TAU);
                 if (t <= v.a1 - v.a0) return @abs(@sqrt(dx * dx + dy * dy) - v.r) - hw;
-                const e0x = v.cx + v.r * @cos(v.a0) - x;
-                const e0y = v.cy + v.r * @sin(v.a0) - y;
-                const e1x = v.cx + v.r * @cos(v.a1) - x;
-                const e1y = v.cy + v.r * @sin(v.a1) - y;
+                const e0x = v.ends[0] - x;
+                const e0y = v.ends[1] - y;
+                const e1x = v.ends[2] - x;
+                const e1y = v.ends[3] - y;
                 return @min(@sqrt(e0x * e0x + e0y * e0y), @sqrt(e1x * e1x + e1y * e1y)) - hw;
             },
             .box => |v| return @abs(sdBox(x - v.x - v.w / 2, y - v.y - v.h / 2, v.w / 2, v.h / 2, v.r)) - hw,

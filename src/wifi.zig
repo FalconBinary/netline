@@ -15,6 +15,10 @@ const theme = @import("theme.zig");
 const cfg = @import("config.zig");
 const nm = @import("nm.zig");
 const ui = @import("ui.zig");
+const rt = @import("rt.zig");
+
+pub const panic = rt.panic;
+pub const std_options = rt.std_options;
 
 const PAD = ui.PAD;
 const ROW_H: f32 = 44;
@@ -57,8 +61,8 @@ fn wid(w: ui.Widget) Wid {
 
 // ================================================================= запуск
 
-pub fn main() void {
-    sys.initEnv();
+pub fn main(init: std.process.Init.Minimal) void {
+    sys.init(init);
     if (sys.argIs(1, "toggle")) {
         // без окна: переключить радио и выйти
         if (!nm.init()) {
@@ -104,7 +108,7 @@ fn start() void {
 
 fn cleanup() void {
     for (&fields) |*f| f.clear();
-    sys.secureZero(&nm.bus.out);
+    sys.secureZero(nm.bus.out);
 }
 
 fn fieldAt(idx: u16) ?*ui.Field {

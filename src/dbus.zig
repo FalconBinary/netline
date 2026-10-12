@@ -315,15 +315,20 @@ const Msg = struct {
 
 const MAX_ASYNC = 8;
 
+// Буферы — отдельные глобальные массивы (в .bss, а не 1,1 МБ в .data каждого бинарника).
+// Соединение с D-Bus в процессе одно.
+var in_buf: [1024 * 1024]u8 = undefined;
+var out_buf: [64 * 1024]u8 = undefined;
+
 pub const Conn = struct {
     fd: i32 = -1,
     on_signal: ?SignalFn = null,
     on_method: ?MethodFn = null,
     serial: u32 = 0,
-    in: [1024 * 1024]u8 = undefined,
+    in: *[1024 * 1024]u8 = &in_buf,
     ilen: usize = 0,
     consumed: usize = 0, // длина последнего отданного ответа в начале буфера
-    out: [64 * 1024]u8 = undefined,
+    out: *[64 * 1024]u8 = &out_buf,
     waiting: [MAX_ASYNC]u32 = [_]u32{0} ** MAX_ASYNC,
     done: [MAX_ASYNC]Done = [_]Done{.{}} ** MAX_ASYNC,
 
@@ -404,7 +409,7 @@ pub const Conn = struct {
         c.serial +%= 1;
         if (c.serial == 0) c.serial = 1;
         const serial = c.serial;
-        var w = W{ .buf = &c.out };
+        var w = W{ .buf = c.out };
         w.byte('l');
         w.byte(o.kind);
         w.byte(o.flags);

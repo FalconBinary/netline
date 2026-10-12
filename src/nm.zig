@@ -464,7 +464,7 @@ pub fn addAndActivate(spec: Spec, ap: []const u8) bool {
     };
     // в буферах были пароли — затираем сразу после отправки
     secureZero(&body_buf);
-    secureZero(&bus.out);
+    secureZero(bus.out);
     return ok;
 }
 

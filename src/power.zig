@@ -18,6 +18,10 @@ const cfg = @import("config.zig");
 const dbus = @import("dbus.zig");
 const broker = @import("broker.zig");
 const ui = @import("ui.zig");
+const rt = @import("rt.zig");
+
+pub const panic = rt.panic;
+pub const std_options = rt.std_options;
 
 const PAD = ui.PAD;
 const LOGIN = "org.freedesktop.login1";
@@ -59,7 +63,8 @@ fn wid(w: ui.Widget) Wid {
 
 // ================================================================= запуск
 
-pub fn main() void {
+pub fn main(init: std.process.Init.Minimal) void {
+    sys.init(init);
     ui.begin("zpower");
     // брокер — до всех остальных подключений, чтобы не держать лишних дескрипторов
     const cmds = [_]?[*:0]const u8{cfg.lock_cmd};

@@ -13,6 +13,10 @@ const draw = @import("draw.zig");
 const theme = @import("theme.zig");
 const tz = @import("tz.zig");
 const ui = @import("ui.zig");
+const rt = @import("rt.zig");
+
+pub const panic = rt.panic;
+pub const std_options = rt.std_options;
 
 const PAD: f32 = 20;
 const CELL_W: f32 = 40;
@@ -30,7 +34,8 @@ var month: u32 = 1;
 
 const Wid = enum(u8) { none, prev, next, title };
 
-pub fn main() void {
+pub fn main(init: std.process.Init.Minimal) void {
+    sys.init(init);
     ui.begin("zcal");
     tz.load(); // часовой пояс читается до песочницы
     const t = tz.now();
