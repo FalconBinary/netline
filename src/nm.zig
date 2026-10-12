@@ -27,7 +27,7 @@ pub const Path = struct {
 
     pub fn set(p: *Path, s: []const u8) void {
         const k = @min(s.len, p.buf.len);
-        @memcpy(p.buf[0..k], s[0..k]);
+        std.mem.copyForwards(u8, p.buf[0..k], s[0..k]); // источник может быть этим же буфером
         p.len = @intCast(k);
     }
     pub fn get(p: *const Path) []const u8 {
@@ -525,7 +525,4 @@ pub fn dropCreated() void {
     created.len = 0;
 }
 
-pub fn secureZero(b: []u8) void {
-    const v: []volatile u8 = b;
-    for (v) |*c| c.* = 0;
-}
+pub const secureZero = sys.secureZero;

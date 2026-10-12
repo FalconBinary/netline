@@ -156,6 +156,11 @@ pub const R = struct {
         const s = r.take(1);
         return if (s.len == 1) s[0] else 0;
     }
+    pub fn u16_(r: *R) u16 {
+        r.alignTo(2);
+        const s = r.take(2);
+        return if (s.len == 2) std.mem.readInt(u16, s[0..2], .little) else 0;
+    }
     pub fn u32_(r: *R) u32 {
         r.alignTo(4);
         const s = r.take(4);
@@ -255,17 +260,72 @@ pub const Reply = struct {
     }
 };
 
+/// Входящий вызов метода (например, от BlueZ к нашему агенту сопряжения).
+pub const Incoming = struct {
+    serial: u32,
+    flags: u8,
+    sender: []const u8,
+    path: []const u8,
+    iface: []const u8,
+    member: []const u8,
+    sig: []const u8,
+    body: []const u8,
+
+    pub fn reader(m: *const Incoming) R {
+        return .{ .d = m.body };
+    }
+};
+
+/// Результат асинхронного вызова: успех или текст ошибки.
+pub const Done = struct {
+    serial: u32 = 0,
+    ok: bool = false,
+    name_buf: [96]u8 = undefined,
+    name_len: usize = 0,
+    msg_buf: [200]u8 = undefined,
+    msg_len: usize = 0,
+
+    pub fn errName(d: *const Done) []const u8 {
+        return d.name_buf[0..d.name_len];
+    }
+    pub fn message(d: *const Done) []const u8 {
+        return d.msg_buf[0..d.msg_len];
+    }
+};
+
 /// Обработчик сигналов, пришедших вперемешку с ответами.
 pub const SignalFn = *const fn (iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void;
+/// Обработчик входящих вызовов. Должен ответить (reply/replyError) сразу или позже.
+/// Синхронные вызовы из обработчиков делать нельзя.
+pub const MethodFn = *const fn (c: *Conn, m: *const Incoming) void;
+
+const Msg = struct {
+    kind: u8,
+    flags: u8,
+    reply_serial: u32 = 0,
+    err_name: []const u8 = "",
+    sig: []const u8 = "",
+    path: []const u8 = "",
+    iface: []const u8 = "",
+    member: []const u8 = "",
+    sender: []const u8 = "",
+    serial: u32,
+    body: []const u8,
+};
+
+const MAX_ASYNC = 8;
 
 pub const Conn = struct {
     fd: i32 = -1,
     on_signal: ?SignalFn = null,
+    on_method: ?MethodFn = null,
     serial: u32 = 0,
-    in: [256 * 1024]u8 = undefined,
+    in: [1024 * 1024]u8 = undefined,
     ilen: usize = 0,
     consumed: usize = 0, // длина последнего отданного ответа в начале буфера
     out: [64 * 1024]u8 = undefined,
+    waiting: [MAX_ASYNC]u32 = [_]u32{0} ** MAX_ASYNC,
+    done: [MAX_ASYNC]Done = [_]Done{.{}} ** MAX_ASYNC,
 
     /// Подключиться к системной шине (или к адресу из DBUS_SYSTEM_BUS_ADDRESS).
     pub fn connectSystem(c: *Conn) Error!void {
@@ -327,28 +387,47 @@ pub const Conn = struct {
         if (n == 0) return error.Timeout;
     }
 
-    /// Синхронный вызов метода. Ответ ссылается на внутренний буфер — до следующего вызова.
-    pub fn call(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!Reply {
+    const Out = struct {
+        kind: u8,
+        flags: u8 = 0,
+        path: []const u8 = "",
+        iface: []const u8 = "",
+        member: []const u8 = "",
+        err_name: []const u8 = "",
+        reply_serial: u32 = 0,
+        dest: []const u8 = "",
+        sig: []const u8 = "",
+    };
+
+    /// Собрать и отправить сообщение. Возвращает его serial.
+    fn send(c: *Conn, o: Out, body: []const u8) Error!u32 {
         c.serial +%= 1;
         if (c.serial == 0) c.serial = 1;
         const serial = c.serial;
         var w = W{ .buf = &c.out };
         w.byte('l');
-        w.byte(1); // METHOD_CALL
-        w.byte(0);
+        w.byte(o.kind);
+        w.byte(o.flags);
         w.byte(1); // версия протокола
         w.u32_(@intCast(body.len));
         w.u32_(serial);
         const fields = w.arrayBegin(8);
-        field(&w, 1, "o", path);
-        field(&w, 2, "s", iface);
-        field(&w, 3, "s", member);
-        field(&w, 6, "s", dest);
-        if (sig.len > 0) {
+        if (o.path.len > 0) field(&w, 1, "o", o.path);
+        if (o.iface.len > 0) field(&w, 2, "s", o.iface);
+        if (o.member.len > 0) field(&w, 3, "s", o.member);
+        if (o.err_name.len > 0) field(&w, 4, "s", o.err_name);
+        if (o.reply_serial != 0) {
+            w.pad(8);
+            w.byte(5);
+            w.sig("u");
+            w.u32_(o.reply_serial);
+        }
+        if (o.dest.len > 0) field(&w, 6, "s", o.dest);
+        if (o.sig.len > 0) {
             w.pad(8);
             w.byte(8);
             w.sig("g");
-            w.sig(sig);
+            w.sig(o.sig);
         }
         w.arrayEnd(fields);
         w.pad(8);
@@ -356,7 +435,52 @@ pub const Conn = struct {
         @memcpy(w.buf[w.n..][0..body.len], body);
         w.n += body.len;
         sys.sendAll(c.fd, w.bytes()) catch return error.Io;
+        return serial;
+    }
+
+    /// Синхронный вызов метода. Ответ ссылается на внутренний буфер — до следующего вызова.
+    pub fn call(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!Reply {
+        const serial = try c.send(.{ .kind = 1, .path = path, .iface = iface, .member = member, .dest = dest, .sig = sig }, body);
         return c.waitReply(serial);
+    }
+
+    /// Асинхронный вызов: ответ придёт позже, его забирают через result(serial).
+    pub fn callAsync(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!u32 {
+        var slot: ?usize = null;
+        for (c.waiting, 0..) |s, i| {
+            if (s == 0 and c.done[i].serial == 0) slot = i;
+        }
+        const i = slot orelse return error.TooBig;
+        const serial = try c.send(.{ .kind = 1, .path = path, .iface = iface, .member = member, .dest = dest, .sig = sig }, body);
+        c.waiting[i] = serial;
+        return serial;
+    }
+
+    /// Забрать результат асинхронного вызова (null — ещё не пришёл).
+    pub fn result(c: *Conn, serial: u32) ?Done {
+        for (&c.done) |*d| {
+            if (d.serial == serial and serial != 0) {
+                const r = d.*;
+                d.* = .{};
+                return r;
+            }
+        }
+        return null;
+    }
+
+    /// Ответить на входящий вызов.
+    pub fn reply(c: *Conn, m: *const Incoming, sig: []const u8, body: []const u8) void {
+        if (m.flags & 1 != 0) return; // NO_REPLY_EXPECTED
+        _ = c.send(.{ .kind = 2, .reply_serial = m.serial, .dest = m.sender, .sig = sig }, body) catch {};
+    }
+
+    pub fn replyError(c: *Conn, m: *const Incoming, name: []const u8, text: []const u8) void {
+        if (m.flags & 1 != 0) return;
+        var b: [256]u8 = undefined;
+        var w = W{ .buf = &b };
+        w.str(text);
+        if (w.overflow) return;
+        _ = c.send(.{ .kind = 3, .err_name = name, .reply_serial = m.serial, .dest = m.sender, .sig = "s" }, w.bytes()) catch {};
     }
 
     fn field(w: *W, code: u8, t: []const u8, val: []const u8) void {
@@ -371,6 +495,85 @@ pub const Conn = struct {
         c.ilen -= n;
     }
 
+    /// Размер первого сообщения в буфере (null — оно ещё не пришло целиком).
+    fn complete(c: *Conn) Error!?usize {
+        if (c.ilen < 16) return null;
+        if (c.in[0] != 'l') return error.Protocol; // big-endian не поддерживаем
+        const body_len = std.mem.readInt(u32, c.in[4..8], .little);
+        const flen = std.mem.readInt(u32, c.in[12..16], .little);
+        const hdr = (16 + @as(usize, flen) + 7) & ~@as(usize, 7);
+        const total = hdr + @as(usize, body_len);
+        if (total > c.in.len) return error.TooBig;
+        if (c.ilen < total) return null;
+        return total;
+    }
+
+    fn parse(c: *Conn, total: usize) Error!Msg {
+        const msg = c.in[0..total];
+        const flen = std.mem.readInt(u32, msg[12..16], .little);
+        const hdr = (16 + @as(usize, flen) + 7) & ~@as(usize, 7);
+        var m = Msg{ .kind = msg[1], .flags = msg[2], .serial = std.mem.readInt(u32, msg[8..12], .little), .body = msg[hdr..total] };
+        var r = R{ .d = msg[0 .. 16 + flen], .p = 16 };
+        const eql = std.mem.eql;
+        while (r.p < r.d.len and !r.bad) {
+            r.alignTo(8);
+            if (r.p >= r.d.len) break;
+            const code = r.byte();
+            const t = r.sig();
+            if (code == 5 and eql(u8, t, "u")) {
+                m.reply_serial = r.u32_();
+            } else if (code == 4 and eql(u8, t, "s")) {
+                m.err_name = r.str();
+            } else if (code == 8 and eql(u8, t, "g")) {
+                m.sig = r.sig();
+            } else if (code == 1 and eql(u8, t, "o")) {
+                m.path = r.str();
+            } else if (code == 2 and eql(u8, t, "s")) {
+                m.iface = r.str();
+            } else if (code == 3 and eql(u8, t, "s")) {
+                m.member = r.str();
+            } else if (code == 7 and eql(u8, t, "s")) {
+                m.sender = r.str();
+            } else r.skip(t);
+        }
+        if (r.bad) return error.Protocol;
+        return m;
+    }
+
+    /// Обработать сообщение, которое не является ответом на текущий синхронный вызов.
+    fn handle(c: *Conn, m: *const Msg) void {
+        switch (m.kind) {
+            2, 3 => {
+                for (&c.waiting, 0..) |*s, i| {
+                    if (s.* == 0 or s.* != m.reply_serial) continue;
+                    var d = Done{ .serial = s.*, .ok = m.kind == 2 };
+                    if (m.kind == 3) {
+                        const name = if (m.err_name.len > 0) m.err_name else "error";
+                        d.name_len = @min(name.len, d.name_buf.len);
+                        @memcpy(d.name_buf[0..d.name_len], name[0..d.name_len]);
+                        var text: []const u8 = name;
+                        if (m.sig.len > 0 and m.sig[0] == 's') {
+                            var r = R{ .d = m.body };
+                            const t = r.str();
+                            if (!r.bad) text = t;
+                        }
+                        d.msg_len = @min(text.len, d.msg_buf.len);
+                        @memcpy(d.msg_buf[0..d.msg_len], text[0..d.msg_len]);
+                    }
+                    c.done[i] = d;
+                    s.* = 0;
+                    return;
+                }
+            },
+            4 => if (c.on_signal) |cb| cb(m.iface, m.member, m.sig, m.body),
+            1 => {
+                const in = Incoming{ .serial = m.serial, .flags = m.flags, .sender = m.sender, .path = m.path, .iface = m.iface, .member = m.member, .sig = m.sig, .body = m.body };
+                if (c.on_method) |cb| cb(c, &in) else c.replyError(&in, "org.freedesktop.DBus.Error.UnknownMethod", "нет такого метода");
+            },
+            else => {},
+        }
+    }
+
     fn waitReply(c: *Conn, serial: u32) Error!Reply {
         // предыдущий ответ уже обработан — убираем его, остальное (если пришло) сохраняем
         if (c.consumed > 0) {
@@ -378,56 +581,40 @@ pub const Conn = struct {
             c.consumed = 0;
         }
         while (true) {
-            // целое сообщение уже в буфере?
-            while (c.ilen >= 16) {
-                if (c.in[0] != 'l') return error.Protocol; // big-endian не поддерживаем
-                const body_len = std.mem.readInt(u32, c.in[4..8], .little);
-                const flen = std.mem.readInt(u32, c.in[12..16], .little);
-                const hdr = (16 + @as(usize, flen) + 7) & ~@as(usize, 7);
-                const total = hdr + @as(usize, body_len);
-                if (total > c.in.len) return error.TooBig;
-                if (c.ilen < total) break;
-                const msg = c.in[0..total];
-                const kind = msg[1];
-                var reply_serial: u32 = 0;
-                var err_name: []const u8 = "";
-                var msig: []const u8 = "";
-                var iface: []const u8 = "";
-                var member: []const u8 = "";
-                var r = R{ .d = msg[0 .. 16 + flen], .p = 16 };
-                while (r.p < r.d.len and !r.bad) {
-                    r.alignTo(8);
-                    if (r.p >= r.d.len) break;
-                    const code = r.byte();
-                    const t = r.sig();
-                    const eql = std.mem.eql;
-                    if (code == 5 and eql(u8, t, "u")) {
-                        reply_serial = r.u32_();
-                    } else if (code == 4 and eql(u8, t, "s")) {
-                        err_name = r.str();
-                    } else if (code == 8 and eql(u8, t, "g")) {
-                        msig = r.sig();
-                    } else if (code == 2 and eql(u8, t, "s")) {
-                        iface = r.str();
-                    } else if (code == 3 and eql(u8, t, "s")) {
-                        member = r.str();
-                    } else r.skip(t);
-                }
-                if (r.bad) return error.Protocol;
-                if ((kind == 2 or kind == 3) and reply_serial == serial) {
+            while (try c.complete()) |total| {
+                const m = try c.parse(total);
+                if ((m.kind == 2 or m.kind == 3) and m.reply_serial == serial) {
                     c.consumed = total;
-                    return .{ .sig = msig, .body = msg[hdr..total], .err_name = if (kind == 3) (if (err_name.len > 0) err_name else "error") else "" };
+                    return .{ .sig = m.sig, .body = m.body, .err_name = if (m.kind == 3) (if (m.err_name.len > 0) m.err_name else "error") else "" };
                 }
-                if (kind == 4) {
-                    if (c.on_signal) |cb| cb(iface, member, msig, msg[hdr..total]);
-                }
-                // чужое сообщение обработано — выбрасываем
-                c.drop(total);
+                c.handle(&m);
+                c.drop(total); // чужое сообщение обработано — выбрасываем
             }
             try c.waitReadable(10000);
             const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
             if (k == 0) return error.Io;
             c.ilen += k;
+        }
+    }
+
+    /// Прочитать, что пришло (сокет готов к чтению), и обработать все целые сообщения:
+    /// ответы на асинхронные вызовы, сигналы, входящие вызовы.
+    pub fn pump(c: *Conn) Error!void {
+        if (c.consumed > 0) {
+            c.drop(c.consumed);
+            c.consumed = 0;
+        }
+        var pfd = [1]sys.PollFd{.{ .fd = c.fd, .events = sys.POLLIN }};
+        if ((sys.poll(&pfd, 0) catch 0) > 0) {
+            if (c.ilen == c.in.len) return error.TooBig;
+            const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
+            if (k == 0) return error.Io;
+            c.ilen += k;
+        }
+        while (try c.complete()) |total| {
+            const m = try c.parse(total);
+            c.handle(&m);
+            c.drop(total);
         }
     }
 };

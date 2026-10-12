@@ -8,10 +8,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const release = optimize != .Debug;
 
-    // zpanel — сама панель, zwifi — меню Wi‑Fi (запускается кликом по значку)
+    // zpanel — сама панель; меню запускаются кликом по значкам; zbg — демон обоев
     const apps = [_]struct { name: []const u8, root: []const u8 }{
         .{ .name = "zpanel", .root = "src/main.zig" },
         .{ .name = "zwifi", .root = "src/wifi.zig" },
+        .{ .name = "zbt", .root = "src/bt.zig" },
+        .{ .name = "zwall", .root = "src/wall.zig" },
+        .{ .name = "zbg", .root = "src/zbg.zig" },
+        .{ .name = "zpower", .root = "src/power.zig" },
+        .{ .name = "zcal", .root = "src/cal.zig" },
     };
     for (apps) |app| {
         const exe = b.addExecutable(.{

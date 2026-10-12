@@ -53,6 +53,49 @@ pub const Canvas = struct {
         }
     }
 
+    /// Картинка RGB (3 байта на пиксель, sw×sh) в прямоугольник (x, y, w, h) устройства:
+    /// при уменьшении — усреднение, углы скруглены радиусом r.
+    pub fn image(self: *Canvas, rgb: []const u8, sw: u32, sh: u32, x: f32, y: f32, w: f32, h: f32, r: f32) void {
+        if (w < 1 or h < 1 or sw == 0 or sh == 0 or rgb.len < @as(usize, sw) * sh * 3) return;
+        const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x))));
+        const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(y))));
+        const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x + w))));
+        const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(y + h))));
+        const fx: f32 = @as(f32, @floatFromInt(sw)) / w;
+        const fy: f32 = @as(f32, @floatFromInt(sh)) / h;
+        const rr = @min(r, @min(w, h) / 2);
+        var py = y0;
+        while (py < y1) : (py += 1) {
+            const ly = @as(f32, @floatFromInt(py)) - y;
+            const sy0: u32 = @intFromFloat(std.math.clamp(@floor(ly * fy), 0, @as(f32, @floatFromInt(sh - 1))));
+            const sy1: u32 = @max(sy0 + 1, @min(sh, @as(u32, @intFromFloat(@max(0, @floor((ly + 1) * fy))))));
+            var px = x0;
+            while (px < x1) : (px += 1) {
+                const lx = @as(f32, @floatFromInt(px)) - x;
+                const d = sdBox(lx + 0.5 - w / 2, ly + 0.5 - h / 2, w / 2, h / 2, rr);
+                const cov = 0.5 - d;
+                if (cov <= 0) continue;
+                const sx0: u32 = @intFromFloat(std.math.clamp(@floor(lx * fx), 0, @as(f32, @floatFromInt(sw - 1))));
+                const sx1: u32 = @max(sx0 + 1, @min(sw, @as(u32, @intFromFloat(@max(0, @floor((lx + 1) * fx))))));
+                var acc: [3]u32 = .{ 0, 0, 0 };
+                var cnt: u32 = 0;
+                var sy = sy0;
+                while (sy < sy1) : (sy += 1) {
+                    var sx = sx0;
+                    while (sx < sx1) : (sx += 1) {
+                        const i = (@as(usize, sy) * sw + sx) * 3;
+                        acc[0] += rgb[i];
+                        acc[1] += rgb[i + 1];
+                        acc[2] += rgb[i + 2];
+                        cnt += 1;
+                    }
+                }
+                const c = 0xff000000 | ((acc[0] / cnt) << 16) | ((acc[1] / cnt) << 8) | (acc[2] / cnt);
+                self.blend(px, py, c, cov);
+            }
+        }
+    }
+
     /// Обходит пиксели прямоугольника и красит с покрытием clamp(0.5 - dist).
     fn paint(self: *Canvas, x0f: f32, y0f: f32, x1f: f32, y1f: f32, color: u32, ctx: anytype, comptime dist: fn (@TypeOf(ctx), f32, f32) f32) void {
         const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x0f))));

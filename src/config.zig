@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Настройки zpanel. Правите этот файл и пересобираете: `zig build -Doptimize=ReleaseSmall`.
+//! Настройки zpanel. Правите этот файл и пересобираете: `zig build -Doptimize=ReleaseSafe`.
 //! Цвета можно менять и без пересборки — через файл темы (см. `theme_file` ниже и README).
 
 const hex = @import("color.zig").hex;
@@ -45,7 +45,7 @@ pub const tag_number_size: f32 = 10;
 // ---------------------------------------------------------------- нагрузка и безопасность
 
 /// Wi‑Fi/Bluetooth обновляются по событиям ядра (netlink). Этот опрос — только запасной:
-/// уровень сигнала и включение Bluetooth через bluetoothctl событий не дают.
+/// уровень сигнала и включение адаптера через BlueZ событий ядра не дают.
 pub const status_poll_s: u32 = 30;
 
 /// Песочница: seccomp (запрет exec, сетевых сокетов, записи файлов) + Landlock (чтение только
@@ -97,6 +97,8 @@ pub const Theme = struct {
     menu_border: u32,
     menu_hover: u32,
     menu_error: u32,
+    // рабочий стол (zbg): цвет, пока обои не выбраны, и поля в режиме .fit
+    desktop: u32,
 };
 
 pub const theme = Theme{
@@ -128,9 +130,10 @@ pub const theme = Theme{
     .menu_border = hex("#45475a"),
     .menu_hover = hex("#ffffff14"),
     .menu_error = hex("#f38ba8"),
+    .desktop = hex("#11111b"),
 };
 
-// ---------------------------------------------------------------- меню Wi‑Fi (zwifi)
+// ---------------------------------------------------------------- меню (zwifi, zbt, zwall, zpower, zcal)
 
 /// Шрифты TrueType (.ttf, контуры glyf) — берётся первый найденный.
 /// CFF/OTF не поддерживаются. Вставьте свой путь первой строкой.
@@ -143,14 +146,27 @@ pub const font_paths = [_][]const u8{
     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", // Fedora
     "/usr/share/fonts/TTF/Inter-Regular.ttf",
 };
+/// Размер карточек Wi‑Fi и Bluetooth (у питания, календаря и обоев — свой).
 pub const menu_width: u32 = 400;
 pub const menu_height: u32 = 500;
 pub const menu_radius: f32 = 16;
-pub const menu_font_size: f32 = 14;
+
+/// Питание: спрашивать подтверждение для выхода, перезагрузки и выключения.
+pub const power_confirm = true;
+/// Перед сном блокировать экран командой lock_cmd.
+pub const lock_before_suspend = true;
+
+/// Папка с обоями (~ — домашняя папка). Поддерживаются JPEG и PNG.
+pub const wallpaper_dir = "~/Pictures/wallpapers";
+/// Как вписывать обои: .fill — заполнить экран с обрезкой краёв, .fit — целиком, с полями.
+pub const wallpaper_mode: enum { fill, fit } = .fill;
+
+pub const lock_cmd = "swaylock -f";
 
 // ---------------------------------------------------------------- действия
 // Команды выполняются через /bin/sh -c процессом-брокером. Сама панель запускать
 // программы не может — брокер исполняет только команды, вшитые сюда при сборке.
+// zwifi, zbt, zwall, zpower и zcal лежат рядом с zpanel — брокер находит их сам.
 // null — ничего не делать.
 
 pub const Action = struct {
@@ -159,75 +175,13 @@ pub const Action = struct {
     middle: ?[*:0]const u8 = null,
 };
 
-pub const wallpaper_dir = "$HOME/Pictures/wallpapers";
-pub const lock_cmd = "swaylock -f";
-
 pub const launcher = Action{
     .left = "rofi -show drun",
     .right = "rofi -show run",
 };
 
-pub const clock = Action{};
-
-pub const wifi = Action{ .left = "zwifi", .right = wifi_toggle };
-pub const bluetooth = Action{ .left = bt_menu, .right = bt_toggle };
-pub const wallpaper = Action{ .left = wall_random, .right = wall_pick };
-pub const power = Action{ .left = power_menu, .right = lock_cmd };
-
-// Wi‑Fi: ЛКМ — своё меню zwifi (см. src/wifi.zig), ПКМ — включить/выключить радио.
-const wifi_toggle =
-    \\if [ "$(nmcli radio wifi)" = enabled ]; then nmcli radio wifi off; else nmcli radio wifi on; fi
-;
-
-// Bluetooth: список сопряжённых устройств, «*» — подключено; выбор подключает/отключает.
-const bt_menu =
-    \\bluetoothctl show | grep -q 'Powered: yes' || { rfkill unblock bluetooth 2>/dev/null; bluetoothctl power on >/dev/null; }
-    \\list=$(bluetoothctl devices | while read -r _ mac name; do
-    \\  if bluetoothctl info "$mac" | grep -q 'Connected: yes'; then printf '* %s %s\n' "$mac" "$name"
-    \\  else printf '  %s %s\n' "$mac" "$name"; fi
-    \\done)
-    \\[ -n "$list" ] || exit 0
-    \\sel=$(printf '%s\n' "$list" | rofi -dmenu -i -p bluetooth) || exit 0
-    \\mac=$(printf '%s' "$sel" | awk '{ print ($1 == "*") ? $2 : $1 }')
-    \\case $sel in \**) bluetoothctl disconnect "$mac" ;; *) bluetoothctl connect "$mac" ;; esac
-;
-
-const bt_toggle =
-    \\if bluetoothctl show | grep -q 'Powered: yes'; then bluetoothctl power off
-    \\else rfkill unblock bluetooth 2>/dev/null; bluetoothctl power on; fi
-;
-
-// Обои: swaybg. Новый процесс стартует раньше, чем гасится старый, — без мигания.
-// Последние обои — ссылка ~/.cache/zpanel-wallpaper (удобно восстанавливать при старте).
-const wall_common = "dir=\"" ++ wallpaper_dir ++ "\"\n" ++
-    \\set_wall() {
-    \\  mkdir -p "$HOME/.cache" && ln -sf "$1" "$HOME/.cache/zpanel-wallpaper"
-    \\  old=$(pgrep -u "$(id -u)" -x swaybg)
-    \\  swaybg -m fill -i "$1" >/dev/null 2>&1 &
-    \\  sleep 0.4; [ -n "$old" ] && kill $old
-    \\}
-    \\images() { find "$dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \); }
-    \\
-;
-
-const wall_random = wall_common ++
-    \\f=$(images | shuf -n 1)
-    \\[ -n "$f" ] && set_wall "$f"
-;
-
-const wall_pick = wall_common ++
-    \\f=$(images | sed "s|^$dir/||" | sort | rofi -dmenu -i -p wallpaper) || exit 0
-    \\[ -n "$f" ] && set_wall "$dir/$f"
-;
-
-// Питание: блокировка, выход из mango, сон, перезагрузка, выключение (с подтверждением).
-const power_menu = "lock='" ++ lock_cmd ++ "'\n" ++
-    \\confirm() { [ "$(printf 'Нет\nДа\n' | rofi -dmenu -i -p "$1?")" = "Да" ]; }
-    \\case $(printf 'Заблокировать\nВыйти\nСон\nПерезагрузить\nВыключить\n' | rofi -dmenu -i -p power) in
-    \\  Заблокировать) $lock ;;
-    \\  Выйти) confirm "Выйти" && { mmsg dispatch quit || pkill -u "$(id -u)" -x mango; } ;;
-    \\  Сон) $lock & sleep 0.5; systemctl suspend ;;
-    \\  Перезагрузить) confirm "Перезагрузить" && systemctl reboot ;;
-    \\  Выключить) confirm "Выключить" && systemctl poweroff ;;
-    \\esac
-;
+pub const clock = Action{ .left = "zcal" };
+pub const wifi = Action{ .left = "zwifi", .right = "zwifi toggle" };
+pub const bluetooth = Action{ .left = "zbt", .right = "zbt toggle" };
+pub const wallpaper = Action{ .left = "zwall", .right = "zwall random" };
+pub const power = Action{ .left = "zpower", .right = lock_cmd };

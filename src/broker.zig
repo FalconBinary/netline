@@ -24,9 +24,11 @@ pub fn start(cmds: []const ?[*:0]const u8) bool {
         return false;
     };
     if (pid == 0) {
-        sys.close(pair[0]);
-        sys.prependExeDirToPath(); // zwifi рядом с zpanel найдётся без настройки PATH
-        serve(pair[1], cmds);
+        // брокеру не нужны чужие дескрипторы (сокет «меню открыто», Wayland, D-Bus) —
+        // оставляем только свой конец пары и stdin/stdout/stderr
+        const own = sys.keepOnlyFd(pair[1]);
+        sys.prependExeDirToPath(); // меню и zbg рядом с zpanel найдутся без настройки PATH
+        serve(own, cmds);
     }
     sys.close(pair[1]);
     sock = pair[0];

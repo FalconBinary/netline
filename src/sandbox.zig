@@ -21,21 +21,28 @@ pub const Opts = struct {
     ioctl: ?u32 = null,
     /// дополнительные системные вызовы без проверки аргументов
     extra: []const linux.SYS = &.{},
+    /// разрешить openat на запись/создание (куда именно — решает Landlock: write_paths)
+    write_files: bool = false,
 };
 
-pub fn apply(read_paths: []const [:0]const u8, comptime opts: Opts) void {
+/// read_paths — только чтение; write_paths — чтение и запись/создание/удаление файлов внутри.
+pub fn apply(read_paths: []const [:0]const u8, write_paths: []const [:0]const u8, comptime opts: Opts) void {
     _ = sys.prctl(38, 1, 0) catch sys.log("PR_SET_NO_NEW_PRIVS не удался", .{}); // PR_SET_NO_NEW_PRIVS
     _ = sys.prctl(4, 0, 0) catch {}; // PR_SET_DUMPABLE = 0: нельзя подключиться ptrace'ом и снять дамп
-    landlock(read_paths);
+    landlock(read_paths, write_paths);
     seccomp(opts);
 }
 
 // ================================================================= Landlock
 
+const FS_WRITE_FILE: u64 = 1 << 1;
 const FS_READ_FILE: u64 = 1 << 2;
 const FS_READ_DIR: u64 = 1 << 3;
+const FS_REMOVE_FILE: u64 = 1 << 5;
+const FS_MAKE_REG: u64 = 1 << 8;
+const FS_TRUNCATE: u64 = 1 << 14;
 
-fn landlock(read_paths: []const [:0]const u8) void {
+fn landlock(read_paths: []const [:0]const u8, write_paths: []const [:0]const u8) void {
     const abi_rc = sys.raw(.landlock_create_ruleset, 0, 0, 1) catch { // LANDLOCK_CREATE_RULESET_VERSION
         sys.log("Landlock недоступен в ядре — только seccomp", .{});
         return;
@@ -65,6 +72,13 @@ fn landlock(read_paths: []const [:0]const u8) void {
         defer sys.close(fd);
         // для каталога — чтение файлов и списка, для файла — только чтение
         if (!addRule(rs, fd, FS_READ_FILE | FS_READ_DIR)) _ = addRule(rs, fd, FS_READ_FILE);
+    }
+    for (write_paths) |p| {
+        const fd = sys.openPath(p) catch continue;
+        defer sys.close(fd);
+        var acc = FS_READ_FILE | FS_READ_DIR | FS_WRITE_FILE | FS_MAKE_REG | FS_REMOVE_FILE;
+        if (abi >= 3) acc |= FS_TRUNCATE;
+        _ = addRule(rs, fd, acc);
     }
     _ = sys.raw(.landlock_restrict_self, @intCast(rs), 0, 0) catch {
         sys.log("Landlock: не удалось применить правила", .{});
@@ -112,11 +126,13 @@ fn nr(comptime name: linux.SYS) u32 {
 
 /// Простые разрешённые вызовы (без проверки аргументов).
 const simple = [_]linux.SYS{
-    .read,          .write,       .close,           .getdents64,
-    .ppoll,         .clock_gettime, .timerfd_settime, .sendto,
-    .sendmsg,       .recvmsg,     .memfd_create,    .ftruncate,
-    .munmap,        .exit,        .exit_group,      .rt_sigreturn,
+    .read,            .write,         .close,           .getdents64,
+    .ppoll,           .clock_gettime, .timerfd_settime, .sendto,
+    .sendmsg,         .recvmsg,       .memfd_create,    .ftruncate,
+    .munmap,          .exit,          .exit_group,      .rt_sigreturn,
     .restart_syscall,
+    // обработчик паники Zig сбрасывает сигналы перед выводом сообщения
+    .rt_sigaction,  .rt_sigprocmask,
 };
 
 const PROT_EXEC: u32 = 4;
@@ -181,11 +197,11 @@ fn seccomp(comptime opts: Opts) void {
     p[n] = .{ .code = JEQ, .k = opts.ioctl orelse 0xffffffff, .t = .allow, .f = .kill };
     n += 1;
 
-    // openat: только на чтение
+    // openat: только на чтение (или и на запись — тогда куда, решает Landlock)
     at.set(.openat, n);
     p[n] = .{ .code = LD_W_ABS, .k = arg(2) };
     n += 1;
-    p[n] = .{ .code = JSET, .k = OPEN_WRITE_MASK, .t = .kill, .f = .allow };
+    p[n] = .{ .code = JSET, .k = if (opts.write_files) 0o20000000 else OPEN_WRITE_MASK, .t = .kill, .f = .allow }; // __O_TMPFILE запрещён всегда
     n += 1;
 
     at.set(.kill, n);

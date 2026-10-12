@@ -36,7 +36,10 @@ bluetooth_off       = #585b70
 wallpaper = #cdd6f4
 power     = #f38ba8
 
-# меню Wi-Fi (zwifi)
+# рабочий стол: цвет под обоями (пока обои не выбраны, и поля в режиме fit)
+desktop = #11111b
+
+# все меню: zwifi, zbt, zwall, zpower, zcal
 menu_background  = #1e1e2ef2
 menu_backdrop    = #00000059    # затемнение экрана вокруг меню
 menu_text        = #cdd6f4

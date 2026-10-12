@@ -43,6 +43,38 @@ pub fn openRead(path: [*:0]const u8) Error!i32 {
     return @intCast(rc);
 }
 
+/// Открыть или создать файл (O_RDWR|O_CREAT, 0600).
+pub fn openCreate(path: [*:0]const u8) Error!i32 {
+    const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), 2 | 0o100 | O_CLOEXEC, 0o600));
+    return @intCast(rc);
+}
+
+/// Создать файл заново (O_WRONLY|O_CREAT|O_TRUNC, 0600).
+pub fn createFile(path: [*:0]const u8) Error!i32 {
+    const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), 1 | 0o100 | 0o1000 | O_CLOEXEC, 0o600));
+    return @intCast(rc);
+}
+
+/// mkdir 0700 (если уже есть — не ошибка).
+pub fn mkdir(path: [*:0]const u8) void {
+    _ = linux.syscall3(.mkdirat, ufd(AT_FDCWD), @intFromPtr(path), 0o700);
+}
+
+pub fn lseek(fd: i32, off: usize) Error!usize {
+    return check(linux.syscall3(.lseek, ufd(fd), off, 0)); // SEEK_SET
+}
+
+/// accept4 без адреса; null — ошибка.
+pub fn accept(fd: i32) ?i32 {
+    const c = check(linux.syscall4(.accept4, ufd(fd), 0, 0, SOCK_CLOEXEC)) catch return null;
+    return @intCast(c);
+}
+
+pub fn openRW(path: [*:0]const u8) Error!i32 {
+    const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), 2 | O_CLOEXEC, 0)); // O_RDWR
+    return @intCast(rc);
+}
+
 /// O_PATH-дескриптор (для правил Landlock).
 pub fn openPath(path: [*:0]const u8) Error!i32 {
     const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), O_PATH | O_CLOEXEC, 0));
@@ -60,6 +92,23 @@ pub fn read(fd: i32, buf: []u8) Error!usize {
 
 pub fn write(fd: i32, data: []const u8) Error!usize {
     return check(linux.syscall3(.write, ufd(fd), @intFromPtr(data.ptr), data.len));
+}
+
+/// Записать всё (в файл; для сокетов — sendAll).
+pub fn writeAll(fd: i32, data: []const u8) Error!void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = write(fd, data[off..]) catch |e| {
+            if (e == error.Interrupted) continue;
+            return e;
+        };
+        if (n == 0) return error.Failed;
+        off += n;
+    }
+}
+
+pub fn unlink(path: [*:0]const u8) void {
+    _ = linux.syscall3(.unlinkat, ufd(AT_FDCWD), @intFromPtr(path), 0);
 }
 
 pub fn close(fd: i32) void {
@@ -292,12 +341,19 @@ pub fn listenAbstract(name: []const u8) Error!i32 {
 }
 
 pub fn connectAbstract(name: []const u8) bool {
+    const fd = connectAbstractFd(name) catch return false;
+    close(fd);
+    return true;
+}
+
+/// Подключение к абстрактному unix-сокету; возвращает дескриптор.
+pub fn connectAbstractFd(name: []const u8) Error!i32 {
     var addr: SockaddrAbs = undefined;
     const len = abstractAddr(name, &addr);
-    const fd = socket(1, 1, 0) catch return false;
-    defer close(fd);
-    _ = check(linux.syscall3(.connect, ufd(fd), @intFromPtr(&addr), len)) catch return false;
-    return true;
+    const fd = try socket(1, 1, 0);
+    errdefer close(fd);
+    _ = try check(linux.syscall3(.connect, ufd(fd), @intFromPtr(&addr), len));
+    return fd;
 }
 
 pub fn ioctl(fd: i32, req: usize, arg: usize) Error!usize {
@@ -318,6 +374,12 @@ pub fn ftruncate(fd: i32, len: usize) Error!void {
 pub fn mmap(len: usize, fd: i32) Error![*]u8 {
     // PROT_READ|PROT_WRITE, MAP_SHARED
     const rc = try check(linux.syscall6(.mmap, 0, len, 3, 1, ufd(fd), 0));
+    return @ptrFromInt(rc);
+}
+
+/// Анонимная память (PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS).
+pub fn mmapAnon(len: usize) Error![*]u8 {
+    const rc = try check(linux.syscall6(.mmap, 0, len, 3, 0x22, ufd(-1), 0));
     return @ptrFromInt(rc);
 }
 
@@ -347,6 +409,12 @@ fn clockTs(clock: usize) Timespec {
 
 pub fn realtime() i64 {
     return clockTs(0).sec; // CLOCK_REALTIME
+}
+
+/// Монотонное время в миллисекундах.
+pub fn monoMs() u64 {
+    const ts = clockTs(1); // CLOCK_MONOTONIC
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1000000;
 }
 
 pub const PollFd = extern struct { fd: i32, events: i16, revents: i16 = 0 };
@@ -407,6 +475,29 @@ pub fn exit(code: u8) noreturn {
 pub fn fork() Error!usize {
     // clone(SIGCHLD, 0, ...) == fork(); работает и на x86_64, и на aarch64
     return check(linux.syscall5(.clone, 17, 0, 0, 0, 0));
+}
+
+/// Закрыть все дескрипторы, кроме 0–2 и `fd` (он переносится на номер 3). Возвращает 3.
+pub fn keepOnlyFd(fd: i32) i32 {
+    if (fd != 3) {
+        _ = linux.syscall3(.dup3, ufd(fd), 3, O_CLOEXEC);
+        close(fd);
+    }
+    // close_range(4, ~0, 0); на старых ядрах — по одному
+    const rc = linux.syscall3(.close_range, 4, std.math.maxInt(u32), 0);
+    if (rc > std.math.maxInt(usize) - 4096) {
+        var i: i32 = 4;
+        while (i < 1024) : (i += 1) close(i);
+    }
+    return 3;
+}
+
+/// Случайное число от ядра (getrandom); при ошибке — от часов.
+pub fn random() u64 {
+    var v: u64 = 0;
+    const rc = linux.syscall3(.getrandom, @intFromPtr(&v), 8, 0);
+    if (rc != 8) v = @bitCast(clockTs(1).nsec *% 2654435761 +% clockTs(0).sec);
+    return v;
 }
 
 pub fn getuid() usize {
@@ -502,6 +593,41 @@ pub fn getenv(name: []const u8) ?[]const u8 {
             return s[name.len + 1 ..];
     }
     return null;
+}
+
+// ---------------------------------------------------------------- аргументы и секреты
+
+/// argv[i] == s ?
+pub fn argIs(i: usize, s: []const u8) bool {
+    if (i >= std.os.argv.len) return false;
+    return std.mem.eql(u8, std.mem.span(std.os.argv[i]), s);
+}
+
+pub fn argAt(i: usize) ?[]const u8 {
+    if (i >= std.os.argv.len) return null;
+    return std.mem.span(std.os.argv[i]);
+}
+
+/// Затереть память так, чтобы компилятор не выбросил запись.
+pub fn secureZero(b: []u8) void {
+    const v: []volatile u8 = b;
+    for (v) |*c| c.* = 0;
+}
+
+/// Принять соединение и вернуть uid собеседника (SO_PEERCRED). Соединение сразу закрывается.
+pub fn acceptPeerUid(fd: i32) ?u32 {
+    const c = check(linux.syscall4(.accept4, ufd(fd), 0, 0, SOCK_CLOEXEC)) catch return null;
+    const cfd: i32 = @intCast(c);
+    defer close(cfd);
+    return peerUid(cfd);
+}
+
+/// uid процесса на другом конце unix-сокета.
+pub fn peerUid(fd: i32) ?u32 {
+    var cred: [3]u32 = undefined; // pid, uid, gid
+    var len: u32 = @sizeOf([3]u32);
+    _ = check(linux.syscall5(.getsockopt, ufd(fd), 1, 17, @intFromPtr(&cred), @intFromPtr(&len))) catch return null; // SOL_SOCKET, SO_PEERCRED
+    return cred[1];
 }
 
 // ---------------------------------------------------------------- вывод
