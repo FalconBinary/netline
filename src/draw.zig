@@ -50,6 +50,27 @@ pub const Canvas = struct {
         }
     }
 
+    /// Картинка с предумноженной альфой (0xAARRGGBB, w×h) один к одному в точку (x, y) устройства.
+    pub fn argb(self: *Canvas, src: []const u32, w: u32, h: u32, x: i32, y: i32) void {
+        if (src.len < @as(usize, w) * h) return;
+        const iw: i32 = @intCast(w);
+        const c0: i32 = @max(0, -x);
+        const c1: i32 = @min(iw, self.w - x);
+        const r0: i32 = @max(0, -y);
+        const r1: i32 = @min(@as(i32, @intCast(h)), self.h - y);
+        if (c0 >= c1 or r0 >= r1) return;
+        var r = r0;
+        while (r < r1) : (r += 1) {
+            const s = src[@as(usize, @intCast(r)) * w ..][@intCast(c0)..@intCast(c1)];
+            const dst = self.row(y + r)[@intCast(x + c0)..][0..s.len];
+            for (s, dst) |p, *d| {
+                const a = p >> 24;
+                if (a == 0) continue;
+                d.* = if (a == 255) p else p + scalePx(d.*, 255 - a);
+            }
+        }
+    }
+
     /// Картинка RGB (3 байта на пиксель, sw×sh) в прямоугольник (x, y, w, h) устройства:
     /// при уменьшении — усреднение, углы скруглены радиусом r.
     pub fn image(self: *Canvas, rgb: []const u8, sw: u32, sh: u32, x: f32, y: f32, w: f32, h: f32, r: f32) void {
@@ -214,6 +235,13 @@ pub fn premul(c: u32) u32 {
         out |= (((c >> sh) & 0xff) * a / 255) << sh;
     }
     return out;
+}
+
+/// Все четыре канала × k / 255 (два канала на 16-битную половину слова).
+inline fn scalePx(c: u32, k: u32) u32 {
+    const rb = (c & 0x00ff00ff) * k + 0x00800080;
+    const ag = ((c >> 8) & 0x00ff00ff) * k + 0x00800080;
+    return (((rb + ((rb >> 8) & 0x00ff00ff)) >> 8) & 0x00ff00ff) | ((ag + ((ag >> 8) & 0x00ff00ff)) & 0xff00ff00);
 }
 
 /// x / 255 с округлением, точно для 0..65535.

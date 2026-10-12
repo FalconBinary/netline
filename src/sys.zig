@@ -530,6 +530,43 @@ pub fn spawnShell(cmd: [*:0]const u8) void {
     _ = linux.syscall4(.wait4, pid, @intFromPtr(&status), 0, 0);
 }
 
+/// Запускает программу без shell, тоже отвязанной. argv[0] без '/' ищется в PATH;
+/// dir — рабочая папка (null — не менять).
+pub fn spawnArgv(av: [*:null]const ?[*:0]const u8, dir: ?[*:0]const u8) void {
+    const pid = fork() catch return;
+    if (pid == 0) {
+        _ = linux.syscall0(.setsid);
+        const pid2 = fork() catch exit(1);
+        if (pid2 == 0) {
+            if (dir) |d| _ = linux.syscall1(.chdir, @intFromPtr(d));
+            execvp(av);
+            exit(127);
+        }
+        exit(0);
+    }
+    var status: u32 = 0;
+    _ = linux.syscall4(.wait4, pid, @intFromPtr(&status), 0, 0);
+}
+
+fn execvp(av: [*:null]const ?[*:0]const u8) void {
+    const a0 = std.mem.span(av[0] orelse return);
+    if (std.mem.indexOfScalar(u8, a0, '/') != null) {
+        _ = linux.syscall3(.execve, @intFromPtr(a0.ptr), @intFromPtr(av), @intFromPtr(envp()));
+        return;
+    }
+    var buf: [1024]u8 = undefined;
+    var it = std.mem.tokenizeScalar(u8, getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin", ':');
+    while (it.next()) |d| {
+        const z = joinZ(&buf, &.{ d, "/", a0 });
+        _ = linux.syscall3(.execve, @intFromPtr(z.ptr), @intFromPtr(av), @intFromPtr(envp()));
+    }
+}
+
+/// Переименовать (атомарная замена файла).
+pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
+    _ = try check(linux.syscall4(.renameat, ufd(AT_FDCWD), @intFromPtr(from), ufd(AT_FDCWD), @intFromPtr(to)));
+}
+
 // ---------------------------------------------------------------- окружение и аргументы
 // В Zig 0.16 стартовый код отдаёт argv и envp прямо в main (std.process.Init.Minimal) —
 // это те же строки, что ядро положило на стек: ничего не копируется и не читается из /proc.

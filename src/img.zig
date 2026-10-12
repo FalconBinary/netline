@@ -1577,6 +1577,16 @@ fn hpass(srow: []const u32, tx: *const Taps, out: []u32) void {
 /// строки живут в маленьком кольце (сколько строк нужно одному выходному пикселю), а не во
 /// временном буфере на всю картинку — для 4K это ~200 КБ вместо ~100 МБ.
 pub fn render(src: *const Image, dst: []u32, dw: u32, dh: u32, mode: Fit, bg: u32) Error!void {
+    return resize(src, dst, dw, dh, mode, bg, false);
+}
+
+/// Для иконок: вписать целиком, поля прозрачные, на выходе — предумноженный ARGB с альфой
+/// (накладывается через Canvas.argb).
+pub fn renderAlpha(src: *const Image, dst: []u32, dw: u32, dh: u32) Error!void {
+    return resize(src, dst, dw, dh, .fit, 0, true);
+}
+
+fn resize(src: *const Image, dst: []u32, dw: u32, dh: u32, mode: Fit, bg: u32, keep_alpha: bool) Error!void {
     const sw: f64 = @floatFromInt(src.w);
     const sh: f64 = @floatFromInt(src.h);
     const fw: f64 = @floatFromInt(dw);
@@ -1593,7 +1603,7 @@ pub fn render(src: *const Image, dst: []u32, dw: u32, dh: u32, mode: Fit, bg: u3
     const ky = if (mode == .fill) k else @as(f64, @floatFromInt(rh)) / sh;
 
     const opaque_bg = 0xff000000 | bg;
-    if (rw != dw or rh != dh) @memset(dst[0 .. @as(usize, dw) * dh], opaque_bg); // поля
+    if (rw != dw or rh != dh) @memset(dst[0 .. @as(usize, dw) * dh], if (keep_alpha) 0 else opaque_bg); // поля
 
     var tx = try taps(src.w, rw, kx, ox);
     defer tx.deinit();
@@ -1633,6 +1643,11 @@ pub fn render(src: *const Image, dst: []u32, dw: u32, dh: u32, mode: Fit, bg: u3
                 acc += @as(V4, @as(@Vector(4, u8), @bitCast(line[x]))) * @as(V4, @splat(wgt));
             }
             var c = norm(acc);
+            if (keep_alpha) {
+                c = @min(c, @as(V4, @splat(c[3]))); // предумноженный цвет не ярче альфы
+                o.* = pack(c);
+                continue;
+            }
             if (c[3] != 255) { // полупрозрачный пиксель — поверх фона (альфа уже предумножена)
                 const ia: V4 = @splat(255 - c[3]);
                 c = @min(c + @divTrunc(bgv * ia + @as(V4, @splat(127)), @as(V4, @splat(255))), @as(V4, @splat(255)));

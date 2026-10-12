@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Общий каркас меню zpanel (zwifi, zbt, zwall, zpower, zcal).
+//! Общий каркас меню zpanel (zrun, zwifi, zbt, zwall, zpower, zcal).
 //!
 //! Карточка по центру экрана поверх лёгкого затемнения, указатель, клавиатура (XKB, повтор
 //! клавиш), буфер обмена, поля ввода, кнопки, тема с перезагрузкой на лету, песочница.
@@ -253,7 +253,7 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
     repeat_timer = sys.timerfdCreate(sys.CLOCK_MONOTONIC) catch fatal("timerfd");
 
     if (cfg.sandbox) {
-        var paths: [12][:0]const u8 = undefined;
+        var paths: [24][:0]const u8 = undefined;
         var n: usize = 0;
         paths[n] = theme.dir;
         n += 1;
@@ -1152,6 +1152,24 @@ pub fn outline(cv: *draw.Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32,
 /// Текст: (x, baseline) в логических пикселях. Возвращает X после текста.
 pub fn text(cv: *draw.Canvas, s: []const u8, x: f32, baseline: f32, size: f32, c: u32, max_x: f32) f32 {
     return ttf.drawText(cv, s, @round(px(x)), px(baseline), fpx(size), c, px(max_x)) / S;
+}
+
+/// Текст с подсветкой: байты, отмеченные в hl (по первому байту символа), — цветом hc.
+pub fn textMarked(cv: *draw.Canvas, s: []const u8, x: f32, baseline: f32, size: f32, c: u32, hc: u32, max_x: f32, hl: *const [4]u64) f32 {
+    var pen = @round(px(x));
+    var i: usize = 0;
+    while (i < s.len) {
+        const on = isMarked(hl, i);
+        var j = i + 1;
+        while (j < s.len and (s[j] & 0xc0 == 0x80 or isMarked(hl, j) == on)) j += 1;
+        pen = ttf.drawText(cv, s[i..j], pen, px(baseline), fpx(size), if (on) hc else c, px(max_x));
+        i = j;
+    }
+    return pen / S;
+}
+
+fn isMarked(hl: *const [4]u64, i: usize) bool {
+    return i < 256 and hl[i / 64] & (@as(u64, 1) << @intCast(i % 64)) != 0;
 }
 
 pub fn textW(s: []const u8, size: f32) f32 {

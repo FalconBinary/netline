@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "zbg", .root = "src/zbg.zig" },
         .{ .name = "zpower", .root = "src/power.zig" },
         .{ .name = "zcal", .root = "src/cal.zig" },
+        .{ .name = "zrun", .root = "src/run.zig" },
     };
     for (apps) |app| {
         const exe = b.addExecutable(.{

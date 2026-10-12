@@ -165,10 +165,25 @@ pub const wallpaper_mode: enum { fill, fit } = .fill;
 
 pub const lock_cmd = "swaylock -f";
 
+// ---------------------------------------------------------------- лаунчер (zrun)
+
+/// Ширина карточки и сколько строк видно в списке.
+pub const launcher_width: u32 = 520;
+pub const launcher_rows: u32 = 7;
+/// Иконки приложений (PNG из темы иконок). false — только плитки с буквой.
+pub const launcher_icons = true;
+/// Тема иконок; "" — как в GTK (gtk-icon-theme-name в ~/.config/gtk-3.0/settings.ini).
+/// Читаются только PNG: у тем из одних SVG (Papirus и т. п.) иконки берутся из hicolor,
+/// а если и там нет — рисуется плитка с буквой.
+pub const icon_theme = "";
+/// Терминал для приложений с Terminal=true и для Shift+Enter: команда дописывается в конец.
+/// foot, kitty — как есть; alacritty, xterm, ghostty — .{ "alacritty", "-e" }; wezterm — .{ "wezterm", "start", "--" }.
+pub const terminal = [_][:0]const u8{"foot"};
+
 // ---------------------------------------------------------------- действия
 // Команды выполняются через /bin/sh -c процессом-брокером. Сама панель запускать
 // программы не может — брокер исполняет только команды, вшитые сюда при сборке.
-// zwifi, zbt, zwall, zpower и zcal лежат рядом с zpanel — брокер находит их сам.
+// zrun, zwifi, zbt, zwall, zpower и zcal лежат рядом с zpanel — брокер находит их сам.
 // null — ничего не делать.
 
 pub const Action = struct {
@@ -178,8 +193,8 @@ pub const Action = struct {
 };
 
 pub const launcher = Action{
-    .left = "rofi -show drun",
-    .right = "rofi -show run",
+    .left = "zrun", // приложения; rofi тоже можно: "rofi -show drun"
+    .right = "zrun run", // команды из PATH
 };
 
 pub const clock = Action{ .left = "zcal" };
