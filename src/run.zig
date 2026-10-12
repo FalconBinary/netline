@@ -449,6 +449,7 @@ var watch_full = false;
 
 /// Запомнить отпечаток пути (до чтения: правка во время чтения не останется незамеченной).
 fn watch(path: []const u8) void {
+    if (list_path.len == 0) return; // кэшировать некуда — и отпечатки не нужны
     if (nwatch == MAX_WATCH) {
         watch_full = true;
         return;
