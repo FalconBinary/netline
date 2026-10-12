@@ -48,6 +48,10 @@ pub const Dev = struct {
     connected: bool = false,
     battery: u8 = 255, // 255 — неизвестно
     rssi: i16 = -32768, // нет данных
+    // для `zbt scan`
+    random: bool = false, // случайный BLE-адрес (телефоны, часы, метки)
+    classic: bool = false, // есть класс устройства — значит, найдено как классическое (BR/EDR)
+    maker: u16 = 0xffff, // производитель из рекламы BLE, 0xffff — нет
 
     pub fn name(d: *const Dev) []const u8 {
         return d.name_buf[0..d.name_len];
@@ -211,6 +215,18 @@ pub fn refresh(out: []Dev) usize {
                     d.connected = r.boolean();
                 } else if (which == 1 and vt == 'n' and eql(u8, key, "RSSI")) {
                     d.rssi = @bitCast(r.u16_());
+                } else if (which == 1 and vt == 's' and eql(u8, key, "AddressType")) {
+                    d.random = eql(u8, r.str(), "random");
+                } else if (which == 1 and vt == 'u' and eql(u8, key, "Class")) {
+                    _ = r.u32_();
+                    d.classic = true;
+                } else if (which == 1 and eql(u8, vs, "a{qv}") and eql(u8, key, "ManufacturerData")) {
+                    const mend = r.arrayEnd(8);
+                    if (r.p < mend) {
+                        r.alignTo(8);
+                        d.maker = r.u16_();
+                    }
+                    r.p = @max(r.p, mend);
                 } else if (which == 2 and vt == 'b' and eql(u8, key, "Powered")) {
                     p_powered = r.boolean();
                 } else if (which == 2 and vt == 'b' and eql(u8, key, "Discovering")) {

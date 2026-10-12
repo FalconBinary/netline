@@ -93,7 +93,8 @@ fn fatalCli() noreturn {
     sys.exit(1);
 }
 
-/// `zbt scan`: 10 секунд поиска и полный список устройств, которые видит bluetoothd.
+/// `zbt scan [секунды]`: поиск (по умолчанию 20 секунд) и полный список устройств,
+/// которые видит bluetoothd, с подсказкой, если нужного среди них нет.
 fn scanCli() noreturn {
     if (!bz.init()) fatalCli();
     bz.keep_all = true;
@@ -101,13 +102,14 @@ fn scanCli() noreturn {
     if (bz.adapter.len == 0) fatalCli();
     sys.log("адаптер {s}: {s}", .{ bz.adapter.get(), if (bz.powered) "включён" else "ВЫКЛЮЧЕН — включите Bluetooth" });
     if (!bz.powered) sys.exit(1);
+    const secs: u32 = if (sys.argAt(2)) |a| std.math.clamp(std.fmt.parseInt(u32, a, 10) catch 20, 5, 120) else 20;
     if (!bz.startDiscovery()) {
         sys.log("поиск не запустился: {s}", .{bz.lastError()});
         sys.exit(1);
     }
-    sys.log("поиск 10 секунд...", .{});
+    sys.log("поиск {d} секунд...", .{secs});
     var i: u32 = 0;
-    while (i < 20) : (i += 1) {
+    while (i < secs * 2) : (i += 1) {
         var pfd = [1]sys.PollFd{.{ .fd = bz.bus.fd, .events = sys.POLLIN }};
         _ = sys.poll(&pfd, 500) catch {};
         bz.bus.pump() catch break;
@@ -115,19 +117,44 @@ fn scanCli() noreturn {
     const n = bz.refresh(&devs);
     bz.stopDiscovery();
     var named: usize = 0;
+    var classic: usize = 0;
+    var random: usize = 0;
     for (devs[0..n]) |*d| {
         if (d.has_name or d.paired or d.kind != .generic) named += 1;
+        if (d.classic) classic += 1;
+        if (d.random) random += 1;
         const rssi: i32 = d.rssi;
-        sys.log("{s}  {s}  {s}{s}rssi {d}", .{
+        var mk: [24]u8 = undefined;
+        sys.log("{s}  {s}  {s}, {s}{s}{s}rssi {d}", .{
             d.path.get()[bz.adapter.len..],
             d.name(),
             kindLabel(d.kind),
+            if (d.classic) "классическое" else if (d.random) "BLE, случайный адрес" else "BLE",
+            makerLabel(d.maker, &mk),
             if (d.paired) ", сопряжено, " else ", ",
             rssi,
         });
     }
     sys.log("всего {d}, из них показываются в меню: {d}", .{ n, named });
+    if (named == 0) {
+        if (random == n and n > 0) sys.log("все найденные — безымянные BLE со случайным адресом: это чужие телефоны, часы и метки поблизости", .{});
+        if (classic == 0) sys.log("классических устройств (наушники, колонки, мыши) не найдено", .{});
+        sys.log("переведите устройство в режим сопряжения (обычно долго держать кнопку питания или Bluetooth, пока не замигает)", .{});
+        sys.log("наушники, подключённые к телефону, в поиске не видны — выключите Bluetooth на телефоне", .{});
+    }
     sys.exit(0);
+}
+
+/// ", Apple" и т. п. по коду производителя из рекламы BLE.
+fn makerLabel(id: u16, buf: []u8) []const u8 {
+    const known = [_]struct { u16, []const u8 }{
+        .{ 0x004c, "Apple" },     .{ 0x0006, "Microsoft" }, .{ 0x0075, "Samsung" },
+        .{ 0x00e0, "Google" },    .{ 0x038f, "Xiaomi" },    .{ 0x027d, "Huawei" },
+        .{ 0x012d, "Sony" },      .{ 0x009e, "Bose" },      .{ 0x0087, "Garmin" },
+    };
+    if (id == 0xffff) return "";
+    for (known) |k| if (k[0] == id) return std.fmt.bufPrint(buf, ", {s}", .{k[1]}) catch "";
+    return std.fmt.bufPrint(buf, ", производитель 0x{x:0>4}", .{id}) catch "";
 }
 
 fn start() void {
