@@ -139,19 +139,21 @@ pub fn pathExists(path: [*:0]const u8) bool {
     return linux.syscall4(.faccessat, ufd(AT_FDCWD), @intFromPtr(path), 0, 0) == 0;
 }
 
-/// Время изменения в наносекундах (fstatat; 0 — нет такого пути) и размер.
-pub const Stamp = extern struct { mtime: u64 = 0, size: u64 = 0 };
+/// «Отпечаток» файла или папки: время изменения (нс), размер и inode (заменённый файл —
+/// новый inode, даже если время у него то же, как у Flatpak/OSTree). Нули — пути нет.
+pub const Stamp = extern struct { mtime: u64 = 0, size: u64 = 0, ino: u64 = 0 };
 
 pub fn stamp(path: [*:0]const u8) Stamp {
-    // statx(AT_FDCWD, path, 0, STATX_MTIME | STATX_SIZE) — одна структура на всех архитектурах
+    // statx(AT_FDCWD, path, 0, STATX_INO | STATX_MTIME | STATX_SIZE) — одна структура на всех архитектурах
     var b: [256]u8 align(8) = undefined;
-    const rc = linux.syscall5(.statx, ufd(AT_FDCWD), @intFromPtr(path), 0, 0x40 | 0x200, @intFromPtr(&b));
+    const rc = linux.syscall5(.statx, ufd(AT_FDCWD), @intFromPtr(path), 0, 0x100 | 0x40 | 0x200, @intFromPtr(&b));
     if (rc != 0) return .{};
     const sec = std.mem.readInt(i64, b[0x70..0x78], .little);
     const nsec = std.mem.readInt(u32, b[0x78..0x7c], .little);
     return .{
         .mtime = @as(u64, @bitCast(sec)) *% 1_000_000_000 +% nsec,
         .size = std.mem.readInt(u64, b[0x28..0x30], .little),
+        .ino = std.mem.readInt(u64, b[0x20..0x28], .little),
     };
 }
 

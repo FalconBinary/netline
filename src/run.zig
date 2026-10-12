@@ -42,7 +42,7 @@ const ICON: f32 = 32;
 var arena: [1 << 20]u8 = undefined;
 var arena_n: usize = 0;
 
-const Str = struct {
+const Str = extern struct {
     off: u32 = 0,
     len: u32 = 0,
 
@@ -85,7 +85,7 @@ fn keepFold(s: []const u8) Str {
 
 const IconState = enum(u8) { unknown, none, ready };
 
-const App = struct {
+const App = extern struct {
     id: Str = .{}, // org.mozilla.firefox.desktop
     file: Str = .{}, // путь к .desktop (для %k)
     name: Str = .{},
@@ -113,7 +113,7 @@ var napps: usize = 0;
 var vis: [MAX_APPS]u16 = undefined; // видимые приложения по алфавиту
 var nvis: usize = 0;
 
-const Exe = struct { name: Str, f_name: Str, uses: u32 = 0 };
+const Exe = extern struct { name: Str, f_name: Str, uses: u32 = 0 };
 const MAX_EXES = 8192;
 var exes: [MAX_EXES]Exe = undefined;
 var nexes: usize = 0;
@@ -167,6 +167,8 @@ var ndata: usize = 0;
 var cache_dir: Str = .{};
 var hist_dir: Str = .{};
 var hist_path: Str = .{};
+var list_path: Str = .{}; // кэш списка приложений и команд
+var icons_path: Str = .{}; // кэш готовых иконок
 var fbuf: [64 * 1024]u8 = undefined;
 
 fn env(name: []const u8) ?[]const u8 {
@@ -207,6 +209,8 @@ fn setupEnv() void {
         var b2: [512]u8 = undefined;
         hist_dir = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel", .{cache}) catch "");
         hist_path = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel/zrun-history", .{cache}) catch "");
+        list_path = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel/zrun-cache", .{cache}) catch "");
+        icons_path = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel/zrun-icons", .{cache}) catch "");
     }
 }
 
@@ -216,6 +220,7 @@ fn loadExes() void {
     var b: [512]u8 = undefined;
     var it = std.mem.tokenizeScalar(u8, env("PATH") orelse "/usr/local/bin:/usr/bin:/bin", ':');
     while (it.next()) |d| {
+        watch(d);
         var dir = sys.Dir.open(sys.joinZ(&b, &.{d})) orelse continue;
         defer dir.deinit();
         while (dir.next()) |name| {
@@ -257,6 +262,7 @@ fn loadApps() void {
 
 /// ID файла по спецификации: путь от папки applications, «/» → «-» (kde4/okular.desktop → kde4-okular.desktop).
 fn scanApps(path: [:0]const u8, prefix: []const u8, depth: u32) void {
+    watch(path); // и несуществующие: появится папка — кэш устареет
     var dir = sys.Dir.open(path) orelse return;
     defer dir.deinit();
     var b: [512]u8 = undefined;
@@ -276,6 +282,7 @@ fn addApp(path: [:0]const u8, id: []const u8) void {
     var slot: usize = 0;
     // такой ID уже был в папке с большим приоритетом — он и действует (в том числе Hidden=true)
     if (lookup(&app_tab, id, appKey, &slot) != null) return;
+    watch(path); // правка файла на месте не меняет время папки
     const data = sys.readFile(path, &fbuf) orelse return;
     const e = desk.parse(data, loc);
     var a = App{ .id = keep(id) };
@@ -292,7 +299,10 @@ fn addApp(path: [:0]const u8, id: []const u8) void {
 fn tryExecOk(te: []const u8) bool {
     if (te.len == 0) return true;
     var b: [512]u8 = undefined;
-    if (std.mem.indexOfScalar(u8, te, '/') != null) return sys.exists(sys.joinZ(&b, &.{te}));
+    if (std.mem.indexOfScalar(u8, te, '/') != null) {
+        watch(te);
+        return sys.exists(sys.joinZ(&b, &.{te}));
+    }
     return isExe(te);
 }
 
@@ -424,6 +434,242 @@ fn bumpHistory(kind: []const u8, key: []const u8) void {
     sys.rename(tmp, hist_path.z()) catch sys.unlink(tmp);
 }
 
+// ================================================================= кэш списка
+// Построение списка — это чтение всех .desktop-файлов (с переводами — десятки КБ каждый),
+// всего PATH и сотни проверок папок иконок. Результат пишется в ~/.cache/zpanel/zrun-cache
+// одним блоком вместе с «отпечатками» (время изменения, размер, inode) всего, что читалось:
+// папок PATH и applications, каждого .desktop-файла, папок тем иконок. При запуске
+// отпечатки сверяются — изменилось хоть что-то, список строится заново.
+
+const Watch = extern struct { path: Str, st: sys.Stamp };
+const MAX_WATCH = 4096;
+var watches: [MAX_WATCH]Watch = undefined;
+var nwatch: usize = 0;
+var watch_full = false;
+
+/// Запомнить отпечаток пути (до чтения: правка во время чтения не останется незамеченной).
+fn watch(path: []const u8) void {
+    if (nwatch == MAX_WATCH) {
+        watch_full = true;
+        return;
+    }
+    const p = keepZ(path);
+    if (p.len != path.len) {
+        watch_full = true;
+        return;
+    }
+    watches[nwatch] = .{ .path = p, .st = sys.stamp(p.z()) };
+    nwatch += 1;
+}
+
+const CACHE_MAGIC: u64 = 0x3143_4e55_525a_7a01; // версия формата — в последнем байте
+
+/// Отпечаток раскладки структур: другой бинарник с другими полями не прочтёт чужой кэш.
+const layout_key: u64 = blk: {
+    @setEvalBranchQuota(100000);
+    var h: u64 = 0xcbf29ce484222325;
+    for (.{ Str, App, Exe, IconDir, Watch, sys.Stamp }) |T| {
+        h = (h ^ @sizeOf(T)) *% 0x100000001b3;
+        for (std.meta.fields(T)) |f| {
+            for (f.name) |c| h = (h ^ c) *% 0x100000001b3;
+            h = (h ^ @offsetOf(T, f.name)) *% 0x100000001b3;
+        }
+    }
+    break :blk h;
+};
+
+const Header = extern struct {
+    magic: u64,
+    layout: u64,
+    env: u64, // окружение и настройки, от которых зависит список
+    gen: u64, // номер этого кэша: на него ссылается кэш иконок
+    base: u32, // строки кэша лежат в arena[base..end]
+    end: u32,
+    nwatch: u32,
+    napps: u32,
+    nexes: u32,
+    nicon: u32,
+    npix: u32,
+    nread: u32,
+};
+
+var list_gen: u64 = 0;
+var arena_base: usize = 0;
+
+fn fnv(h0: u64, s: []const u8) u64 {
+    var h = h0;
+    for (s) |c| h = (h ^ c) *% 0x100000001b3;
+    return h;
+}
+
+fn envKey() u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    const names = [_][]const u8{ "HOME", "PATH", "XDG_DATA_HOME", "XDG_DATA_DIRS", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_CURRENT_DESKTOP", "LC_ALL", "LC_MESSAGES", "LANG" };
+    for (names) |n| {
+        h = fnv(h, n);
+        h = fnv(h, sys.getenv(n) orelse "\x00");
+        h = fnv(h, "\n");
+    }
+    h = fnv(h, cfg.icon_theme);
+    return fnv(h, if (cfg.launcher_icons) "+" else "-");
+}
+
+fn validStr(x: Str, end: usize) bool {
+    return @as(usize, x.off) + x.len <= end;
+}
+
+fn validZ(x: Str, end: usize) bool {
+    return @as(usize, x.off) + x.len < end and arena[x.off + x.len] == 0;
+}
+
+fn readExact(fd: i32, buf: []u8) bool {
+    var n: usize = 0;
+    while (n < buf.len) {
+        const k = sys.read(fd, buf[n..]) catch return false;
+        if (k == 0) return false;
+        n += k;
+    }
+    return true;
+}
+
+/// Прочитать кэш списка. false — нет, устарел или битый (тогда строки, которые
+/// успели лечь в arena, отбрасываются и список строится заново).
+fn loadList() bool {
+    arena_base = arena_n;
+    if (list_path.len == 0) return false;
+    const fd = sys.openRead(list_path.z()) catch return false;
+    defer sys.close(fd);
+    const ok = readList(fd);
+    if (!ok) {
+        arena_n = arena_base;
+        napps = 0;
+        nexes = 0;
+        nicon = 0;
+        npix = 0;
+        nread = 0;
+        nwatch = 0;
+    }
+    return ok;
+}
+
+fn readList(fd: i32) bool {
+    var h: Header = undefined;
+    if (!readExact(fd, std.mem.asBytes(&h))) return false;
+    if (h.magic != CACHE_MAGIC or h.layout != layout_key or h.env != envKey() or h.base != arena_base) return false;
+    if (h.end < h.base or h.end > arena.len or h.nwatch > MAX_WATCH or h.napps > MAX_APPS or h.nexes > MAX_EXES or
+        h.nicon > icon_dirs.len or h.npix > pix_dirs.len or h.nread > read_paths.len) return false;
+    const end: usize = h.end;
+    if (!readExact(fd, arena[h.base..end])) return false;
+
+    // сначала отпечатки: если что-то поменялось, остальное и читать незачем
+    if (!readExact(fd, std.mem.sliceAsBytes(watches[0..h.nwatch]))) return false;
+    for (watches[0..h.nwatch]) |w| {
+        if (!validZ(w.path, end)) return false;
+        const now = sys.stamp(w.path.z());
+        if (!std.meta.eql(now, w.st)) {
+            sys.tracef("кэш списка устарел: {s}", .{w.path.get()});
+            return false;
+        }
+    }
+
+    if (!readExact(fd, std.mem.sliceAsBytes(apps[0..h.napps]))) return false;
+    if (!readExact(fd, std.mem.sliceAsBytes(exes[0..h.nexes]))) return false;
+    if (!readExact(fd, std.mem.sliceAsBytes(icon_dirs[0..h.nicon]))) return false;
+    if (!readExact(fd, std.mem.sliceAsBytes(pix_dirs[0..h.npix]))) return false;
+    var rp: [read_paths.len]Str = undefined;
+    if (!readExact(fd, std.mem.sliceAsBytes(rp[0..h.nread]))) return false;
+
+    // проверка ссылок: битый файл — пересборка, а не выход за буфер
+    for (apps[0..h.napps]) |*a| {
+        inline for (std.meta.fields(App)) |f| {
+            if (f.type == Str) {
+                if (!validStr(@field(a, f.name), end)) return false;
+            }
+        }
+        if (!validZ(a.icon, end) or !validZ(a.dir, end)) return false;
+        if (@as(*const u8, @ptrCast(&a.visible)).* > 1 or @as(*const u8, @ptrCast(&a.terminal)).* > 1) return false;
+        a.uses = 0;
+        a.icon_state = .unknown;
+    }
+    for (exes[0..h.nexes]) |*e| {
+        if (!validStr(e.name, end) or !validStr(e.f_name, end)) return false;
+        e.uses = 0;
+    }
+    for (icon_dirs[0..h.nicon]) |d| if (!validZ(d.path, end)) return false;
+    for (pix_dirs[0..h.npix]) |d| if (!validZ(d, end)) return false;
+    for (rp[0..h.nread], 0..) |x, i| {
+        if (!validZ(x, end)) return false;
+        read_paths[i] = x.z();
+    }
+
+    arena_n = end;
+    nwatch = h.nwatch;
+    napps = h.napps;
+    nexes = h.nexes;
+    nicon = h.nicon;
+    npix = h.npix;
+    nread = h.nread;
+    list_gen = h.gen;
+    // хеш-таблицы — из списков (быстрее, чем хранить)
+    @memset(&app_tab, EMPTY);
+    for (0..napps) |i| {
+        var slot: usize = 0;
+        if (lookup(&app_tab, apps[i].id.get(), appKey, &slot) == null) app_tab[slot] = @intCast(i);
+    }
+    @memset(&exe_tab, EMPTY);
+    for (0..nexes) |i| {
+        var slot: usize = 0;
+        if (lookup(&exe_tab, exes[i].name.get(), exeKey, &slot) == null) exe_tab[slot] = @intCast(i);
+    }
+    return true;
+}
+
+/// Записать кэш списка (до песочницы; через временный файл — недописанный не прочтётся).
+fn saveList() void {
+    if (list_path.len == 0 or watch_full) return;
+    list_gen = sys.random();
+    var rp: [read_paths.len]Str = undefined;
+    for (read_paths[0..nread], 0..) |x, i| rp[i] = .{ .off = @intCast(@intFromPtr(x.ptr) - @intFromPtr(&arena)), .len = @intCast(x.len) };
+    const h = Header{
+        .magic = CACHE_MAGIC,
+        .layout = layout_key,
+        .env = envKey(),
+        .gen = list_gen,
+        .base = @intCast(arena_base),
+        .end = @intCast(arena_n),
+        .nwatch = @intCast(nwatch),
+        .napps = @intCast(napps),
+        .nexes = @intCast(nexes),
+        .nicon = @intCast(nicon),
+        .npix = @intCast(npix),
+        .nread = @intCast(nread),
+    };
+    sys.mkdir(cache_dir.z());
+    sys.mkdir(hist_dir.z());
+    var tb: [600]u8 = undefined;
+    const tmp = sys.joinZ(&tb, &.{ list_path.get(), ".tmp" });
+    const fd = sys.createFile(tmp) catch return;
+    const parts = [_][]const u8{
+        std.mem.asBytes(&h),
+        arena[arena_base..arena_n],
+        std.mem.sliceAsBytes(watches[0..nwatch]),
+        std.mem.sliceAsBytes(apps[0..napps]), // счётчики запусков ещё нулевые: история читается после
+        std.mem.sliceAsBytes(exes[0..nexes]),
+        std.mem.sliceAsBytes(icon_dirs[0..nicon]),
+        std.mem.sliceAsBytes(pix_dirs[0..npix]),
+        std.mem.sliceAsBytes(rp[0..nread]),
+    };
+    for (parts) |part| {
+        sys.writeAll(fd, part) catch {
+            sys.close(fd);
+            sys.unlink(tmp);
+            return;
+        };
+    }
+    sys.close(fd);
+    sys.rename(tmp, list_path.z()) catch sys.unlink(tmp);
+}
+
 // ================================================================= брокер запуска
 // Отделяется после чтения списков, до подключения к Wayland и песочницы. Сообщения:
 //   'A' <номер u16> <флаги> — приложение из списка (Exec разбирается здесь, без shell);
@@ -494,7 +740,7 @@ fn runCommand(cmd: []const u8, term: bool) void {
 // Только PNG: тема из config.zig или GTK, её Inherits, затем hicolor; размер — ровно под
 // экран или крупнее (с уменьшением). Иконки грузятся при первом показе строки.
 
-const IconDir = struct { path: Str, size: u16, rank: u8 };
+const IconDir = extern struct { path: Str, size: u16, rank: u8 };
 var icon_dirs: [64]IconDir = undefined;
 var nicon: usize = 0;
 var dir_order: [64]u8 = undefined;
@@ -539,7 +785,9 @@ fn userTheme() []const u8 {
     const conf = env("XDG_CONFIG_HOME") orelse (std.fmt.bufPrint(&b, "{s}/.config", .{home}) catch return "");
     var pb: [600]u8 = undefined;
     for ([_][]const u8{ "/gtk-3.0/settings.ini", "/gtk-4.0/settings.ini" }) |f| {
-        if (iniValue(sys.joinZ(&pb, &.{ conf, f }), "gtk-icon-theme-name", &vb)) |v| {
+        const path = sys.joinZ(&pb, &.{ conf, f });
+        watch(path);
+        if (iniValue(path, "gtk-icon-theme-name", &vb)) |v| {
             if (v.len > 0) return keep(v).get();
         }
     }
@@ -574,7 +822,9 @@ fn iconSetup() void {
         nthemes = 1;
         var vb: [8192]u8 = undefined;
         for (roots[0..nroots]) |r| {
-            const inh = iniValue(sys.joinZ(&b, &.{ r.get(), "/", own, "/index.theme" }), "Inherits", &vb) orelse continue;
+            const idx = sys.joinZ(&b, &.{ r.get(), "/", own, "/index.theme" });
+            watch(idx);
+            const inh = iniValue(idx, "Inherits", &vb) orelse continue;
             var it = std.mem.tokenizeScalar(u8, inh, ',');
             while (it.next()) |x| {
                 const th = std.mem.trim(u8, x, " ");
@@ -590,12 +840,16 @@ fn iconSetup() void {
 
     for (themes[0..nthemes], 0..) |th, rank| {
         for (roots[0..nroots]) |r| {
-            if (r.len == 0 or !sys.exists(sys.joinZ(&b, &.{ r.get(), "/", th }))) continue;
+            if (r.len == 0) continue;
+            const tp = sys.joinZ(&b, &.{ r.get(), "/", th });
+            watch(tp); // новая папка размера в теме меняет время этой папки
+            if (!sys.exists(tp)) continue;
             for (sizes) |s| {
                 if (nicon == icon_dirs.len) break;
                 var pb: [600]u8 = undefined;
                 const p = std.fmt.bufPrint(&pb, "{s}/{s}/{d}x{d}/apps", .{ r.get(), th, s, s }) catch continue;
                 if (!sys.exists(sys.joinZ(&b, &.{p}))) continue;
+                watch(p); // новые иконки (установка программы)
                 icon_dirs[nicon] = .{ .path = keepZ(p), .size = s, .rank = @intCast(rank) };
                 nicon += 1;
             }
@@ -604,7 +858,9 @@ fn iconSetup() void {
     for (data_dirs[0..ndata]) |d| {
         if (npix == pix_dirs.len) break;
         const p = keepZ(std.fmt.bufPrint(&b, "{s}/pixmaps", .{d}) catch continue);
-        if (p.len == 0 or !sys.exists(p.z())) continue;
+        if (p.len == 0) continue;
+        watch(p.get());
+        if (!sys.exists(p.z())) continue;
         pix_dirs[npix] = p;
         npix += 1;
     }
@@ -641,15 +897,71 @@ fn resetIcons(t: u32) void {
     for (apps[0..napps]) |*a| a.icon_state = .unknown;
     for (0..nicon) |i| dir_order[i] = @intCast(i);
     std.sort.pdq(u8, dir_order[0..nicon], t, dirBefore);
+    loadIconCache(t);
 }
 
 fn iconOf(a: *App) ?[]const u32 {
     if (!cfg.launcher_icons) return null;
     const t: u32 = @intFromFloat(@round(ICON * ui.S));
     if (t != icon_t) resetIcons(t);
-    if (a.icon_state == .unknown) a.icon_state = if (loadIcon(a, t)) .ready else .none;
+    if (a.icon_state == .unknown) {
+        a.icon_state = if (loadIcon(a, t)) .ready else .none;
+        icons_dirty = true;
+    }
     if (a.icon_state != .ready) return null;
     return pool.?[a.icon_off..][0 .. t * t];
+}
+
+// ---------------------------------------------------------------- кэш готовых иконок
+// ~/.cache/zpanel/zrun-icons: иконки уже уменьшены под экран, и отмечено, у кого иконки
+// нет (чтобы не перебирать десятки путей при каждом запуске). Файл открыт до песочницы;
+// читается при первом кадре, дописывается при закрытии, если появились новые.
+// Действует, пока не перестроен список (номер list_gen) и не поменялся масштаб.
+
+var icons_fd: i32 = -1;
+var icons_dirty = false;
+
+const IconHeader = extern struct { magic: u64, gen: u64, t: u32, napps: u32, pool_n: u32, pad: u32 = 0 };
+const IconRec = extern struct { state: u8, pad: [3]u8 = .{ 0, 0, 0 }, off: u32 };
+
+fn loadIconCache(t: u32) void {
+    if (icons_fd < 0 or list_gen == 0) return;
+    _ = sys.lseek(icons_fd, 0) catch return;
+    var h: IconHeader = undefined;
+    if (!readExact(icons_fd, std.mem.asBytes(&h))) return;
+    if (h.magic != CACHE_MAGIC or h.gen != list_gen or h.t != t or h.napps != napps or h.pool_n > POOL) return;
+    var recs: [MAX_APPS]IconRec = undefined;
+    if (!readExact(icons_fd, std.mem.sliceAsBytes(recs[0..napps]))) return;
+    const need = @as(usize, t) * t;
+    if (h.pool_n > 0) {
+        if (pool == null) pool = @ptrCast(@alignCast(sys.mmapAnon(POOL * 4) catch return));
+        if (!readExact(icons_fd, std.mem.sliceAsBytes(pool.?[0..h.pool_n]))) return;
+    }
+    for (apps[0..napps], recs[0..napps]) |*a, r| {
+        switch (r.state) {
+            @intFromEnum(IconState.ready) => if (@as(usize, r.off) + need <= h.pool_n) {
+                a.icon_state = .ready;
+                a.icon_off = r.off;
+            },
+            @intFromEnum(IconState.none) => a.icon_state = .none,
+            else => {},
+        }
+    }
+    pool_n = h.pool_n;
+    sys.tracef("иконки из кэша: {d} КБ", .{pool_n * 4 / 1024});
+}
+
+/// При закрытии: дописать кэш иконок, если за этот запуск появились новые.
+fn saveIconCache() void {
+    if (icons_fd < 0 or !icons_dirty or list_gen == 0 or icon_t == 0) return;
+    const h = IconHeader{ .magic = CACHE_MAGIC, .gen = list_gen, .t = icon_t, .napps = @intCast(napps), .pool_n = @intCast(pool_n) };
+    var recs: [MAX_APPS]IconRec = undefined;
+    for (apps[0..napps], recs[0..napps]) |a, *r| r.* = .{ .state = @intFromEnum(a.icon_state), .off = a.icon_off };
+    _ = sys.lseek(icons_fd, 0) catch return;
+    sys.writeAll(icons_fd, std.mem.asBytes(&h)) catch return;
+    sys.writeAll(icons_fd, std.mem.sliceAsBytes(recs[0..napps])) catch return;
+    if (pool_n > 0) sys.writeAll(icons_fd, std.mem.sliceAsBytes(pool.?[0..pool_n])) catch return;
+    sys.ftruncate(icons_fd, @sizeOf(IconHeader) + napps * @sizeOf(IconRec) + pool_n * 4) catch {};
 }
 
 fn loadIcon(a: *App, t: u32) bool {
@@ -852,12 +1164,22 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (sys.argIs(1, "run")) mode = .cmds;
     ui.begin("zrun");
     setupEnv();
-    loadExes();
-    sortExes();
-    loadApps();
-    sortApps();
+    if (loadList()) {
+        sys.tracef("список из кэша: {d} приложений, {d} команд", .{ napps, nexes });
+    } else {
+        loadExes();
+        sortExes();
+        loadApps();
+        sortApps();
+        iconSetup();
+        saveList();
+        sys.tracef("список построен: {d} приложений, {d} команд", .{ napps, nexes });
+    }
+    sortApps(); // видимые по алфавиту (из кэша — заново: это быстро)
     loadHistory();
-    iconSetup();
+    if (cfg.launcher_icons and icons_path.len > 0) {
+        icons_fd = sys.openCreate(icons_path.z()) catch -1; // пишется уже из песочницы
+    }
     startBroker();
 
     const rows: f32 = @floatFromInt(cfg.launcher_rows);
@@ -872,6 +1194,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .scroll = onScroll,
         .field = fieldOf,
         .start = start,
+        .cleanup = saveIconCache,
     }, .{ .read = read_paths[0..nread] }, .{ .extra = &.{.lseek} });
 }
 
