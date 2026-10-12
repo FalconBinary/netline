@@ -146,6 +146,15 @@ const Inflate = struct {
     olen: usize = 0,
 
     fn refill(s: *Inflate) void {
+        if (s.cnt > 56) return;
+        if (s.src.len - s.pos >= 8) {
+            // сразу 8 байт: лишние старшие биты — это те же следующие байты, повторное OR их не портит
+            s.buf |= std.mem.readInt(u64, s.src[s.pos..][0..8], .little) << @intCast(s.cnt);
+            const n = (63 - s.cnt) >> 3;
+            s.pos += n;
+            s.cnt += n * 8;
+            return;
+        }
         while (s.cnt <= 56) {
             if (s.pos < s.src.len) {
                 s.buf |= @as(u64, s.src[s.pos]) << @intCast(s.cnt);
@@ -214,11 +223,15 @@ const Inflate = struct {
                 const dist = dbase[ds] + try s.bits(dext[ds]);
                 if (dist > s.olen) return error.Invalid;
                 if (s.olen + len > s.out.len) return error.TooLarge;
-                var i: usize = 0;
-                while (i < len) : (i += 1) {
-                    s.out[s.olen] = s.out[s.olen - dist];
-                    s.olen += 1;
+                const o = s.olen;
+                if (dist >= len) {
+                    @memcpy(s.out[o..][0..len], s.out[o - dist ..][0..len]);
+                } else if (dist == 1) {
+                    @memset(s.out[o..][0..len], s.out[o - 1]);
+                } else {
+                    for (o..o + len) |i| s.out[i] = s.out[i - dist]; // перекрытие: строго по байту
                 }
+                s.olen += len;
             }
         }
     }
@@ -420,10 +433,8 @@ fn decodePng(d: []const u8) Error!Image {
             try unfilter(ft, row, prev, bpp);
             prev = row;
             const dy = pass[1] + @as(u32, @intCast(y)) * pass[3];
-            for (0..pw) |x| {
-                const dx = pass[0] + @as(u32, @intCast(x)) * pass[2];
-                img.px[@as(usize, dy) * w + dx] = pngPixel(row, x, ctype, depth, &pal, trns_key);
-            }
+            const dst = img.px[@as(usize, dy) * w + pass[0] ..];
+            pngRow(row, @intCast(pw), dst, pass[2], ctype, depth, &pal, trns_key);
         }
     }
     return img;
@@ -446,19 +457,57 @@ fn paeth(a: u8, b: u8, c: u8) u8 {
 }
 
 fn unfilter(ft: u8, row: []u8, prev: ?[]u8, bpp: usize) Error!void {
-    for (row, 0..) |*b, i| {
-        const a: u8 = if (i >= bpp) row[i - bpp] else 0;
-        const up: u8 = if (prev) |pr| pr[i] else 0;
-        const c: u8 = if (prev != null and i >= bpp) prev.?[i - bpp] else 0;
-        b.* = switch (ft) {
-            0 => b.*,
-            1 => b.* +% a,
-            2 => b.* +% up,
-            3 => b.* +% @as(u8, @intCast((@as(u16, a) + up) / 2)),
-            4 => b.* +% paeth(a, up, c),
-            else => return error.Invalid,
-        };
+    const head = @min(bpp, row.len); // у первых bpp байт нет соседа слева
+    switch (ft) {
+        0 => {},
+        1 => for (head..row.len) |i| {
+            row[i] +%= row[i - bpp];
+        },
+        2 => if (prev) |up| {
+            for (row, up[0..row.len]) |*b, u| b.* +%= u;
+        },
+        3 => if (prev) |up| {
+            for (0..head) |i| row[i] +%= up[i] >> 1;
+            for (head..row.len) |i| row[i] +%= @intCast((@as(u16, row[i - bpp]) + up[i]) >> 1);
+        } else for (head..row.len) |i| {
+            row[i] +%= row[i - bpp] >> 1;
+        },
+        4 => if (prev) |up| {
+            for (0..head) |i| row[i] +%= up[i]; // paeth(0, up, 0) = up
+            for (head..row.len) |i| row[i] +%= paeth(row[i - bpp], up[i], up[i - bpp]);
+        } else for (head..row.len) |i| {
+            row[i] +%= row[i - bpp]; // paeth(a, 0, 0) = a
+        },
+        else => return error.Invalid,
     }
+}
+
+/// Строка PNG → пиксели (каждый step-й, начиная с dst[0]). 8 бит без прозрачного ключа —
+/// отдельными циклами, остальное — общим путём.
+fn pngRow(row: []const u8, n: usize, dst: []u32, step: usize, ctype: u8, depth: u8, pal: *const [256]u32, key: ?[3]u16) void {
+    if (depth == 8 and key == null) {
+        switch (ctype) {
+            6 => for (0..n) |x| {
+                const p = row[x * 4 ..][0..4];
+                dst[x * step] = (@as(u32, p[3]) << 24) | (@as(u32, p[0]) << 16) | (@as(u32, p[1]) << 8) | p[2];
+            },
+            2 => for (0..n) |x| {
+                const p = row[x * 3 ..][0..3];
+                dst[x * step] = 0xff000000 | (@as(u32, p[0]) << 16) | (@as(u32, p[1]) << 8) | p[2];
+            },
+            0 => for (0..n) |x| {
+                dst[x * step] = 0xff000000 | @as(u32, row[x]) * 0x010101;
+            },
+            4 => for (0..n) |x| {
+                dst[x * step] = (@as(u32, row[x * 2 + 1]) << 24) | @as(u32, row[x * 2]) * 0x010101;
+            },
+            else => for (0..n) |x| {
+                dst[x * step] = pal[row[x]];
+            },
+        }
+        return;
+    }
+    for (0..n) |x| dst[x * step] = pngPixel(row, x, ctype, depth, pal, key);
 }
 
 fn sample(row: []const u8, i: usize, depth: u8) u16 {
@@ -524,6 +573,8 @@ const zz = [64]u8{
 
 const JHuff = struct {
     fast: [512]u16 = [_]u16{0} ** 512, // (длина << 8) | значение
+    // AC целиком за один просмотр: (коэффициент << 8) | (пробег << 4) | (длина кода + биты значения)
+    fast_ac: [512]i16 = [_]i16{0} ** 512,
     maxcode: [18]i32 = [_]i32{-1} ** 18,
     valptr: [17]i32 = [_]i32{0} ** 17,
     vals: [256]u8 = [_]u8{0} ** 256,
@@ -552,6 +603,17 @@ const JHuff = struct {
             code <<= 1;
         }
         h.maxcode[17] = std.math.maxInt(i32);
+        // короткий код и следующие за ним биты значения целиком в 9 битах — значение готово заранее
+        for (&h.fast_ac, h.fast, 0..) |*fa, e, i| {
+            if (e == 0) continue;
+            const len: u32 = e >> 8;
+            const rs: u32 = e & 255;
+            const mag = rs & 15;
+            if (mag == 0 or len + mag > 9) continue;
+            const v = ((@as(u32, @intCast(i)) << @intCast(len)) & 511) >> @intCast(9 - mag);
+            const val = Jpeg.extend(v, mag);
+            if (val >= -128 and val <= 127) fa.* = @intCast(val * 256 + @as(i32, @intCast((rs >> 4) * 16 + len + mag)));
+        }
         h.ok = true;
     }
 };
@@ -565,9 +627,9 @@ const Comp = struct {
     ta: u8 = 0,
     bw: u32 = 0, // блоков в строке (с дополнением до MCU)
     bh: u32 = 0,
-    coefs: []i16 = &[_]i16{},
+    coefs: []i16 = &[_]i16{}, // только для progressive: коэффициенты копятся по сканам
     pred: i32 = 0,
-    plane: []u8 = &[_]u8{},
+    plane: []u8 = &[_]u8{}, // пиксели компоненты (уже в масштабе 1/scale)
 };
 
 /// Больше стольких байт за концом файла — данные обрезаны (недокачанный файл), а не просто
@@ -595,8 +657,8 @@ const Jpeg = struct {
     scale: u32 = 1,
     ncoef: usize = 64,
     eobrun: u32 = 0,
-    // чтение битов
-    bits: u32 = 0,
+    // чтение битов: 64-битный буфер, старший бит — следующий
+    bits: u64 = 0,
     cnt: u32 = 0,
     marker: bool = false,
     past_end: u32 = 0, // сколько байт «дочитали» за концом файла
@@ -634,23 +696,23 @@ const Jpeg = struct {
         return 0;
     }
     fn fill(j: *Jpeg) void {
-        while (j.cnt <= 24) {
-            j.bits |= @as(u32, j.nextByte()) << @intCast(24 - j.cnt);
+        while (j.cnt <= 56) {
+            j.bits |= @as(u64, j.nextByte()) << @intCast(56 - j.cnt);
             j.cnt += 8;
         }
     }
     fn get(j: *Jpeg, n: u32) u32 {
         if (n == 0) return 0;
-        j.fill();
-        const v = j.bits >> @intCast(32 - n);
+        if (j.cnt < n) j.fill();
+        const v: u32 = @intCast(j.bits >> @intCast(64 - n));
         j.bits <<= @intCast(n);
         j.cnt -= n;
         return v;
     }
     fn decode(j: *Jpeg, h: *const JHuff) Error!u8 {
         if (!h.ok) return error.Invalid;
-        j.fill();
-        const e = h.fast[j.bits >> 23];
+        if (j.cnt < 16) j.fill();
+        const e = h.fast[@intCast(j.bits >> 55)];
         if (e != 0) {
             const l = e >> 8;
             j.bits <<= @intCast(l);
@@ -659,7 +721,7 @@ const Jpeg = struct {
         }
         var l: u32 = 10;
         while (l <= 16) : (l += 1) {
-            const code: i32 = @intCast(j.bits >> @intCast(32 - l));
+            const code: i32 = @intCast(j.bits >> @intCast(64 - l));
             if (code <= h.maxcode[l]) {
                 const idx = h.valptr[l] + code;
                 if (idx < 0 or idx > 255) return error.Invalid;
@@ -718,9 +780,23 @@ const Jpeg = struct {
         if (t > 16) return error.Invalid;
         c.pred += extend(j.get(t), t);
         blk[0] = @truncate(c.pred);
+        const ac = &j.ac[c.ta];
+        if (!ac.ok) return error.Invalid;
         var k: u32 = 1;
         while (k < 64) {
-            const rs = try j.decode(&j.ac[c.ta]);
+            if (j.cnt < 16) j.fill();
+            const fa = ac.fast_ac[@intCast(j.bits >> 55)];
+            if (fa != 0) { // частый случай: код и значение за один просмотр
+                const len: u6 = @intCast(fa & 15);
+                j.bits <<= len;
+                j.cnt -= len;
+                k += @intCast((fa >> 4) & 15);
+                if (k > 63) return error.Invalid;
+                if (j.ncoef == 64) blk[zz[k]] = fa >> 8;
+                k += 1;
+                continue;
+            }
+            const rs = try j.decode(ac);
             const r = rs >> 4;
             const s = rs & 15;
             if (s == 0) {
@@ -752,9 +828,23 @@ const Jpeg = struct {
             j.eobrun -= 1;
             return;
         }
+        const ac = &j.ac[c.ta];
+        if (!ac.ok) return error.Invalid;
         var k = ss;
         while (k <= se) {
-            const rs = try j.decode(&j.ac[c.ta]);
+            if (j.cnt < 16) j.fill();
+            const fa = ac.fast_ac[@intCast(j.bits >> 55)];
+            if (fa != 0) { // код и значение за один просмотр
+                const len: u6 = @intCast(fa & 15);
+                j.bits <<= len;
+                j.cnt -= len;
+                k += @intCast((fa >> 4) & 15);
+                if (k > 63) return error.Invalid;
+                blk[zz[k]] = @truncate(@as(i32, fa >> 8) * (@as(i32, 1) << al));
+                k += 1;
+                continue;
+            }
+            const rs = try j.decode(ac);
             const r = rs >> 4;
             const s = rs & 15;
             if (s == 0) {
@@ -869,8 +959,7 @@ const Jpeg = struct {
                     }
                     todo -= 1;
                 }
-                const blk = j.block(c, @intCast(bx), @intCast(by));
-                try j.decodeBlock(c, blk, ss, se, ah, al);
+                try j.unit(c, @intCast(bx), @intCast(by), ss, se, ah, al);
             };
         } else {
             for (0..j.mcuy) |my| for (0..j.mcux) |mx| {
@@ -886,12 +975,61 @@ const Jpeg = struct {
                     for (0..c.v) |v| for (0..c.h) |hh| {
                         const bx: u32 = @intCast(mx * c.h + hh);
                         const by: u32 = @intCast(my * c.v + v);
-                        try j.decodeBlock(c, j.block(c, bx, by), ss, se, ah, al);
+                        try j.unit(c, bx, by, ss, se, ah, al);
                     };
                 }
             };
         }
         j.skipScan(); // остаток скана (до следующего маркера)
+    }
+
+    /// Один блок скана. Baseline — сразу в пиксели (коэффициенты всего кадра не храним:
+    /// для 24-мегапиксельного фото это 72 МБ), progressive — в накопитель коэффициентов.
+    fn unit(j: *Jpeg, c: *Comp, bx: u32, by: u32, ss: u32, se: u32, ah: u5, al: u5) Error!void {
+        if (!j.progressive) {
+            var blk = [_]i16{0} ** 64;
+            try j.baselineBlock(c, &blk);
+            j.putBlock(c, &blk, bx, by);
+            return;
+        }
+        return j.decodeBlock(c, j.block(c, bx, by), ss, se, ah, al);
+    }
+
+    /// Коэффициенты блока (обычный порядок) → пиксели плоскости в масштабе 1/scale.
+    fn putBlock(j: *const Jpeg, c: *Comp, blk: []const i16, bx: u32, by: u32) void {
+        const q = &j.qt[c.tq];
+        const n = 8 / j.scale;
+        const pw = c.bw * n;
+        const out = c.plane[(@as(usize, by) * n) * pw + @as(usize, bx) * n ..];
+        if (j.ncoef == 1) { // 1/8 — нужен только DC
+            out[0] = dcPixel(dequant(blk[0], q[0]));
+            return;
+        }
+        var d: [64]i32 = undefined;
+        for (&d, blk[0..64], q) |*o, v, qq| o.* = dequant(v, qq);
+        var ac: i32 = 0;
+        for (d[1..]) |v| ac |= v;
+        if (ac == 0) { // только DC — блок одного цвета
+            const v = dcPixel(d[0]);
+            for (0..n) |y| @memset(out[y * pw ..][0..n], v);
+            return;
+        }
+        var px: [64]u8 = undefined;
+        idct8(&d, &px);
+        if (n == 8) {
+            for (0..8) |y| @memcpy(out[y * pw ..][0..8], px[y * 8 ..][0..8]);
+            return;
+        }
+        // уменьшение в scale раз — усреднением квадратов scale×scale
+        const sc = j.scale;
+        const half = sc * sc / 2;
+        for (0..n) |oy| for (0..n) |ox| {
+            var sum: u32 = 0;
+            for (0..sc) |dy| for (0..sc) |dx| {
+                sum += px[(oy * sc + dy) * 8 + ox * sc + dx];
+            };
+            out[oy * pw + ox] = @intCast((sum + half) / (sc * sc));
+        };
     }
 
     fn decodeBlock(j: *Jpeg, c: *Comp, blk: []i16, ss: u32, se: u32, ah: u5, al: u5) Error!void {
@@ -931,56 +1069,105 @@ fn parseExif(d: []const u8) u8 {
     return 1;
 }
 
-// таблица косинусов для обратного DCT: c[u][x] = C(u)·cos((2x+1)uπ/16)/2
-const cos_t = blk: {
-    @setEvalBranchQuota(20000);
-    var t: [8][8]f32 = undefined;
-    for (0..8) |u| for (0..8) |x| {
-        const cu: f32 = if (u == 0) 0.70710678 else 1.0;
-        t[u][x] = cu * @cos(@as(f32, @floatFromInt((2 * x + 1) * u)) * std.math.pi / 16.0) / 2.0;
-    };
-    break :blk t;
-};
+// ---- обратное DCT: целочисленная схема jidctint (libjpeg) в варианте stb_image —
+// около 80 умножений на блок вместо 1024. Арифметика с переносом (+%, *%): специально
+// испорченный файл даст мусор в пикселях, но не панику.
 
-fn clamp8(v: f32) u8 {
-    return @intFromFloat(std.math.clamp(v + 128.5, 0, 255));
+fn dequant(v: i16, q: u16) i32 {
+    return std.math.clamp(@as(i32, v) * q, -32768, 32767);
 }
 
-/// Блок → пиксели плоскости (с уменьшением в scale раз усреднением).
-fn idctBlock(f: *[64]f32, out: []u8, stride: usize, scale: u32) void {
-    const n = 8 / scale;
-    var allzero = true;
-    for (f[1..]) |v| {
-        if (v != 0) {
-            allzero = false;
-            break;
-        }
+fn clampU8(v: i32) u8 {
+    return @intCast(std.math.clamp(v, 0, 255));
+}
+
+/// Пиксель блока, у которого есть только DC (как его посчитал бы idct8).
+fn dcPixel(dc: i32) u8 {
+    return clampU8(((dc *% 16384) +% (65536 + (128 << 17))) >> 17);
+}
+
+fn f2f(comptime x: f32) i32 {
+    return @intFromFloat(x * 4096 + 0.5);
+}
+
+const V8 = @Vector(8, i32);
+
+fn k8(comptime x: f32) V8 {
+    return @splat(f2f(x));
+}
+
+/// Одномерное 8-точечное обратное DCT сразу для восьми независимых линий (по линии на элемент
+/// вектора). Выход: out[0..8] — значения 0..7 (ещё не сдвинутые вниз).
+inline fn idct1v(s: [8]V8, out: *[8]V8, bias: i32, comptime shift: u5) void {
+    var p1 = (s[2] +% s[6]) *% k8(0.5411961);
+    var t2 = p1 +% s[6] *% k8(-1.847759065);
+    var t3 = p1 +% s[2] *% k8(0.765366865);
+    var t0 = (s[0] +% s[4]) *% @as(V8, @splat(4096));
+    var t1 = (s[0] -% s[4]) *% @as(V8, @splat(4096));
+    const b: V8 = @splat(bias);
+    const x0 = t0 +% t3 +% b;
+    const x3 = t0 -% t3 +% b;
+    const x1 = t1 +% t2 +% b;
+    const x2 = t1 -% t2 +% b;
+    t0 = s[7];
+    t1 = s[5];
+    t2 = s[3];
+    t3 = s[1];
+    var p3 = t0 +% t2;
+    var p4 = t1 +% t3;
+    p1 = t0 +% t3;
+    var p2 = t1 +% t2;
+    const p5 = (p3 +% p4) *% k8(1.175875602);
+    t0 = t0 *% k8(0.298631336);
+    t1 = t1 *% k8(2.053119869);
+    t2 = t2 *% k8(3.072711026);
+    t3 = t3 *% k8(1.501321110);
+    p1 = p5 +% p1 *% k8(-0.899976223);
+    p2 = p5 +% p2 *% k8(-2.562915447);
+    p3 = p3 *% k8(-1.961570560);
+    p4 = p4 *% k8(-0.390180644);
+    t3 = t3 +% p1 +% p4;
+    t2 = t2 +% p2 +% p3;
+    t1 = t1 +% p2 +% p4;
+    t0 = t0 +% p1 +% p3;
+    const sh: @Vector(8, u5) = @splat(shift);
+    out[0] = (x0 +% t3) >> sh;
+    out[7] = (x0 -% t3) >> sh;
+    out[1] = (x1 +% t2) >> sh;
+    out[6] = (x1 -% t2) >> sh;
+    out[2] = (x2 +% t1) >> sh;
+    out[5] = (x2 -% t1) >> sh;
+    out[3] = (x3 +% t0) >> sh;
+    out[4] = (x3 -% t0) >> sh;
+}
+
+fn transpose(m: *[8]V8) void {
+    var a: [8][8]i32 = undefined;
+    for (0..8) |r| a[r] = m[r];
+    for (0..8) |r| {
+        var v: [8]i32 = undefined;
+        for (0..8) |c| v[c] = a[c][r];
+        m[r] = v;
     }
-    if (allzero or scale == 8) {
-        const v = clamp8(f[0] / 8);
-        for (0..n) |y| @memset(out[y * stride ..][0..n], v);
-        return;
+}
+
+/// Коэффициенты (обычный порядок, после квантования) → 8×8 пикселей.
+/// Сначала все столбцы сразу (строка блока — вектор), потом, после транспонирования, все строки.
+fn idct8(d: *const [64]i32, out: *[64]u8) void {
+    var rows: [8]V8 = undefined;
+    for (0..8) |r| rows[r] = d[r * 8 ..][0..8].*;
+    var v: [8]V8 = undefined;
+    idct1v(rows, &v, 512, 10); // столбцы: оставляем 2 лишних бита точности
+    transpose(&v);
+    var o: [8]V8 = undefined;
+    idct1v(v, &o, 65536 + (128 << 17), 17); // строки: масштаб 1 << 17 и сдвиг на +128
+    transpose(&o); // o[r] — строка r
+    const lo: V8 = @splat(0);
+    const hi: V8 = @splat(255);
+    for (0..8) |r| {
+        const px: @Vector(8, u8) = @intCast(@max(lo, @min(hi, o[r])));
+        out[r * 8 ..][0..8].* = px;
     }
-    var tmp: [64]f32 = undefined;
-    for (0..8) |v| for (0..8) |x| {
-        var s: f32 = 0;
-        for (0..8) |u| s += f[v * 8 + u] * cos_t[u][x];
-        tmp[v * 8 + x] = s;
-    };
-    var px: [64]f32 = undefined;
-    for (0..8) |y| for (0..8) |x| {
-        var s: f32 = 0;
-        for (0..8) |v| s += tmp[v * 8 + x] * cos_t[v][y];
-        px[y * 8 + x] = s;
-    };
-    const inv: f32 = 1.0 / @as(f32, @floatFromInt(scale * scale));
-    for (0..n) |oy| for (0..n) |ox| {
-        var s: f32 = 0;
-        for (0..scale) |dy| for (0..scale) |dx| {
-            s += px[(oy * scale + dy) * 8 + ox * scale + dx];
-        };
-        out[oy * stride + ox] = clamp8(s * inv);
-    };
 }
 
 fn decodeJpeg(d: []const u8, need_w0: u32, need_h0: u32) Error!Image {
@@ -1049,11 +1236,16 @@ fn decodeJpeg(d: []const u8, need_w0: u32, need_h0: u32) Error!Image {
                     }
                 }
                 j.ncoef = if (j.scale == 8) 1 else 64;
+                const n = 8 / j.scale;
                 for (j.comps[0..nc]) |*c| {
                     c.bw = j.mcux * c.h;
                     c.bh = j.mcuy * c.v;
-                    c.coefs = try alloc(i16, @as(usize, c.bw) * c.bh * j.ncoef);
-                    @memset(c.coefs, 0);
+                    if (j.progressive) {
+                        c.coefs = try alloc(i16, @as(usize, c.bw) * c.bh * j.ncoef);
+                        @memset(c.coefs, 0);
+                    }
+                    c.plane = try alloc(u8, @as(usize, c.bw) * n * c.bh * n);
+                    @memset(c.plane, 128); // блоки, которых не было в файле, — серые, как раньше
                 }
             },
             0xC3, 0xC5...0xC7, 0xC9...0xCB, 0xCD...0xCF => return error.Unsupported, // lossless, арифметика
@@ -1110,53 +1302,72 @@ fn decodeJpeg(d: []const u8, need_w0: u32, need_h0: u32) Error!Image {
     }
     if (!frame) return error.Invalid;
 
-    // ---- коэффициенты → плоскости
-    const s = j.scale;
-    const n = 8 / s;
-    for (j.comps[0..j.ncomp]) |*c| {
-        const pw = c.bw * n;
-        c.plane = try alloc(u8, @as(usize, pw) * c.bh * n);
-        const q = &j.qt[c.tq];
-        var f: [64]f32 = undefined;
-        for (0..c.bh) |by| for (0..c.bw) |bx| {
-            const blk = j.block(c, @intCast(bx), @intCast(by));
-            if (j.ncoef == 1) {
-                @memset(&f, 0);
-                f[0] = @as(f32, @floatFromInt(blk[0])) * @as(f32, @floatFromInt(q[0]));
-            } else for (0..64) |k| {
-                f[k] = @as(f32, @floatFromInt(blk[k])) * @as(f32, @floatFromInt(q[k]));
-            }
-            idctBlock(&f, c.plane[(by * n) * pw + bx * n ..], pw, s);
-        };
+    // ---- progressive: накопленные коэффициенты → плоскости (baseline уже там)
+    if (j.progressive) {
+        for (j.comps[0..j.ncomp]) |*c| {
+            for (0..c.bh) |by| for (0..c.bw) |bx| {
+                const blk = j.block(c, @intCast(bx), @intCast(by));
+                if (j.ncoef == 1) {
+                    var b64 = [_]i16{0} ** 64;
+                    b64[0] = blk[0];
+                    j.putBlock(c, &b64, @intCast(bx), @intCast(by));
+                } else j.putBlock(c, blk, @intCast(bx), @intCast(by));
+            };
+            free(i16, c.coefs); // до выделения картинки — пиковая память меньше
+            c.coefs = &[_]i16{};
+        }
     }
 
-    // ---- цвет
+    // ---- цвет, построчно
+    const s = j.scale;
     const ow = (j.width + s - 1) / s;
     const oh = (j.height + s - 1) / s;
     var img = try newImage(ow, oh);
     errdefer img.deinit();
+    var up: [3]Upsample = .{ .{}, .{}, .{} };
+    defer for (&up) |*u| u.deinit();
+    for (j.comps[0..j.ncomp], 0..) |*c, ci| try up[ci].init(&j, c, ow);
     const rgb = j.ncomp == 3 and (j.adobe == 0 or (j.comps[0].id == 'R' and j.comps[1].id == 'G' and j.comps[2].id == 'B'));
-    for (0..oh) |y| for (0..ow) |x| {
-        var v: [3]i32 = .{ 0, 0, 0 };
-        for (j.comps[0..j.ncomp], 0..) |*c, ci| v[ci] = sampleComp(&j, c, @intCast(x), @intCast(y));
-        var r: i32 = v[0];
-        var g: i32 = v[0];
-        var b: i32 = v[0];
-        if (j.ncomp == 3 and rgb) {
-            g = v[1];
-            b = v[2];
-        } else if (j.ncomp == 3) {
-            const cb = v[1] - 128;
-            const cr = v[2] - 128;
-            r = v[0] + ((91881 * cr) >> 16);
-            g = v[0] - ((22554 * cb + 46802 * cr) >> 16);
-            b = v[0] + ((116130 * cb) >> 16);
+    for (0..oh) |y| {
+        const dst = img.px[y * ow ..][0..ow];
+        const r0 = up[0].row(&j.comps[0], @intCast(y));
+        if (j.ncomp == 1) {
+            for (dst, r0) |*o, v| o.* = 0xff000000 | @as(u32, v) * 0x010101;
+            continue;
         }
-        const R: u32 = @intCast(std.math.clamp(r, 0, 255));
-        const G: u32 = @intCast(std.math.clamp(g, 0, 255));
-        const B: u32 = @intCast(std.math.clamp(b, 0, 255));
-        img.px[y * ow + x] = 0xff000000 | (R << 16) | (G << 8) | B;
-    };
+        const r1 = up[1].row(&j.comps[1], @intCast(y));
+        const r2 = up[2].row(&j.comps[2], @intCast(y));
+        if (rgb) {
+            for (dst, r0, r1, r2) |*o, a, b, c| o.* = 0xff000000 | (@as(u32, a) << 16) | (@as(u32, b) << 8) | c;
+            continue;
+        }
+        var x: usize = 0;
+        while (x + 8 <= ow) : (x += 8) {
+            const Y: V8 = @as(@Vector(8, u8), r0[x..][0..8].*);
+            const cb = @as(V8, @as(@Vector(8, u8), r1[x..][0..8].*)) - @as(V8, @splat(128));
+            const cr = @as(V8, @as(@Vector(8, u8), r2[x..][0..8].*)) - @as(V8, @splat(128));
+            const half: V8 = @splat(32768);
+            const sh: @Vector(8, u5) = @splat(16);
+            const lo: V8 = @splat(0);
+            const hi: V8 = @splat(255);
+            const R = @max(lo, @min(hi, Y + ((@as(V8, @splat(91881)) * cr + half) >> sh)));
+            const G = @max(lo, @min(hi, Y + ((@as(V8, @splat(-22554)) * cb - @as(V8, @splat(46802)) * cr + half) >> sh)));
+            const B = @max(lo, @min(hi, Y + ((@as(V8, @splat(116130)) * cb + half) >> sh)));
+            const U = @Vector(8, u32);
+            const px = @as(U, @splat(0xff000000)) | (@as(U, @intCast(R)) << @splat(16)) | (@as(U, @intCast(G)) << @splat(8)) | @as(U, @intCast(B));
+            dst[x..][0..8].* = px;
+        }
+        for (dst[x..], r0[x..ow], r1[x..ow], r2[x..ow]) |*o, yy, cbv, crv| {
+            const Y: i32 = yy;
+            const cb = @as(i32, cbv) - 128;
+            const cr = @as(i32, crv) - 128;
+            // коэффициенты JFIF в 1/65536, с округлением (как в libjpeg)
+            const R: u32 = @intCast(std.math.clamp(Y + ((91881 * cr + 32768) >> 16), 0, 255));
+            const G: u32 = @intCast(std.math.clamp(Y + ((-22554 * cb - 46802 * cr + 32768) >> 16), 0, 255));
+            const B: u32 = @intCast(std.math.clamp(Y + ((116130 * cb + 32768) >> 16), 0, 255));
+            o.* = 0xff000000 | (R << 16) | (G << 8) | B;
+        }
+    }
     if (j.orientation != 1) {
         const rot = try orient(&img, j.orientation);
         img.deinit();
@@ -1165,29 +1376,81 @@ fn decodeJpeg(d: []const u8, need_w0: u32, need_h0: u32) Error!Image {
     return img;
 }
 
-/// Значение компоненты в точке выходного изображения (с билинейной подвыборкой цветности).
-fn sampleComp(j: *const Jpeg, c: *const Comp, x: u32, y: u32) i32 {
-    const n = 8 / j.scale;
-    const pw = c.bw * n;
-    const ph = c.bh * n;
-    if (c.h == j.hmax and c.v == j.vmax) {
-        return c.plane[@min(y, ph - 1) * pw + @min(x, pw - 1)];
+/// Строки компоненты на ширине выходной картинки. Полное разрешение — прямо из плоскости,
+/// подвыборка цветности — билинейно (центры отсчётов совмещены), веса в 1/256.
+const Upsample = struct {
+    full: bool = true,
+    half: bool = false, // цветность вдвое уже — частый случай 4:2:0 и 4:2:2
+    ow: u32 = 0,
+    pw: u32 = 0,
+    ph: u32 = 0,
+    fy: u32 = 0, // шаг по вертикали: v / vmax в 1/65536
+    xmap: []u32 = &[_]u32{}, // (x0 << 8) | вес x1
+    vrow: []u16 = &[_]u16{},
+    out: []u8 = &[_]u8{},
+
+    fn init(u: *Upsample, j: *const Jpeg, c: *const Comp, ow: u32) Error!void {
+        const n = 8 / j.scale;
+        u.pw = c.bw * n;
+        u.ph = c.bh * n;
+        u.ow = ow;
+        u.full = c.h == j.hmax and c.v == j.vmax;
+        if (u.full) return;
+        u.fy = (@as(u32, c.v) << 16) / j.vmax;
+        u.xmap = try alloc(u32, ow);
+        u.vrow = try alloc(u16, u.pw);
+        u.out = try alloc(u8, ow);
+        const fx = (@as(u32, c.h) << 16) / j.hmax;
+        for (u.xmap, 0..) |*m, x| m.* = coord(@intCast(x), fx, u.pw);
+        u.half = @as(u32, c.h) * 2 == j.hmax;
     }
-    const fx = (@as(f32, @floatFromInt(x)) + 0.5) * @as(f32, @floatFromInt(c.h)) / @as(f32, @floatFromInt(j.hmax)) - 0.5;
-    const fy = (@as(f32, @floatFromInt(y)) + 0.5) * @as(f32, @floatFromInt(c.v)) / @as(f32, @floatFromInt(j.vmax)) - 0.5;
-    const cx = std.math.clamp(fx, 0, @as(f32, @floatFromInt(pw - 1)));
-    const cy = std.math.clamp(fy, 0, @as(f32, @floatFromInt(ph - 1)));
-    const x0: u32 = @intFromFloat(@floor(cx));
-    const y0: u32 = @intFromFloat(@floor(cy));
-    const x1 = @min(x0 + 1, pw - 1);
-    const y1 = @min(y0 + 1, ph - 1);
-    const ax = cx - @as(f32, @floatFromInt(x0));
-    const ay = cy - @as(f32, @floatFromInt(y0));
-    const p = c.plane;
-    const a = @as(f32, @floatFromInt(p[y0 * pw + x0])) * (1 - ax) + @as(f32, @floatFromInt(p[y0 * pw + x1])) * ax;
-    const b = @as(f32, @floatFromInt(p[y1 * pw + x0])) * (1 - ax) + @as(f32, @floatFromInt(p[y1 * pw + x1])) * ax;
-    return @intFromFloat(a * (1 - ay) + b * ay + 0.5);
-}
+
+    fn deinit(u: *Upsample) void {
+        free(u32, u.xmap);
+        free(u16, u.vrow);
+        free(u8, u.out);
+    }
+
+    /// (x + 0,5)·f − 0,5, зажатое в [0, n − 1]: целая часть << 8 | дробная (0..255).
+    fn coord(x: u32, f: u32, n: u32) u32 {
+        const v: i64 = ((@as(i64, x) * 2 + 1) * f >> 1) - 32768; // в 1/65536
+        if (v <= 0) return 0;
+        const max = @as(i64, n - 1) << 16;
+        const c = @min(v, max);
+        return @intCast(((c >> 16) << 8) | ((c >> 8) & 255));
+    }
+
+    fn row(u: *Upsample, c: *const Comp, y: u32) []const u8 {
+        const p = c.plane;
+        if (u.full) return p[@as(usize, @min(y, u.ph - 1)) * u.pw ..][0..u.ow]; // ow ≤ pw: плоскость дополнена до MCU
+        const cy = coord(y, u.fy, u.ph);
+        const y0 = cy >> 8;
+        const wy: u16 = @intCast(cy & 255);
+        const r0 = p[@as(usize, y0) * u.pw ..][0..u.pw];
+        const r1 = p[@as(usize, @min(y0 + 1, u.ph - 1)) * u.pw ..][0..u.pw];
+        for (u.vrow, r0, r1) |*o, a, b| o.* = @as(u16, a) * (256 - wy) + @as(u16, b) * wy;
+        if (u.half) {
+            // те же веса, что дала бы карта столбцов: 1/4·левый + 3/4·свой и 3/4·свой + 1/4·правый
+            const v = u.vrow;
+            var i: usize = 0;
+            while (2 * i < u.out.len) : (i += 1) {
+                const m: u32 = v[i];
+                const l: u32 = v[if (i > 0) i - 1 else 0];
+                const r: u32 = v[@min(i + 1, v.len - 1)];
+                u.out[2 * i] = @intCast((if (i > 0) l * 64 + m * 192 else m * 256) + 32768 >> 16);
+                if (2 * i + 1 < u.out.len) u.out[2 * i + 1] = @intCast(m * 192 + r * 64 + 32768 >> 16);
+            }
+            return u.out;
+        }
+        for (u.out, u.xmap) |*o, m| {
+            const x0 = m >> 8;
+            const wx = m & 255;
+            const x1 = @min(x0 + 1, u.pw - 1);
+            o.* = @intCast((@as(u32, u.vrow[x0]) * (256 - wx) + @as(u32, u.vrow[x1]) * wx + 32768) >> 16);
+        }
+        return u.out;
+    }
+};
 
 /// Повернуть/отразить по EXIF Orientation (2–8).
 fn orient(src: *const Image, o: u8) Error!Image {
@@ -1274,19 +1537,45 @@ fn taps(n_src: u32, m: u32, k: f64, offset: f64) Error!Taps {
     return t;
 }
 
-fn premulPx(c: u32) [4]i32 {
-    const a: i32 = @intCast(c >> 24);
-    if (a == 255) return .{ @intCast((c >> 16) & 255), @intCast((c >> 8) & 255), @intCast(c & 255), 255 }; // обычный случай
-    return .{
-        @divTrunc(@as(i32, @intCast((c >> 16) & 255)) * a + 127, 255),
-        @divTrunc(@as(i32, @intCast((c >> 8) & 255)) * a + 127, 255),
-        @divTrunc(@as(i32, @intCast(c & 255)) * a + 127, 255),
-        a,
-    };
+const V4 = @Vector(4, i32);
+
+/// Пиксель → вектор каналов в порядке байтов (B, G, R, A) с предумноженной альфой.
+inline fn premulVec(c: u32) V4 {
+    const v: V4 = @as(@Vector(4, u8), @bitCast(c));
+    if (c >> 24 == 255) return v; // обычный случай — непрозрачный
+    const a: V4 = @splat(@intCast(c >> 24));
+    var r = @divTrunc(v * a + @as(V4, @splat(127)), @as(V4, @splat(255)));
+    r[3] = v[3];
+    return r;
+}
+
+inline fn pack(v: V4) u32 {
+    return @bitCast(@as(@Vector(4, u8), @intCast(v)));
+}
+
+/// (acc + 0,5) / 16384, зажатое в 0..255.
+inline fn norm(acc: V4) V4 {
+    const r = (acc + @as(V4, @splat(8192))) >> @splat(14);
+    return @max(@as(V4, @splat(0)), @min(r, @as(V4, @splat(255))));
+}
+
+/// Строка исходника → строка ширины rw (горизонтальный проход фильтра), предумноженные пиксели.
+fn hpass(srow: []const u32, tx: *const Taps, out: []u32) void {
+    for (out, 0..) |*o, x| {
+        var acc: V4 = @splat(0);
+        const st = tx.start[x];
+        const ws = tx.w[x * tx.max ..][0..tx.count[x]];
+        for (ws, srow[st..][0..ws.len]) |wgt, p| acc += premulVec(p) * @as(V4, @splat(wgt));
+        o.* = pack(norm(acc));
+    }
 }
 
 /// Вписать картинку в dst (dw×dh): fill — заполнить с обрезкой, fit — целиком с полями цвета bg.
 /// Результат непрозрачный: 0xFFRRGGBB (годится и как предумноженный ARGB для Wayland).
+///
+/// Фильтр разделимый: сначала по строкам, потом по столбцам. Горизонтально отфильтрованные
+/// строки живут в маленьком кольце (сколько строк нужно одному выходному пикселю), а не во
+/// временном буфере на всю картинку — для 4K это ~200 КБ вместо ~100 МБ.
 pub fn render(src: *const Image, dst: []u32, dw: u32, dh: u32, mode: Fit, bg: u32) Error!void {
     const sw: f64 = @floatFromInt(src.w);
     const sh: f64 = @floatFromInt(src.h);
@@ -1304,63 +1593,51 @@ pub fn render(src: *const Image, dst: []u32, dw: u32, dh: u32, mode: Fit, bg: u3
     const ky = if (mode == .fill) k else @as(f64, @floatFromInt(rh)) / sh;
 
     const opaque_bg = 0xff000000 | bg;
-    @memset(dst[0 .. @as(usize, dw) * dh], opaque_bg);
+    if (rw != dw or rh != dh) @memset(dst[0 .. @as(usize, dw) * dh], opaque_bg); // поля
 
     var tx = try taps(src.w, rw, kx, ox);
     defer tx.deinit();
     var ty = try taps(src.h, rh, ky, oy);
     defer ty.deinit();
 
-    // нужные строки исходника
-    var y0: u32 = src.h;
-    var y1: u32 = 0;
-    for (0..rh) |i| {
-        y0 = @min(y0, ty.start[i]);
-        y1 = @max(y1, ty.start[i] + ty.count[i]);
-    }
-    const rows = y1 - y0;
-    // промежуточный буфер: rw × rows, 4 канала в предумноженном виде
-    const tmp = try alloc([4]i16, @as(usize, rw) * rows);
-    defer free([4]i16, tmp);
-    for (0..rows) |r| {
-        const srow = src.px[(y0 + r) * src.w ..][0..src.w];
-        for (0..rw) |x| {
-            var acc: [4]i32 = .{ 0, 0, 0, 0 };
-            const st = tx.start[x];
-            for (0..tx.count[x]) |i| {
-                const wgt = tx.w[x * tx.max + i];
-                const p = premulPx(srow[st + i]);
-                inline for (0..4) |ch| acc[ch] += p[ch] * wgt;
-            }
-            var o: [4]i16 = undefined;
-            inline for (0..4) |ch| o[ch] = @intCast(std.math.clamp((acc[ch] + 8192) >> 14, 0, 255));
-            tmp[r * rw + x] = o;
-        }
-    }
-    const br: i32 = @intCast((bg >> 16) & 255);
-    const bgc: i32 = @intCast((bg >> 8) & 255);
-    const bb: i32 = @intCast(bg & 255);
+    // кольцо строк: ty.max строк по rw пикселей; slot_row — какая строка исходника в слоте
+    const nring = ty.max;
+    const ring = try alloc(u32, @as(usize, rw) * nring);
+    defer free(u32, ring);
+    const slot_row = try alloc(u32, nring);
+    defer free(u32, slot_row);
+    @memset(slot_row, std.math.maxInt(u32));
+    const rows = try alloc([]const u32, nring);
+    defer free([]const u32, rows);
+
+    const bgv: V4 = .{ @intCast(bg & 255), @intCast((bg >> 8) & 255), @intCast((bg >> 16) & 255), 0 };
     for (0..rh) |y| {
-        const st = ty.start[y] - y0;
-        for (0..rw) |x| {
-            var acc: [4]i32 = .{ 0, 0, 0, 0 };
-            for (0..ty.count[y]) |i| {
-                const wgt = ty.w[y * ty.max + i];
-                const p = tmp[(st + i) * rw + x];
-                inline for (0..4) |ch| acc[ch] += @as(i32, p[ch]) * wgt;
+        const st = ty.start[y];
+        const cnt = ty.count[y];
+        // нужные строки исходника: каждая фильтруется по горизонтали один раз
+        for (0..cnt) |i| {
+            const r: u32 = st + @as(u32, @intCast(i));
+            const slot = r % nring;
+            const line = ring[slot * rw ..][0..rw];
+            if (slot_row[slot] != r) {
+                hpass(src.px[@as(usize, r) * src.w ..][0..src.w], &tx, line);
+                slot_row[slot] = r;
             }
-            var c: [4]i32 = undefined;
-            inline for (0..4) |ch| c[ch] = std.math.clamp((acc[ch] + 8192) >> 14, 0, 255);
-            if (c[3] == 255) { // непрозрачный пиксель — фон не нужен
-                dst[(ry + y) * dw + rx + x] = 0xff000000 | (@as(u32, @intCast(c[0])) << 16) | (@as(u32, @intCast(c[1])) << 8) | @as(u32, @intCast(c[2]));
-                continue;
+            rows[i] = line;
+        }
+        const ws = ty.w[y * ty.max ..][0..cnt];
+        const out = dst[(ry + y) * dw + rx ..][0..rw];
+        for (out, 0..) |*o, x| {
+            var acc: V4 = @splat(0);
+            for (ws, rows[0..cnt]) |wgt, line| {
+                acc += @as(V4, @as(@Vector(4, u8), @bitCast(line[x]))) * @as(V4, @splat(wgt));
             }
-            // поверх фона (альфа уже предумножена)
-            const ia = 255 - c[3];
-            const R: u32 = @intCast(@min(255, c[0] + @divTrunc(br * ia + 127, 255)));
-            const G: u32 = @intCast(@min(255, c[1] + @divTrunc(bgc * ia + 127, 255)));
-            const B: u32 = @intCast(@min(255, c[2] + @divTrunc(bb * ia + 127, 255)));
-            dst[(ry + y) * dw + rx + x] = 0xff000000 | (R << 16) | (G << 8) | B;
+            var c = norm(acc);
+            if (c[3] != 255) { // полупрозрачный пиксель — поверх фона (альфа уже предумножена)
+                const ia: V4 = @splat(255 - c[3]);
+                c = @min(c + @divTrunc(bgv * ia + @as(V4, @splat(127)), @as(V4, @splat(255))), @as(V4, @splat(255)));
+            }
+            o.* = pack(c) | 0xff000000;
         }
     }
 }
