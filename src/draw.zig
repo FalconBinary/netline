@@ -83,6 +83,7 @@ pub const Canvas = struct {
         const fx: f32 = @as(f32, @floatFromInt(sw)) / w;
         const fy: f32 = @as(f32, @floatFromInt(sh)) / h;
         const b = Box{ .cx = x + w / 2, .cy = y + h / 2, .hw = w / 2, .hh = h / 2, .r = @min(r, @min(w, h) / 2) };
+        if (fx == 1 and fy == 1 and x == @floor(x) and y == @floor(y)) return self.image1(rgb, sw, b, x0, y0, x1, y1, x, y);
         // столбцы исходника для каждого столбца назначения — один раз на картинку
         var cols: [4096][2]u32 = undefined;
         const ncols: usize = @intCast(x1 - x0);
@@ -122,6 +123,30 @@ pub const Canvas = struct {
                 const cnt = (sy1 - sy0) * (c[1] - c[0]);
                 const col = 0xff000000 | ((acc[0] / cnt) << 16) | ((acc[1] / cnt) << 8) | (acc[2] / cnt);
                 blendPx(&dst[@intCast(px)], col, coverAlpha(255, cov));
+            }
+        }
+    }
+
+    /// Картинка уже в размере экрана (превью, подготовленные под масштаб): пиксель в пиксель,
+    /// середина строки — простым копированием, по функции расстояния — только скруглённые края.
+    fn image1(self: *Canvas, rgb: []const u8, sw: u32, b: Box, x0: i32, y0: i32, x1: i32, y1: i32, x: f32, y: f32) void {
+        const ix: i32 = @intFromFloat(x);
+        const iy: i32 = @intFromFloat(y);
+        var py = y0;
+        while (py < y1) : (py += 1) {
+            const src = rgb[@as(usize, @intCast(py - iy)) * sw * 3 ..];
+            const dst = self.row(py);
+            const span = b.fullSpan(py, x0, x1, 0.5);
+            var px = x0;
+            while (px < x1) : (px += 1) {
+                const i: usize = @as(usize, @intCast(px - ix)) * 3;
+                const col = 0xff000000 | (@as(u32, src[i]) << 16) | (@as(u32, src[i + 1]) << 8) | src[i + 2];
+                if (px >= span[0] and px < span[1]) {
+                    dst[@intCast(px)] = col;
+                } else {
+                    const cov = 0.5 - b.sdf(@as(f32, @floatFromInt(px)) + 0.5, @as(f32, @floatFromInt(py)) + 0.5);
+                    if (cov > 0) blendPx(&dst[@intCast(px)], col, coverAlpha(255, cov));
+                }
             }
         }
     }

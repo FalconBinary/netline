@@ -348,7 +348,47 @@ fn saveCached(i: usize, rgb: []const u8) void {
 
 var work: [TW * TH]u32 = undefined; // рабочий буфер превью (не на стеке)
 
-/// Превью в памяти — только для видимого экрана и экрана сверху и снизу (≤ 36 штук, ~6 МБ),
+/// Масштаб, под который готовы превью в памяти (0 — ещё не было кадра). На диске превью
+/// всегда 304×190; в памяти — сразу в размере плитки на экране: при 1× это 152×95
+/// (вчетверо меньше памяти), и кадр рисует их пиксель в пиксель, без усреднения.
+var ts: u32 = 0;
+
+fn thumbSize() [2]u32 {
+    return if (ts == 1) .{ TW / 2, TH / 2 } else .{ TW, TH };
+}
+
+/// Превью 304×190 → под масштаб ts (при 1× — усреднение 2×2, как делал бы кадр).
+fn fitThumb(k: usize) void {
+    if (ts != 1) return;
+    const big = thumbs[k];
+    const w = TW / 2;
+    const h = TH / 2;
+    const small = sys.mmapAnon(w * h * 3) catch return; // не вышло — останется большое
+    for (0..h) |y| {
+        for (0..w) |x| {
+            for (0..3) |c| {
+                const a = (y * 2 * TW + x * 2) * 3 + c;
+                const sum = @as(u32, big[a]) + big[a + 3] + big[a + TW * 3] + big[a + TW * 3 + 3];
+                small[(y * w + x) * 3 + c] = @intCast(sum / 4);
+            }
+        }
+    }
+    sys.munmap(big.ptr, big.len);
+    thumbs[k] = small[0 .. w * h * 3];
+}
+
+/// Масштаб экрана поменялся (или первый кадр): превью в памяти — заново под него.
+fn rescale(s: u32) void {
+    ts = s;
+    for (0..nfiles) |i| {
+        if (states[i] != .ok) continue;
+        freeThumb(i);
+        states[i] = if (cache_ok) .cached else .pending;
+    }
+    if (nfiles > 0) ui.setTimer(1, 0);
+}
+
+/// Превью в памяти — только для видимого экрана и экрана сверху и снизу (≤ 36 штук: ~1,5 МБ при 1×, ~6 МБ при 2×),
 /// остальные лежат в кэше на диске и подгружаются за миллисекунду. Раньше в памяти держались
 /// все: 100 обоев — 17 МБ, 512 — 88 МБ.
 fn window() [2]usize {
@@ -378,6 +418,7 @@ fn trimThumbs() void {
 
 /// Сделать одно превью: сначала видимые.
 fn makeOne() bool {
+    if (ts == 0) return false; // масштаб узнаем с первым кадром
     var pick: ?usize = null;
     const first = scroll * COLS;
     var i = first;
@@ -402,6 +443,7 @@ fn makeOne() bool {
     const rgb = sys.mmapAnon(TW * TH * 3) catch return true;
     thumbs[k] = rgb[0 .. TW * TH * 3];
     if (loadCached(k, thumbs[k])) {
+        fitThumb(k);
         states[k] = .ok;
         dropIfOutside(k);
         return true;
@@ -422,6 +464,7 @@ fn makeOne() bool {
     }
     states[k] = .ok;
     saveCached(k, thumbs[k]);
+    fitThumb(k);
     dropIfOutside(k); // невидимое превью сделано заранее — в кэш на диск, из памяти долой
     return true;
 }
@@ -539,13 +582,16 @@ fn paint(cv: *draw.Canvas) void {
         ui.centered(cv, hint, W / 2, H / 2 + 14, 12, t.menu_muted);
     }
     const S = ui.S;
+    const si: u32 = @intFromFloat(S);
+    if (si != ts) rescale(si);
+    const tsz = thumbSize();
     for (ui.widgets[0..ui.nwid]) |w| {
         switch (@as(Wid, @enumFromInt(w.id))) {
             .random => ui.button(cv, w, "Случайные", .secondary),
             .tile => {
                 const i = w.idx;
                 if (states[i] == .ok) {
-                    cv.image(thumbs[i], TW, TH, w.x * S, w.y * S, w.w * S, w.h * S, 10 * S);
+                    cv.image(thumbs[i], tsz[0], tsz[1], w.x * S, w.y * S, w.w * S, w.h * S, 10 * S);
                 } else {
                     ui.rrect(cv, w.x, w.y, w.w, w.h, 10, t.menu_field);
                     if (states[i] == .failed) ui.centered(cv, "не открывается", w.x + w.w / 2, ui.mid(w.y, w.h, 11), 11, t.menu_muted);
