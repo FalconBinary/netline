@@ -269,6 +269,7 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
         });
     }
 
+    sys.tracef("окно и песочница готовы", .{});
     if (app.start) |f| f();
     redraw();
 
@@ -572,10 +573,14 @@ fn pixels(k: u1) []u32 {
     return p[0..n];
 }
 
+var frames: u32 = 0;
+
 fn render() void {
     if (!ensureBuffers()) return;
     const k: u1 = if (card.last) |l| ~l else 0;
     if (card.bufs[k].busy) return;
+    const t0 = sys.traceStart();
+    defer if (sys.trace) sys.tracef("кадр {d}: {d} мкс", .{ frames, sys.traceSince(t0) });
     app.layout();
     var cv = draw.Canvas{ .px = pixels(k), .w = @intCast(card.pw), .h = @intCast(card.ph) };
     S = @floatFromInt(card.scale);
@@ -607,6 +612,7 @@ fn render() void {
     card.bufs[k].busy = true;
     card.last = k;
     card.dirty = false;
+    frames += 1;
 }
 
 // ================================================================= виджеты

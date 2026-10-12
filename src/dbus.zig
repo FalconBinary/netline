@@ -346,8 +346,12 @@ pub const Conn = struct {
             sys.close(c.fd);
             c.fd = -1;
         }
+        // AUTH, BEGIN и Hello уходят одним рейсом, не дожидаясь «OK» (так делает и sd-bus):
+        // одно ожидание ответа вместо двух
         try c.auth();
-        const r = try c.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello", "", "");
+        const serial = try c.send(.{ .kind = 1, .path = "/org/freedesktop/DBus", .iface = "org.freedesktop.DBus", .member = "Hello", .dest = "org.freedesktop.DBus" }, "");
+        try c.authReply();
+        const r = try c.waitReply(serial);
         if (!r.ok()) return error.Auth;
     }
 
@@ -366,23 +370,27 @@ pub const Conn = struct {
             line[n + 1] = hexd[ch & 15];
             n += 2;
         }
-        line[n] = '\r';
-        line[n + 1] = '\n';
-        n += 2;
+        const tail = "\r\nBEGIN\r\n";
+        @memcpy(line[n..][0..tail.len], tail);
+        n += tail.len;
         sys.sendAll(c.fd, line[0..n]) catch return error.Io;
-        // ждём строку "OK <guid>\r\n"
+    }
+
+    /// Строка «OK <guid>\r\n» от сервера. Всё, что пришло за ней, — уже сообщения (ответ на Hello).
+    fn authReply(c: *Conn) Error!void {
         var got: usize = 0;
-        while (true) {
-            try c.waitReadable(5000);
-            const k = sys.read(c.fd, c.in[got..256]) catch return error.Io;
-            if (k == 0) return error.Auth;
-            got += k;
-            if (std.mem.indexOf(u8, c.in[0..got], "\r\n")) |_| break;
+        const end = while (true) {
+            if (std.mem.indexOf(u8, c.in[0..got], "\r\n")) |e| break e;
             if (got >= 256) return error.Auth;
-        }
-        if (!std.mem.startsWith(u8, c.in[0..got], "OK ")) return error.Auth;
-        sys.sendAll(c.fd, "BEGIN\r\n") catch return error.Io;
-        c.ilen = 0;
+            try c.waitReadable(5000);
+            const k = sys.read(c.fd, c.in[got..]) catch return error.Io;
+            if (k == 0) return error.Auth; // REJECTED и закрытие — нет доступа
+            got += k;
+        };
+        if (!std.mem.startsWith(u8, c.in[0..end], "OK ")) return error.Auth;
+        const rest = got - (end + 2);
+        std.mem.copyForwards(u8, c.in[0..rest], c.in[end + 2 .. got]);
+        c.ilen = rest;
         c.consumed = 0;
     }
 

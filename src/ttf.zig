@@ -146,10 +146,15 @@ pub const Font = struct {
         const starts = ends + segx2 + 2;
         const deltas = starts + segx2;
         const ranges = deltas + segx2;
-        var i: usize = 0;
-        while (i < segs) : (i += 1) {
-            const end = self.u16at(ends + i * 2);
-            if (end < cp) continue;
+        // первый сегмент, у которого конец ≥ cp (концы идут по возрастанию) — двоичным поиском
+        var lo: usize = 0;
+        var hi: usize = segs;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (self.u16at(ends + mid * 2) < cp) lo = mid + 1 else hi = mid;
+        }
+        if (lo < segs) {
+            const i = lo;
             const start = self.u16at(starts + i * 2);
             if (start > cp) return 0;
             const delta = self.u16at(deltas + i * 2);
@@ -626,10 +631,18 @@ pub const Utf8 = struct {
     }
 };
 
+/// Кэш «символ → номер глифа»: поиск по cmap — на каждый символ каждого кадра.
+const CpSlot = struct { cp: u32 = 0xffffffff, gid: u32 = 0 };
+var cp_cache: [512]CpSlot = [_]CpSlot{.{}} ** 512;
+
 fn glyphFor(cp: u32) u32 {
     const f = fnt() orelse return 0;
-    const g = f.glyphIndex(cp);
-    return if (g != 0 or cp == '?') g else f.glyphIndex('?');
+    const slot = &cp_cache[(cp *% 2654435761) >> 23];
+    if (slot.cp == cp) return slot.gid;
+    const g0 = f.glyphIndex(cp);
+    const g = if (g0 != 0 or cp == '?') g0 else f.glyphIndex('?');
+    slot.* = .{ .cp = cp, .gid = g };
+    return g;
 }
 
 /// Ширина строки в пикселях.

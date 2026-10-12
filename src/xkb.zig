@@ -106,12 +106,48 @@ fn section(text: []const u8, name: []const u8) ?[]const u8 {
 
 const MAX_NAMES = 768;
 
+/// Имена клавиш (<AE01>, <LFSH> — до 8 байт) → коды: имя упаковано в u64,
+/// открытая адресация. Раньше каждое имя в xkb_symbols искалось перебором всех.
+const Names = struct {
+    keys: [1024]u64 = [_]u64{0} ** 1024, // 0 — пусто (у имени хотя бы один байт ненулевой)
+    codes: [1024]u16 = undefined,
+    n: usize = 0,
+
+    fn pack(s: []const u8) ?u64 {
+        if (s.len == 0 or s.len > 8) return null;
+        var b = [_]u8{0} ** 8;
+        @memcpy(b[0..s.len], s);
+        const k = std.mem.readInt(u64, &b, .little);
+        return if (k == 0) null else k;
+    }
+
+    fn slot(t: *const Names, k: u64) usize {
+        var i: usize = @intCast((k *% 0x9e3779b97f4a7c15) >> 54);
+        while (t.keys[i] != 0 and t.keys[i] != k) i = (i + 1) & 1023;
+        return i;
+    }
+
+    fn put(t: *Names, name: []const u8, code: u16) void {
+        const k = pack(name) orelse return;
+        if (t.n >= MAX_NAMES) return;
+        const i = t.slot(k);
+        if (t.keys[i] == 0) {
+            t.keys[i] = k;
+            t.codes[i] = code;
+            t.n += 1;
+        } // повтор имени: действует первое, как раньше при переборе
+    }
+
+    fn get(t: *const Names, name: []const u8) ?u16 {
+        const k = pack(name) orelse return null;
+        const i = t.slot(k);
+        return if (t.keys[i] == k) t.codes[i] else null;
+    }
+};
+
 pub fn parse(text: []const u8) Keymap {
     var km = Keymap{};
-    var names: [MAX_NAMES][8]u8 = undefined;
-    var name_len: [MAX_NAMES]u8 = undefined;
-    var codes: [MAX_NAMES]u16 = undefined;
-    var nn: usize = 0;
+    var names = Names{};
 
     // --- xkb_keycodes: <NAME> = N;  alias <A> = <B>;
     if (section(text, "xkb_keycodes")) |body| {
@@ -124,24 +160,13 @@ pub fn parse(text: []const u8) Keymap {
                 const v = l.next();
                 if (v.kind != .ident) continue;
                 const code = std.fmt.parseInt(u16, v.s, 10) catch continue;
-                if (nn < MAX_NAMES and t.s.len <= 8) {
-                    @memcpy(names[nn][0..t.s.len], t.s);
-                    name_len[nn] = @intCast(t.s.len);
-                    codes[nn] = code;
-                    nn += 1;
-                }
+                names.put(t.s, code);
             } else if (t.kind == .ident and std.mem.eql(u8, t.s, "alias")) {
                 const a = l.next();
                 if (!isPunct(l.next(), '=')) continue;
                 const b = l.next();
-                if (a.kind != .keyname or b.kind != .keyname or a.s.len > 8) continue;
-                const code = lookupName(names[0..nn], name_len[0..nn], codes[0..nn], b.s) orelse continue;
-                if (nn < MAX_NAMES) {
-                    @memcpy(names[nn][0..a.s.len], a.s);
-                    name_len[nn] = @intCast(a.s.len);
-                    codes[nn] = code;
-                    nn += 1;
-                }
+                if (a.kind != .keyname or b.kind != .keyname) continue;
+                names.put(a.s, names.get(b.s) orelse continue);
             }
         }
     }
@@ -156,7 +181,7 @@ pub fn parse(text: []const u8) Keymap {
         const kn = l.next();
         if (kn.kind != .keyname) continue;
         if (!isPunct(l.next(), '{')) continue;
-        const code = lookupName(names[0..nn], name_len[0..nn], codes[0..nn], kn.s);
+        const code = names.get(kn.s);
         var implicit: u8 = 0;
         // тело клавиши до закрывающей '}'
         while (true) {
@@ -196,13 +221,6 @@ fn groupNum(s: []const u8) u8 {
     var i: usize = 0;
     while (i < s.len and !std.ascii.isDigit(s[i])) i += 1;
     return std.fmt.parseInt(u8, s[i..], 10) catch 0;
-}
-
-fn lookupName(names: []const [8]u8, lens: []const u8, codes: []const u16, s: []const u8) ?u16 {
-    for (names, lens, codes) |n, len, c| {
-        if (std.mem.eql(u8, n[0..len], s)) return c;
-    }
-    return null;
 }
 
 fn skipList(l: *Lexer) void {
