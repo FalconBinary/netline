@@ -263,8 +263,15 @@ fn noScreen(k: bz.Kind) bool {
 /// Ответить агенту самим, если пользователю нечего сравнивать или вводить:
 /// подтверждение для устройств без экрана и стандартные PIN для старых устройств.
 fn autoAnswer() bool {
+    // только запросы от устройства, которое пользователь сам выбрал для сопряжения
+    if (!bz.req.device.eql(target.path.get())) return false;
     switch (bz.req.kind) {
-        .confirm, .authorize => if (noScreen(target.kind)) {
+        // «Just Works»: кода нет, сравнивать нечего, а сопряжение пользователь уже начал сам
+        .authorize => {
+            bz.answer(true, "");
+            return true;
+        },
+        .confirm => if (noScreen(target.kind)) {
             bz.answer(true, "");
             return true;
         },

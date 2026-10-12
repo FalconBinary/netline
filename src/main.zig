@@ -14,6 +14,7 @@ const wl = @import("wl.zig");
 const draw = @import("draw.zig");
 const status = @import("status.zig");
 const tz = @import("tz.zig");
+const ttf = @import("ttf.zig");
 const mango = @import("mango.zig");
 const broker = @import("broker.zig");
 const sandbox = @import("sandbox.zig");
@@ -133,6 +134,7 @@ var wifi_state: status.Wifi = .{};
 var bt_state: status.Bt = .none;
 var clock_buf: [64]u8 = undefined;
 var clock_len: usize = 0;
+var clock_date: usize = 0; // начало clock_buf — дата словами, рисуется шрифтом TrueType
 var clock_hour: u32 = 99;
 
 var clock_timer: i32 = -1;
@@ -155,6 +157,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     tz.load();
     theme.init();
     status.init();
+    // Векторный шрифт панели умеет только цифры; дату словами рисуем TrueType-шрифтом меню.
+    // Загружаем до песочницы; не нашёлся — дата будет цифрами.
+    if (cfg.clock_format == .full) _ = ttf.load(&cfg.font_paths);
 
     conn.connect() catch {
         sys.log("не удалось подключиться к Wayland (WAYLAND_DISPLAY/XDG_RUNTIME_DIR)", .{});
@@ -327,9 +332,21 @@ fn updateClock() bool {
     }
     var buf: [64]u8 = undefined;
     var n: usize = 0;
+    var date_len: usize = 0;
     if (cfg.clock_format == .full) {
-        const d = std.fmt.bufPrint(&buf, "{s}, {d} {s} {d}  ", .{ wshort[t.wday % 7], t.day, months_gen[(t.month -% 1) % 12], t.year }) catch "";
-        n = d.len;
+        if (ttf.font != null) {
+            const d = std.fmt.bufPrint(&buf, "{s}, {d} {s} {d}", .{ wshort[t.wday % 7], t.day, months_gen[(t.month -% 1) % 12], t.year }) catch "";
+            n = d.len;
+            date_len = n;
+        } else {
+            // без TrueType-шрифта — только цифры: 12.10.2026  13:31
+            two(buf[0..], t.day);
+            buf[2] = '.';
+            two(buf[3..], t.month);
+            buf[5] = '.';
+            const y = std.fmt.bufPrint(buf[6..], "{d}  ", .{t.year}) catch "";
+            n = 6 + y.len;
+        }
     }
     if (cfg.clock_format == .date_hm) {
         two(buf[0..], t.day);
@@ -348,14 +365,33 @@ fn updateClock() bool {
         two(buf[n + 1 ..], t.sec);
         n += 3;
     }
-    if (n == clock_len and std.mem.eql(u8, buf[0..n], clock_buf[0..n])) return false;
+    if (n == clock_len and date_len == clock_date and std.mem.eql(u8, buf[0..n], clock_buf[0..n])) return false;
     @memcpy(clock_buf[0..n], buf[0..n]);
     clock_len = n;
+    clock_date = date_len;
     return true;
 }
 
+/// Время (и дата цифрами) — векторным шрифтом панели.
 fn clockText() []const u8 {
-    return clock_buf[0..clock_len];
+    return clock_buf[clock_date..clock_len];
+}
+
+fn dateText() []const u8 {
+    return clock_buf[0..clock_date];
+}
+
+const date_gap: f32 = 10; // промежуток между датой и временем
+
+/// Кегль даты: строчные и прописные чуть ниже цифр времени.
+fn dateSize(S: f32) u16 {
+    return @intFromFloat(@round(cfg.clock_size * 1.3 * S));
+}
+
+fn clockWidth(S: f32) f32 {
+    var w = draw.textWidth(clockText(), cfg.clock_size);
+    if (clock_date > 0) w += ttf.width(dateText(), dateSize(S)) / S + date_gap;
+    return w;
 }
 
 // ================================================================= события Wayland
@@ -925,7 +961,7 @@ fn layout(b: *Bar) void {
         place(b, it, rx, by);
         rx -= cfg.spacing;
     }
-    const tw = draw.textWidth(clockText(), cfg.clock_size);
+    const tw = clockWidth(@floatFromInt(b.scale));
     addHit(b, .clock, 0, (W - tw) / 2 - 8, by, tw + 16, cfg.button);
 }
 
@@ -949,9 +985,14 @@ fn paint(b: *const Bar, cv: *draw.Canvas) void {
         switch (h.item) {
             .tags => paintTag(b, cv, h, S),
             .clock => {
-                const tw = draw.textWidth(clockText(), cfg.clock_size);
-                const x = @round((h.x + (h.w - tw) / 2) * S);
+                const tw = clockWidth(S);
+                var x = @round((h.x + (h.w - tw) / 2) * S);
                 const y = @round((H - cfg.clock_size) / 2 * S);
+                if (clock_date > 0) {
+                    // базовая линия даты — по низу цифр времени
+                    const end = ttf.drawText(cv, dateText(), x, y + cfg.clock_size * S, dateSize(S), c.clock, W * S);
+                    x = @round(end + date_gap * S);
+                }
                 draw.text(cv, clockText(), x, y, cfg.clock_size * S, c.clock);
             },
             else => paintIcon(cv, h, S),
