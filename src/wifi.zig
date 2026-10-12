@@ -37,6 +37,7 @@ var target: nm.Net = .{};
 var target_hidden = false;
 var reenter = false; // сохранённый профиль не подошёл — при отправке старый удаляется
 var nm_ok = false;
+var loaded = false; // список ещё не загружен: окно показывается сразу, данные — следующим тактом
 var ticks: u32 = 0;
 
 const F = enum(u8) { ssid, password, identity, anon, ca, domain, cert, key, keypass };
@@ -98,12 +99,8 @@ pub fn main(init: std.process.Init.Minimal) void {
 
 fn start() void {
     list.visible = @intFromFloat((ui.H() - LIST_Y - 64) / ROW_H);
-    if (nm_ok) {
-        nm.loadSaved();
-        nm.scan();
-        refresh();
-    }
-    armTimer();
+    // меню появляется сразу («Поиск сетей…»), список подгружается первым тактом таймера
+    if (nm_ok) ui.setTimer(1, 3000) else armTimer();
 }
 
 fn cleanup() void {
@@ -144,7 +141,11 @@ fn onTick() void {
     switch (view) {
         .list => {
             if (!nm_ok) return;
-            if (ticks % 4 == 0) nm.scan();
+            if (!loaded) {
+                loaded = true;
+                nm.loadSaved();
+                nm.scan();
+            } else if (ticks % 4 == 0) nm.scan();
             refresh();
         },
         .connecting => {

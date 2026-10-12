@@ -449,6 +449,48 @@ pub const Conn = struct {
         return c.waitReply(serial);
     }
 
+    /// Отправить вызов, не дожидаясь ответа: ответы на пачку таких вызовов забирает collect.
+    pub fn sendCall(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!u32 {
+        return c.send(.{ .kind = 1, .path = path, .iface = iface, .member = member, .dest = dest, .sig = sig }, body);
+    }
+
+    /// Дождаться ответов на вызовы `serials` (0 — пропуск) в любом порядке: для каждого —
+    /// got(ctx, индекс, ответ). Ответ живёт только внутри got, вызывать шину из got нельзя.
+    /// Пачка вместо цепочки синхронных вызовов — одно ожидание вместо N.
+    /// Больше 64 вызовов сразу не отправляйте: у системной шины лимит ожидающих ответов.
+    pub fn collect(c: *Conn, serials: []u32, ctx: anytype, comptime got: fn (@TypeOf(ctx), usize, Reply) void) Error!void {
+        if (c.consumed > 0) {
+            c.drop(c.consumed);
+            c.consumed = 0;
+        }
+        var left: usize = 0;
+        for (serials) |s| left += @intFromBool(s != 0);
+        while (left > 0) {
+            while (try c.complete()) |total| {
+                const m = try c.parse(total);
+                var mine = false;
+                if (m.kind == 2 or m.kind == 3) {
+                    for (serials, 0..) |*s, i| {
+                        if (s.* == 0 or s.* != m.reply_serial) continue;
+                        s.* = 0;
+                        left -= 1;
+                        mine = true;
+                        got(ctx, i, .{ .sig = m.sig, .body = m.body, .err_name = if (m.kind == 3) (if (m.err_name.len > 0) m.err_name else "error") else "" });
+                        break;
+                    }
+                }
+                if (!mine) c.handle(&m);
+                c.drop(total);
+            }
+            if (left == 0) break;
+            try c.waitReadable(10000);
+            if (c.ilen == c.in.len) return error.TooBig;
+            const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
+            if (k == 0) return error.Io;
+            c.ilen += k;
+        }
+    }
+
     /// Асинхронный вызов: ответ придёт позже, его забирают через result(serial).
     pub fn callAsync(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!u32 {
         var slot: ?usize = null;

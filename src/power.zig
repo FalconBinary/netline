@@ -75,9 +75,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     } else |_| {}
     if (sys.getenv("MANGO_INSTANCE_SIGNATURE")) |p| mango_fd = sys.connectUnix(p) catch -1;
 
+    var can = [_]bool{false} ** all.len;
+    queryAvailable(&can);
     nacts = 0;
-    for (all) |a| {
-        if (available(a)) {
+    for (all, can) |a, ok| {
+        if (ok) {
             acts[nacts] = a;
             nacts += 1;
         }
@@ -101,26 +103,30 @@ pub fn main(init: std.process.Init.Minimal) void {
     }, .{}, .{});
 }
 
-/// Можно ли выполнить действие (logind отвечает "yes" или "challenge" — с паролем polkit).
-fn available(a: Act) bool {
-    switch (a) {
-        .lock => return have_broker,
-        .logout => return mango_fd >= 0 or logind_ok,
-        else => {},
-    }
-    if (!logind_ok) return false;
-    const member = switch (a) {
-        .sleep => "CanSuspend",
-        .hibernate => "CanHibernate",
-        .reboot => "CanReboot",
-        .poweroff => "CanPowerOff",
-        else => unreachable,
-    };
-    const r = bus.call(LOGIN, LPATH, MGR, member, "", "") catch return false;
-    if (!r.ok()) return false;
+const Ask = struct { act: Act, member: []const u8 };
+const asks = [_]Ask{
+    .{ .act = .sleep, .member = "CanSuspend" },
+    .{ .act = .hibernate, .member = "CanHibernate" },
+    .{ .act = .reboot, .member = "CanReboot" },
+    .{ .act = .poweroff, .member = "CanPowerOff" },
+};
+
+/// Какие действия доступны. Блокировка и выход — без logind; про остальное спрашиваем
+/// logind одной пачкой ("yes" или "challenge" — с паролем polkit).
+fn queryAvailable(can: *[all.len]bool) void {
+    can[@intFromEnum(Act.lock)] = have_broker;
+    can[@intFromEnum(Act.logout)] = mango_fd >= 0 or logind_ok;
+    if (!logind_ok) return;
+    var serials: [asks.len]u32 = undefined;
+    for (asks, &serials) |q, *sr| sr.* = bus.sendCall(LOGIN, LPATH, MGR, q.member, "", "") catch 0;
+    bus.collect(&serials, can, gotCan) catch {};
+}
+
+fn gotCan(can: *[all.len]bool, i: usize, r: dbus.Reply) void {
+    if (!r.ok()) return;
     var rr = r.reader();
     const v = rr.str();
-    return std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "challenge");
+    can[@intFromEnum(asks[i].act)] = !rr.bad and (std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "challenge"));
 }
 
 /// Пользователь, имя компьютера и время работы — до песочницы.

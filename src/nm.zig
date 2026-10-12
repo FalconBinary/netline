@@ -221,9 +221,28 @@ pub fn loadSaved() void {
         paths[n].set(r.str());
         n += 1;
     }
-    for (paths[0..n]) |*p| {
-        if (nsaved == saved.len) break;
-        const s = call(p.get(), CONN, "GetSettings", "", "") orelse continue;
+    // GetSettings для всех профилей — пачками, а не по одному вызову с ожиданием
+    var start: usize = 0;
+    while (start < n) : (start += BATCH) {
+        const stop = @min(n, start + BATCH);
+        var serials = [_]u32{0} ** BATCH;
+        for (paths[start..stop], 0..) |*p, i| {
+            serials[i] = bus.sendCall(NM, p.get(), CONN, "GetSettings", "", "") catch 0;
+        }
+        bus.collect(serials[0 .. stop - start], paths[start..stop], gotSettings) catch {
+            setError("ошибка связи с NetworkManager");
+            return;
+        };
+    }
+}
+
+/// Сколько вызовов отправлять одной пачкой (у системной шины лимит ожидающих ответов).
+const BATCH = 32;
+
+fn gotSettings(paths: []Path, i: usize, s: dbus.Reply) void {
+    if (!s.ok() or nsaved == saved.len) return;
+    const p = &paths[i];
+    {
         var item = Saved{};
         var is_wifi = false;
         var gr = s.reader();
@@ -290,10 +309,47 @@ pub fn networks(out: []Net) usize {
     }
 
     var n: usize = 0;
-    for (aps[0..naps]) |*ap| {
+    var ctx = ApCtx{ .aps = aps[0..naps], .out = out, .n = &n, .active = active_ap.get() };
+    var start: usize = 0;
+    while (start < naps) : (start += BATCH) {
+        const stop = @min(naps, start + BATCH);
+        var serials = [_]u32{0} ** BATCH;
         var w = dbus.W{ .buf = &body_buf };
         w.str(AP);
-        const props = call(ap.get(), PROPS, "GetAll", "s", w.bytes()) orelse continue;
+        for (aps[start..stop], 0..) |*ap, i| {
+            serials[i] = bus.sendCall(NM, ap.get(), PROPS, "GetAll", "s", w.bytes()) catch 0;
+        }
+        ctx.base = start;
+        bus.collect(serials[0 .. stop - start], &ctx, gotAp) catch {
+            setError("ошибка связи с NetworkManager");
+            break;
+        };
+    }
+    for (out[0..n]) |*net| {
+        if (savedFor(net.ssid())) |sv| {
+            net.known = true;
+            net.conn = sv.path;
+        }
+    }
+    // активная сверху, затем по силе сигнала
+    std.mem.sort(Net, out[0..n], {}, struct {
+        fn lt(_: void, a: Net, b: Net) bool {
+            if (a.active != b.active) return a.active;
+            return a.strength > b.strength;
+        }
+    }.lt);
+    return n;
+}
+
+const ApCtx = struct { aps: []Path, out: []Net, n: *usize, active: []const u8, base: usize = 0 };
+
+/// Свойства одной точки доступа → строка списка (по одной на SSID, самая сильная точка).
+fn gotAp(ctx: *ApCtx, i: usize, props: dbus.Reply) void {
+    if (!props.ok()) return;
+    const ap = &ctx.aps[ctx.base + i];
+    const out = ctx.out;
+    const n = ctx.n.*;
+    {
         var net = Net{ .ap = ap.* };
         var flags: u32 = 0;
         var wpa: u32 = 0;
@@ -322,37 +378,23 @@ pub fn networks(out: []Net) usize {
                 rsn = pr.u32_();
             } else pr.skip(vs);
         }
-        if (pr.bad or net.ssid_len == 0) continue; // скрытые сети в списке не показываем
+        if (pr.bad or net.ssid_len == 0) return; // скрытые сети в списке не показываем
         net.sec = securityOf(flags, wpa, rsn);
-        net.active = std.mem.eql(u8, ap.get(), active_ap.get());
+        net.active = std.mem.eql(u8, ap.get(), ctx.active);
 
         // одна строка на SSID: оставляем самую сильную точку (но активную — всегда)
         var dup: ?usize = null;
-        for (out[0..n], 0..) |*o, i| {
-            if (std.mem.eql(u8, o.ssid(), net.ssid())) dup = i;
+        for (out[0..n], 0..) |*o, k| {
+            if (std.mem.eql(u8, o.ssid(), net.ssid())) dup = k;
         }
-        if (dup) |i| {
-            if (net.active or (!out[i].active and net.strength > out[i].strength)) out[i] = net;
-            continue;
+        if (dup) |d| {
+            if (net.active or (!out[d].active and net.strength > out[d].strength)) out[d] = net;
+            return;
         }
-        if (n == out.len) continue;
+        if (n == out.len) return;
         out[n] = net;
-        n += 1;
+        ctx.n.* = n + 1;
     }
-    for (out[0..n]) |*net| {
-        if (savedFor(net.ssid())) |s| {
-            net.known = true;
-            net.conn = s.path;
-        }
-    }
-    // активная сверху, затем по силе сигнала
-    std.mem.sort(Net, out[0..n], {}, struct {
-        fn lt(_: void, a: Net, b: Net) bool {
-            if (a.active != b.active) return a.active;
-            return a.strength > b.strength;
-        }
-    }.lt);
-    return n;
 }
 
 // ================================================================= действия

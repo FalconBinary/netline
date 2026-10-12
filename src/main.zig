@@ -826,15 +826,27 @@ fn render(i: u8) void {
     b.dirty = false;
 }
 
+fn sameTags(a: []const mango.Tag, b: []const mango.Tag) bool {
+    for (a, b) |x, y| {
+        if (x.active != y.active or x.urgent != y.urgent or x.clients != y.clients) return false;
+    }
+    return true;
+}
+
+/// Теги из mango → панели. Перерисовка — только если у этой панели что-то изменилось:
+/// события IPC приходят и на то, что панель не показывает (например, смену фокуса).
 fn applyTags() void {
     for (&bars) |*b| {
         if (!b.used) continue;
+        var tags: [mango.MAX_TAGS]mango.Tag = [_]mango.Tag{.{}} ** mango.MAX_TAGS;
+        var n: u8 = 0;
         if (mango.find(b.monName())) |m| {
-            b.tags = m.tags;
-            b.ntags = @min(m.ntags, mango.MAX_TAGS);
-        } else {
-            b.ntags = 0;
+            n = @min(m.ntags, mango.MAX_TAGS);
+            @memcpy(tags[0..n], m.tags[0..n]);
         }
+        if (n == b.ntags and sameTags(tags[0..n], b.tags[0..n])) continue;
+        b.tags = tags;
+        b.ntags = n;
         b.dirty = true;
     }
 }

@@ -33,7 +33,7 @@ const TW: u32 = 304;
 const TH: u32 = 190;
 const MAX_FILES = 512;
 
-const State = enum(u8) { pending, ok, failed };
+const State = enum(u8) { pending, ok, failed, cached }; // cached — превью на диске, в памяти его нет
 
 var names_buf: [96 * 1024]u8 = undefined;
 var names_len: usize = 0;
@@ -348,13 +348,41 @@ fn saveCached(i: usize, rgb: []const u8) void {
 
 var work: [TW * TH]u32 = undefined; // рабочий буфер превью (не на стеке)
 
+/// Превью в памяти — только для видимого экрана и экрана сверху и снизу (≤ 36 штук, ~6 МБ),
+/// остальные лежат в кэше на диске и подгружаются за миллисекунду. Раньше в памяти держались
+/// все: 100 обоев — 17 МБ, 512 — 88 МБ.
+fn window() [2]usize {
+    const lo = (if (scroll > ROWS) scroll - ROWS else 0) * COLS;
+    return .{ @min(lo, nfiles), @min(nfiles, (scroll + 2 * ROWS) * COLS) };
+}
+
+fn freeThumb(i: usize) void {
+    if (thumbs[i].len > 0) sys.munmap(thumbs[i].ptr, thumbs[i].len);
+    thumbs[i] = &[_]u8{};
+}
+
+/// Превью вне окна — убрать из памяти (если кэш на диске есть).
+fn dropIfOutside(i: usize) void {
+    if (!cache_ok or states[i] != .ok) return;
+    const win = window();
+    if (i >= win[0] and i < win[1]) return;
+    freeThumb(i);
+    states[i] = .cached;
+}
+
+/// После прокрутки: лишнее — из памяти, недостающие видимые — подгрузить.
+fn trimThumbs() void {
+    for (0..nfiles) |i| dropIfOutside(i);
+    if (nfiles > 0) ui.setTimer(1, 0);
+}
+
 /// Сделать одно превью: сначала видимые.
 fn makeOne() bool {
     var pick: ?usize = null;
     const first = scroll * COLS;
     var i = first;
     while (i < @min(nfiles, first + ROWS * COLS)) : (i += 1) {
-        if (states[i] == .pending) {
+        if (states[i] == .pending or states[i] == .cached) {
             pick = i;
             break;
         }
@@ -375,11 +403,18 @@ fn makeOne() bool {
     thumbs[k] = rgb[0 .. TW * TH * 3];
     if (loadCached(k, thumbs[k])) {
         states[k] = .ok;
+        dropIfOutside(k);
         return true;
     }
-    var pic = img.load(path, TW, TH) catch return true;
+    var pic = img.load(path, TW, TH) catch {
+        freeThumb(k);
+        return true;
+    };
     defer pic.deinit();
-    img.render(&pic, &work, TW, TH, .fill, 0x202020) catch return true;
+    img.render(&pic, &work, TW, TH, .fill, 0x202020) catch {
+        freeThumb(k);
+        return true;
+    };
     for (work, 0..) |p, j| {
         thumbs[k][j * 3] = @truncate(p >> 16);
         thumbs[k][j * 3 + 1] = @truncate(p >> 8);
@@ -387,6 +422,7 @@ fn makeOne() bool {
     }
     states[k] = .ok;
     saveCached(k, thumbs[k]);
+    dropIfOutside(k); // невидимое превью сделано заранее — в кэш на диск, из памяти долой
     return true;
 }
 
@@ -409,8 +445,10 @@ fn onTick() void {
 
 fn ensureVisible() void {
     const row = sel / COLS;
+    const was = scroll;
     if (row < scroll) scroll = row;
     if (row >= scroll + ROWS) scroll = row + 1 - ROWS;
+    if (scroll != was) trimThumbs();
 }
 
 fn moveSel(d: i32) void {
@@ -444,7 +482,9 @@ fn onKey(k: ui.Key) bool {
 fn onScroll(d: i32) void {
     const rows = (nfiles + COLS - 1) / COLS;
     if (rows <= ROWS) return;
+    const was = scroll;
     scroll = @intCast(std.math.clamp(@as(i64, @intCast(scroll)) + d, 0, @as(i64, @intCast(rows - ROWS))));
+    if (scroll != was) trimThumbs();
     ui.redraw();
 }
 
