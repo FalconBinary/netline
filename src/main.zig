@@ -131,7 +131,7 @@ var last_click: [commands.len]?u32 = [_]?u32{null} ** commands.len;
 
 var wifi_state: status.Wifi = .{};
 var bt_state: status.Bt = .none;
-var clock_buf: [32]u8 = undefined;
+var clock_buf: [64]u8 = undefined;
 var clock_len: usize = 0;
 var clock_hour: u32 = 99;
 
@@ -312,6 +312,9 @@ fn two(buf: []u8, v: u32) void {
     buf[1] = '0' + @as(u8, @intCast(v % 10));
 }
 
+const wshort = [_][]const u8{ "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс" };
+const months_gen = [_][]const u8{ "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря" };
+
 fn updateClock() bool {
     var t = tz.now();
     if (t.hour != clock_hour) {
@@ -322,8 +325,12 @@ fn updateClock() bool {
         }
         clock_hour = t.hour;
     }
-    var buf: [32]u8 = undefined;
+    var buf: [64]u8 = undefined;
     var n: usize = 0;
+    if (cfg.clock_format == .full) {
+        const d = std.fmt.bufPrint(&buf, "{s}, {d} {s} {d}  ", .{ wshort[t.wday % 7], t.day, months_gen[(t.month -% 1) % 12], t.year }) catch "";
+        n = d.len;
+    }
     if (cfg.clock_format == .date_hm) {
         two(buf[0..], t.day);
         buf[2] = '.';

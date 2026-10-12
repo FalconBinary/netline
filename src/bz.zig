@@ -60,6 +60,8 @@ pub var powered = false;
 pub var discovering = false;
 /// пришёл сигнал от bluetoothd — список стоит перечитать
 pub var changed = false;
+/// отдавать из refresh все устройства, в том числе безымянные (для `zbt scan`)
+pub var keep_all = false;
 
 var owner_buf: [64]u8 = undefined;
 var owner_len: usize = 0;
@@ -226,7 +228,11 @@ pub fn refresh(out: []Dev) usize {
             ad_powered = p_powered;
             ad_disc = p_disc;
         }
-        if (is_dev and n < out.len) {
+        // Во время поиска bluetoothd копит десятки безымянных BLE-устройств (телефоны со
+        // случайными адресами, метки, телевизоры). Их отбрасываем сразу, чтобы они не
+        // вытеснили из списка нужные: оставляем сопряжённые, с именем или с известным типом.
+        const useful = keep_all or d.paired or nm.len > 0 or d.kind != .generic;
+        if (is_dev and useful and n < out.len) {
             const label = if (alias.len > 0) alias else nm;
             d.has_name = nm.len > 0;
             d.name_len = @intCast(@min(label.len, d.name_buf.len));
@@ -298,8 +304,15 @@ pub fn setPowered(on: bool) bool {
     return false;
 }
 
-pub fn startDiscovery() void {
-    _ = call(adapter.get(), ADAPTER, "StartDiscovery", "", "");
+/// Начать поиск. «Уже идёт» — не ошибка; иначе false и текст в lastError.
+pub fn startDiscovery() bool {
+    const r = bus.call(BZ, adapter.get(), ADAPTER, "StartDiscovery", "", "") catch {
+        setError("ошибка связи с bluetoothd");
+        return false;
+    };
+    if (r.ok() or std.mem.endsWith(u8, r.err_name, "InProgress")) return true;
+    setError(friendly(r.err_name, r.message()));
+    return false;
 }
 
 pub fn stopDiscovery() void {

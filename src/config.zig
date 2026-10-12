@@ -8,7 +8,7 @@ const hex = @import("color.zig").hex;
 
 pub const Position = enum { top, bottom };
 pub const TagStyle = enum { dots, numbers };
-pub const ClockFormat = enum { hm, hms, date_hm };
+pub const ClockFormat = enum { hm, hms, date_hm, full };
 
 /// Элементы панели. Часы всегда по центру.
 pub const Item = enum { launcher, tags, clock, wifi, bluetooth, wallpaper, power };
@@ -33,7 +33,9 @@ pub const icon_stroke: f32 = 1.6; // толщина линий иконок
 pub const hover_effect = true; // подсвечивать кнопку под курсором
 
 pub const clock_size: f32 = 12; // высота цифр часов
-pub const clock_format: ClockFormat = .hm; // .hms будит панель каждую секунду, .hm — раз в минуту
+/// .hm — 13:31, .hms — 13:31:05 (будит панель каждую секунду), .date_hm — 12.10  13:31,
+/// .full — Пн, 12 октября 2026  13:31
+pub const clock_format: ClockFormat = .full;
 
 pub const tag_style: TagStyle = .dots;
 pub const hide_empty_tags = false; // прятать пустые неактивные теги

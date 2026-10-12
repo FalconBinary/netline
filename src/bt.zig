@@ -5,7 +5,8 @@
 //!
 //! Сопряжённые устройства (подключить, отключить, забыть), поиск и сопряжение новых
 //! со своим агентом (подтверждение кода, ввод PIN), заряд батареи, включение адаптера.
-//! Работает с bluetoothd по D-Bus. `zbt toggle` — включить/выключить Bluetooth без окна.
+//! Работает с bluetoothd по D-Bus. `zbt toggle` — включить/выключить Bluetooth без окна,
+//! `zbt scan` — поискать устройства и вывести всё, что видит bluetoothd (для диагностики).
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -26,9 +27,9 @@ const LIST_Y: f32 = 62;
 const View = enum { list, add, actions, pairing, done };
 var view: View = .list;
 
-var devs: [64]bz.Dev = undefined;
+var devs: [128]bz.Dev = undefined;
 var ndev: usize = 0;
-var shown: [64]u8 = undefined; // индексы devs в текущем списке
+var shown: [128]u8 = undefined; // индексы devs в текущем списке
 var list: ui.List = .{};
 var target: bz.Dev = .{};
 var ok = false;
@@ -41,6 +42,12 @@ var op_serial: u32 = 0;
 var op_dev: bz.Path = .{};
 
 var pin_field: ui.Field = .{};
+
+/// PIN, которые пробуем сами для старых устройств без экрана и клавиатуры (наушники, колонки, мыши):
+/// у них PIN зашит, и почти всегда это 0000 или 1234. Не подошли — спросим у пользователя.
+const auto_pins = [_][]const u8{ "0000", "1234" };
+var pin_try: usize = 0;
+var pin_dev: bz.Path = .{};
 
 const Wid = enum(u8) { none, row, more, toggle, back, add, primary, secondary, act_conn, act_forget, field };
 
@@ -58,6 +65,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (bz.adapter.len == 0 or !bz.setPowered(!bz.powered)) fatalCli();
         sys.exit(0);
     }
+    if (sys.argIs(1, "scan")) scanCli();
     ui.begin("zbt");
     ok = bz.init();
     if (!ok) ui.setMsg(bz.lastError());
@@ -83,6 +91,43 @@ pub fn main(init: std.process.Init.Minimal) void {
 fn fatalCli() noreturn {
     sys.log("{s}", .{bz.lastError()});
     sys.exit(1);
+}
+
+/// `zbt scan`: 10 секунд поиска и полный список устройств, которые видит bluetoothd.
+fn scanCli() noreturn {
+    if (!bz.init()) fatalCli();
+    bz.keep_all = true;
+    _ = bz.refresh(&devs);
+    if (bz.adapter.len == 0) fatalCli();
+    sys.log("адаптер {s}: {s}", .{ bz.adapter.get(), if (bz.powered) "включён" else "ВЫКЛЮЧЕН — включите Bluetooth" });
+    if (!bz.powered) sys.exit(1);
+    if (!bz.startDiscovery()) {
+        sys.log("поиск не запустился: {s}", .{bz.lastError()});
+        sys.exit(1);
+    }
+    sys.log("поиск 10 секунд...", .{});
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        var pfd = [1]sys.PollFd{.{ .fd = bz.bus.fd, .events = sys.POLLIN }};
+        _ = sys.poll(&pfd, 500) catch {};
+        bz.bus.pump() catch break;
+    }
+    const n = bz.refresh(&devs);
+    bz.stopDiscovery();
+    var named: usize = 0;
+    for (devs[0..n]) |*d| {
+        if (d.has_name or d.paired or d.kind != .generic) named += 1;
+        const rssi: i32 = d.rssi;
+        sys.log("{s}  {s}  {s}{s}rssi {d}", .{
+            d.path.get()[bz.adapter.len..],
+            d.name(),
+            kindLabel(d.kind),
+            if (d.paired) ", сопряжено, " else ", ",
+            rssi,
+        });
+    }
+    sys.log("всего {d}, из них показываются в меню: {d}", .{ n, named });
+    sys.exit(0);
 }
 
 fn start() void {
@@ -129,7 +174,8 @@ fn refresh() void {
     var n: usize = 0;
     for (devs[0..ndev], 0..) |*d, i| {
         const want = switch (view) {
-            .add, .pairing => !d.paired and d.has_name,
+            // имя у классических устройств приходит не сразу, а тип (наушники и т. п.) — уже с первым ответом
+            .add, .pairing => !d.paired and (d.has_name or d.kind != .generic),
             else => d.paired,
         };
         if (want) {
@@ -179,11 +225,20 @@ fn armTimer() void {
 fn onTick() void {
     ticks +%= 1;
     if (view == .done) return ui.quit();
+    // Синхронный вызов мог дочитать из сокета сигналы и запросы агента сверх своего ответа:
+    // они лежат в буфере, а сокет уже не «готов к чтению» — разбираем их здесь.
+    if (ok) pumpBus();
     if (bz.changed) refresh();
     ui.redraw(); // анимация точек
 }
 
 fn onBus() void {
+    pumpBus();
+    // в простое (таймер выключен) обновляемся сразу по сигналу
+    if (ok and bz.changed and !timer_on) refresh();
+}
+
+fn pumpBus() void {
     bz.bus.pump() catch {
         ok = false;
         ui.setMsg("связь с bluetoothd потеряна");
@@ -192,11 +247,35 @@ fn onBus() void {
     checkOp();
     if (bz.req_changed) {
         bz.req_changed = false;
-        if (view == .pairing) ui.resetFocus(true);
+        if (view == .pairing and !autoAnswer()) ui.resetFocus(true);
         ui.redraw();
     }
-    // в простое (таймер выключен) обновляемся сразу по сигналу
-    if (bz.changed and !timer_on) refresh();
+}
+
+/// Устройства, на которых нечего показывать и некуда вводить код.
+fn noScreen(k: bz.Kind) bool {
+    return switch (k) {
+        .headphones, .speaker, .mouse, .gamepad => true,
+        else => false,
+    };
+}
+
+/// Ответить агенту самим, если пользователю нечего сравнивать или вводить:
+/// подтверждение для устройств без экрана и стандартные PIN для старых устройств.
+fn autoAnswer() bool {
+    switch (bz.req.kind) {
+        .confirm, .authorize => if (noScreen(target.kind)) {
+            bz.answer(true, "");
+            return true;
+        },
+        .ask_pin => if ((noScreen(target.kind) or target.kind == .generic) and pin_try < auto_pins.len) {
+            bz.answer(true, auto_pins[pin_try]);
+            pin_try += 1;
+            return true;
+        },
+        else => {},
+    }
+    return false;
 }
 
 fn startOp(kind: OpKind, serial: ?u32, dev: []const u8) void {
@@ -226,8 +305,16 @@ fn checkOp() void {
                 startOp(.connect_after_pair, bz.connect(op_dev.get()), op_dev.get());
             } else {
                 bz.req.kind = .none;
+                const auth = std.mem.endsWith(u8, d.errName(), "AuthenticationFailed") or std.mem.endsWith(u8, d.errName(), "AuthenticationRejected");
+                // стандартный PIN не подошёл — пробуем следующий, не выходя с экрана сопряжения
+                if (auth and pin_try > 0 and pin_try < auto_pins.len) {
+                    startOp(.pair, bz.pair(op_dev.get()), op_dev.get());
+                    if (op == .pair) return;
+                }
                 setView(.add);
-                ui.setMsg(bz.friendly(d.errName(), d.message()));
+                if (auth and pin_try >= auto_pins.len) {
+                    ui.setMsg("PIN 0000 и 1234 не подошли — выберите устройство ещё раз и введите PIN");
+                } else ui.setMsg(bz.friendly(d.errName(), d.message()));
             }
         },
         .connect_after_pair => {
@@ -248,7 +335,7 @@ fn setView(v: View) void {
     const was = view;
     view = v;
     ui.clearMsg();
-    if (ok and v == .add) bz.startDiscovery(); // «уже идёт» — не ошибка
+    if (ok and v == .add and was != .add and bz.powered and !bz.startDiscovery()) ui.setMsg(bz.lastError());
     if (ok and was == .add and v != .add) bz.stopDiscovery();
     armTimer();
     if (ok and v != .done) refresh();
@@ -281,6 +368,11 @@ fn choose(row: usize, right: bool) void {
         bz.stopDiscovery();
         bz.req = .{};
         pin_field.clear();
+        // автоподбор PIN — один раз на устройство; после неудачи PIN спросим у пользователя
+        if (!pin_dev.eql(target.path.get())) {
+            pin_dev.set(target.path.get());
+            pin_try = 0;
+        }
         startOp(.pair, bz.pair(target.path.get()), target.path.get());
         if (op == .pair) setView(.pairing);
         return;
@@ -533,7 +625,10 @@ fn paintPairing(cv: *draw.Canvas) void {
             if (pairing) _ = ui.wrap(cv, "Подтвердите сопряжение на устройстве, если оно спросит", PAD, H / 2 + 30, 12, t.menu_muted, W - 2 * PAD, 16, true);
         },
         .confirm, .show_passkey => {
-            const hint = if (bz.req.kind == .confirm) "Убедитесь, что на устройстве тот же код:" else "Введите этот код на устройстве и нажмите Enter:";
+            const hint = if (bz.req.kind == .confirm)
+                "Если на устройстве есть экран — сверьте код. Если экрана нет — просто нажмите «Подтвердить»:"
+            else
+                "Введите этот код на устройстве и нажмите Enter:";
             _ = ui.wrap(cv, hint, PAD, 110, 13, t.menu_muted, W - 2 * PAD, 17, true);
             const code = std.fmt.bufPrint(&b, "{d:0>6}", .{bz.req.passkey}) catch "";
             paintCode(cv, code, if (bz.req.kind == .show_passkey) bz.req.entered else 0);
@@ -546,7 +641,7 @@ fn paintPairing(cv: *draw.Canvas) void {
             ui.icon(cv, kindIcon(target.kind), W / 2 - 24, H / 2 - 70, 48, 1.4, t.menu_text);
             ui.centered(cv, "Разрешить сопряжение с этим устройством?", W / 2, H / 2 + 10, 14, t.menu_text);
         },
-        .ask_pin => ui.centered(cv, "Введите PIN устройства (часто 0000 или 1234):", W / 2, 130, 13, t.menu_muted),
+        .ask_pin => ui.centered(cv, "Введите PIN устройства (обычно указан в инструкции):", W / 2, 130, 13, t.menu_muted),
         .ask_passkey => ui.centered(cv, "Введите код, показанный на устройстве:", W / 2, 130, 13, t.menu_muted),
     }
     paintWidgets(cv);

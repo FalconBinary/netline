@@ -344,7 +344,7 @@ fn parsePosix(s: []const u8) Posix {
 
 // ---------------------------------------------------------------- API
 
-pub const Local = struct { hour: u32, min: u32, sec: u32, day: u32, month: u32, year: i64 };
+pub const Local = struct { hour: u32, min: u32, sec: u32, day: u32, month: u32, year: i64, wday: u32 };
 
 pub fn now() Local {
     const t = sys.realtime();
@@ -359,5 +359,6 @@ pub fn now() Local {
         .day = date.day,
         .month = date.month,
         .year = date.year,
+        .wday = @intCast(@mod(days + 3, 7)), // 0 = понедельник; 1970-01-01 — четверг
     };
 }
