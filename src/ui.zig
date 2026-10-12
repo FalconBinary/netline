@@ -1115,7 +1115,7 @@ pub fn wrap(cv: *draw.Canvas, s: []const u8, x: f32, y: f32, size: f32, c: u32, 
         }
         const line = rest[0..cut];
         if (center) centered(cv, line, x + max_w / 2, base, size, c) else _ = text(cv, line, x, base, size, c, x + max_w);
-        rest = std.mem.trimLeft(u8, rest[cut..], " ");
+        rest = std.mem.trimStart(u8, rest[cut..], " ");
         base += line_h;
     }
     return base;

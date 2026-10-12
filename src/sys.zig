@@ -537,7 +537,16 @@ var env_buf: [64 * 1024]u8 = undefined;
 var env_ptrs: [1024:null]?[*:0]const u8 = undefined;
 var env_count: usize = 0;
 
+var proc_ready = false;
+var arg_buf: [8 * 1024]u8 = undefined;
+var arg_list: [64][]const u8 = undefined;
+var arg_count: usize = 0;
+
+/// Окружение и аргументы — прямо из /proc/self, без std.os.argv/environ
+/// (их нет без libc в новых версиях Zig). Повторный вызов ничего не делает.
 pub fn initEnv() void {
+    if (proc_ready) return;
+    proc_ready = true;
     const data = readFile("/proc/self/environ", env_buf[0 .. env_buf.len - 1]) orelse &[_]u8{};
     env_buf[data.len] = 0;
     var start: usize = 0;
@@ -556,6 +565,16 @@ pub fn initEnv() void {
         env_count += 1;
     }
     env_ptrs[env_count] = null;
+
+    // аргументы: строки через \0
+    const args = readFile("/proc/self/cmdline", &arg_buf) orelse &[_]u8{};
+    var it = std.mem.splitScalar(u8, args, 0);
+    while (it.next()) |a| {
+        if (arg_count == arg_list.len) break;
+        if (it.index == null and a.len == 0) break; // хвостовой \0
+        arg_list[arg_count] = a;
+        arg_count += 1;
+    }
 }
 
 var path_env: [4096]u8 = undefined;
@@ -599,13 +618,14 @@ pub fn getenv(name: []const u8) ?[]const u8 {
 
 /// argv[i] == s ?
 pub fn argIs(i: usize, s: []const u8) bool {
-    if (i >= std.os.argv.len) return false;
-    return std.mem.eql(u8, std.mem.span(std.os.argv[i]), s);
+    const a = argAt(i) orelse return false;
+    return std.mem.eql(u8, a, s);
 }
 
 pub fn argAt(i: usize) ?[]const u8 {
-    if (i >= std.os.argv.len) return null;
-    return std.mem.span(std.os.argv[i]);
+    initEnv();
+    if (i >= arg_count) return null;
+    return arg_list[i];
 }
 
 /// Затереть память так, чтобы компилятор не выбросил запись.

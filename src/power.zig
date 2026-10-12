@@ -131,11 +131,11 @@ fn readInfo() void {
     const up = std.fmt.parseInt(u64, up_s[0..dot], 10) catch 0;
     const h = up / 3600;
     const m = (up / 60) % 60;
-    const s = if (h > 0)
+    const s: []const u8 = (if (h > 0)
         std.fmt.bufPrint(&sub_buf, "{s} · работает {d} ч {d} мин", .{ host, h, m })
     else
-        std.fmt.bufPrint(&sub_buf, "{s} · работает {d} мин", .{ host, m });
-    sub_len = (s catch "").len;
+        std.fmt.bufPrint(&sub_buf, "{s} · работает {d} мин", .{ host, m })) catch "";
+    sub_len = s.len;
 }
 
 fn busFd() i32 {
