@@ -1316,10 +1316,10 @@ pub fn paintDone(cv: *draw.Canvas, label: []const u8) void {
 
 /// Анимированное «Подключение...» (n — номер тика).
 pub fn dots(base: []const u8, n: u32, buf: []u8) []const u8 {
-    const k = n % 4;
-    const len = @min(base.len + k, buf.len);
-    @memcpy(buf[0..base.len], base);
-    @memset(buf[base.len..len], '.');
+    const b = base[0..@min(base.len, buf.len)]; // длинная подпись не выйдет за буфер
+    const len = @min(b.len + n % 4, buf.len);
+    @memcpy(buf[0..b.len], b);
+    @memset(buf[b.len..len], '.');
     return buf[0..len];
 }
 

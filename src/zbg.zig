@@ -364,11 +364,16 @@ fn dispatch(ev: wl.Event) void {
             1 => destroy(own),
             else => {},
         },
-        .buffer => if (ev.op == 0) { // release: старый буфер больше не нужен
-            if (ev.obj != outs[own].buffer) {
-                conn.send(ev.obj, 0, .{});
-                kinds[ev.obj] = .none;
-            }
+        .buffer => if (ev.op == 0) { // release
+            // После release буфер можно уничтожить — картинка на экране останется
+            // (wl_surface.attach). Композитор с GPU-рендером (wlroots) может отпустить
+            // shm-буфер сразу после загрузки в текстуру: раньше текущий буфер здесь
+            // не трогали, и при следующей смене обоев он уже не получал release —
+            // смена оставляла в композиторе полноэкранный буфер. Теперь память
+            // обоев возвращается системе, как только композитору она не нужна.
+            conn.send(ev.obj, 0, .{});
+            kinds[ev.obj] = .none;
+            if (outs[own].buffer == ev.obj) outs[own].buffer = 0;
         },
         else => {},
     }
@@ -534,6 +539,6 @@ fn paint(i: u8, pic: ?*const img.Image) void {
         conn.send(o.surface, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(o.w)), @as(i32, @intCast(o.h)) });
     }
     conn.send(o.surface, 6, .{});
-    // прошлый буфер уничтожим, когда композитор его отпустит (событие release)
+    // и прошлый, и этот буфер уничтожаются, когда композитор их отпустит (событие release)
     o.buffer = buf;
 }
