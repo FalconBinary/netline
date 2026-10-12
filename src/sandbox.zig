@@ -102,8 +102,8 @@ fn linuxAddRule(rs: i32, attr: *const [12]u8) sys.Error!usize {
 
 // ================================================================= seccomp
 
-const SockFilter = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
-const SockFprog = extern struct { len: u16, filter: [*]const SockFilter };
+const SockFilter = sys.SockFilter;
+const SockFprog = sys.SockFprog;
 
 const LD_W_ABS: u16 = 0x20;
 const JEQ: u16 = 0x15;

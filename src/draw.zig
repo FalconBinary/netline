@@ -225,7 +225,118 @@ pub const Canvas = struct {
         const pad = stroke / 2 + 1;
         self.paint(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad, color, ctx, Group.sdf);
     }
+
+    /// То же, что prims, но маска покрытия считается один раз и дальше берётся из кэша:
+    /// иконки и цифры в каждом кадре одни и те же, и перерисовка — просто наложение цветом.
+    /// Позиция учитывается с точностью до 1/4 пикселя (целые позиции — пиксель в пиксель как prims).
+    pub fn icon(self: *Canvas, list: []const Prim, ox: f32, oy: f32, s: f32, stroke: f32, color: u32) void {
+        if (list.len == 0 or list.len > 24 or !(@abs(ox) < 1e6 and @abs(oy) < 1e6))
+            return self.prims(list, ox, oy, s, stroke, color);
+        const qx = @round(ox * 4);
+        const qy = @round(oy * 4);
+        const fx = @mod(qx, 4);
+        const fy = @mod(qy, 4);
+        const m = maskFor(list, fx / 4, fy / 4, s, stroke) orelse return self.prims(list, ox, oy, s, stroke, color);
+        const ix: i32 = @intFromFloat((qx - fx) / 4);
+        const iy: i32 = @intFromFloat((qy - fy) / 4);
+        self.blit(mask_pool[m.off..][0 .. @as(usize, m.w) * m.h], m.w, m.h, ix + m.x0, iy + m.y0, color);
+    }
 };
+
+// ---------------------------------------------------------------- кэш масок иконок
+
+const MaskSlot = struct { key: u64 = 0, x0: i32 = 0, y0: i32 = 0, w: u16 = 0, h: u16 = 0, off: u32 = 0, used: u32 = 0 };
+const MASK_SLOTS = 128;
+var mask_slots: [MASK_SLOTS]MaskSlot = [_]MaskSlot{.{}} ** MASK_SLOTS;
+var mask_pool: [128 * 1024]u8 = undefined;
+var mask_used: usize = 0;
+var mask_tick: u32 = 0;
+
+/// Ключ набора примитивов — по значениям полей (не по адресу и не по байтам с выравниванием).
+fn maskKey(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    const mix = struct {
+        fn f(acc: *u64, v: f32) void {
+            acc.* = (acc.* ^ @as(u32, @bitCast(v))) *% 0x100000001b3;
+            acc.* ^= acc.* >> 29;
+        }
+    }.f;
+    mix(&h, fx);
+    mix(&h, fy);
+    mix(&h, s);
+    mix(&h, stroke);
+    for (list) |p| {
+        mix(&h, @floatFromInt(@intFromEnum(std.meta.activeTag(p))));
+        switch (p) {
+            .seg => |v| inline for (.{ v.x0, v.y0, v.x1, v.y1 }) |x| mix(&h, x),
+            .arc => |v| inline for (.{ v.cx, v.cy, v.r, v.a0, v.a1 }) |x| mix(&h, x),
+            .ring => |v| inline for (.{ v.cx, v.cy, v.r }) |x| mix(&h, x),
+            .dot => |v| inline for (.{ v.cx, v.cy, v.r }) |x| mix(&h, x),
+            .box => |v| inline for (.{ v.x, v.y, v.w, v.h, v.r }) |x| mix(&h, x),
+            .fbox => |v| inline for (.{ v.x, v.y, v.w, v.h, v.r }) |x| mix(&h, x),
+        }
+    }
+    return if (h == 0) 1 else h;
+}
+
+/// Маска покрытия (0..255) набора примитивов с началом в (fx, fy) внутри пикселя.
+fn maskFor(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) ?*const MaskSlot {
+    const key = maskKey(list, fx, fy, s, stroke);
+    // две ячейки-кандидата: иконки одного кадра не вытесняют друг друга по кругу
+    const sa = &mask_slots[key % MASK_SLOTS];
+    const sb = &mask_slots[(key >> 32) % MASK_SLOTS];
+    mask_tick +%= 1;
+    if (sa.key == key) {
+        sa.used = mask_tick;
+        return sa;
+    }
+    if (sb.key == key) {
+        sb.used = mask_tick;
+        return sb;
+    }
+    const slot = if (sa.key == 0 or (sb.key != 0 and mask_tick -% sa.used >= mask_tick -% sb.used)) sa else sb;
+
+    var buf: [24]Prim = undefined;
+    var bx0: f32 = 1e9;
+    var by0: f32 = 1e9;
+    var bx1: f32 = -1e9;
+    var by1: f32 = -1e9;
+    for (list, 0..) |p, i| {
+        const t = p.transform(fx, fy, s);
+        buf[i] = t;
+        const b = t.bounds();
+        bx0 = @min(bx0, b[0]);
+        by0 = @min(by0, b[1]);
+        bx1 = @max(bx1, b[2]);
+        by1 = @max(by1, b[3]);
+    }
+    // та же область, что обходит prims: рамка примитивов плюс полутолщина и пиксель запаса
+    const pad = stroke / 2 + 1;
+    const x0f = @floor(bx0 - pad);
+    const y0f = @floor(by0 - pad);
+    const wf = @ceil(bx1 + pad) - x0f;
+    const hf = @ceil(by1 + pad) - y0f;
+    if (!(wf >= 1 and hf >= 1 and wf <= 256 and hf <= 256 and @abs(x0f) < 4096 and @abs(y0f) < 4096)) return null;
+    const w: usize = @intFromFloat(wf);
+    const h: usize = @intFromFloat(hf);
+    if (mask_used + w * h > mask_pool.len) { // пул кончился — начинаем заново
+        mask_used = 0;
+        for (&mask_slots) |*m| m.* = .{};
+    }
+    const out = mask_pool[mask_used..][0 .. w * h];
+    const g = Group{ .p = buf[0..list.len], .hw = stroke / 2 };
+    for (0..h) |j| {
+        const py = y0f + @as(f32, @floatFromInt(j)) + 0.5;
+        for (out[j * w ..][0..w], 0..) |*o, i| {
+            // покрытие — как в paint/coverAlpha: clamp(0,5 − d), округление до 1/255
+            const cov = 0.5 - g.sdf(x0f + @as(f32, @floatFromInt(i)) + 0.5, py);
+            o.* = if (cov <= 0) 0 else if (cov >= 1) 255 else @intFromFloat(cov * 255 + 0.5);
+        }
+    }
+    slot.* = .{ .key = key, .x0 = @intFromFloat(x0f), .y0 = @intFromFloat(y0f), .w = @intCast(w), .h = @intCast(h), .off = @intCast(mask_used), .used = mask_tick };
+    mask_used += w * h;
+    return slot;
+}
 
 pub fn premul(c: u32) u32 {
     const a = c >> 24;
@@ -539,7 +650,7 @@ pub fn text(c: *Canvas, str: []const u8, x: f32, y: f32, size: f32, color: u32) 
     const s = size / 10.0;
     var cx = x;
     for (str) |ch| {
-        if (glyph(ch)) |g| c.prims(g, cx, y, s, STROKE * s, color);
+        if (glyph(ch)) |g| c.icon(g, cx, y, s, STROKE * s, color);
         cx += advance(ch) * s;
     }
 }

@@ -1187,7 +1187,7 @@ pub fn centered(cv: *draw.Canvas, s: []const u8, cx: f32, baseline: f32, size: f
 
 /// Иконка из примитивов в сетке 16×16, размером size логических пикселей.
 pub fn icon(cv: *draw.Canvas, prims: []const draw.Prim, x: f32, y: f32, size: f32, stroke: f32, c: u32) void {
-    cv.prims(prims, @round(px(x)), @round(px(y)), px(size / 16), px(stroke), c);
+    cv.icon(prims, @round(px(x)), @round(px(y)), px(size / 16), px(stroke), c);
 }
 
 pub const ic_back = [_]draw.Prim{

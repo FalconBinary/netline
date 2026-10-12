@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     ui.begin("zpower");
     // брокер — до всех остальных подключений, чтобы не держать лишних дескрипторов
-    const cmds = [_]?[*:0]const u8{cfg.lock_cmd};
+    const cmds = [_]?broker.Cmd{comptime broker.compile(cfg.lock_cmd)};
     have_broker = broker.start(&cmds);
 
     if (bus.connectSystem()) |_| {

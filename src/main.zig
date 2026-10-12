@@ -85,11 +85,11 @@ const Bar = struct {
 // Таблица команд для брокера: [элемент][кнопка]. Строится при компиляции из config.zig.
 const actions = [_]cfg.Action{ cfg.launcher, cfg.clock, cfg.wifi, cfg.bluetooth, cfg.wallpaper, cfg.power };
 const commands = blk: {
-    var c: [actions.len * 3]?[*:0]const u8 = undefined;
+    var c: [actions.len * 3]?broker.Cmd = undefined;
     for (actions, 0..) |a, i| {
-        c[i * 3] = a.left;
-        c[i * 3 + 1] = a.right;
-        c[i * 3 + 2] = a.middle;
+        c[i * 3] = broker.compile(a.left);
+        c[i * 3 + 1] = broker.compile(a.right);
+        c[i * 3 + 2] = broker.compile(a.middle);
     }
     break :blk c;
 };
@@ -139,6 +139,7 @@ var clock_hour: u32 = 99;
 
 var clock_timer: i32 = -1;
 var poll_timer: i32 = -1;
+var poll_period: u32 = 0; // на сколько секунд взведён запасной опрос (0 — выключен)
 var burst: u32 = 0; // сколько ещё быстрых (раз в секунду) проверок после клика
 
 // ================================================================= main
@@ -184,9 +185,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     clock_timer = sys.timerfdCreate(sys.CLOCK_REALTIME) catch fatal("timerfd");
     poll_timer = sys.timerfdCreate(sys.CLOCK_MONOTONIC) catch fatal("timerfd");
     armClock();
-    armPoll();
     _ = updateClock();
-    refreshStatus(true, true);
+    refreshStatus(true, true); // заодно взводит запасной опрос, если он нужен
 
     if (cfg.sandbox) {
         const paths = [_][:0]const u8{ "/sys", "/proc", "/usr/share/zoneinfo", "/etc/localtime", tz.path, theme.dir };
@@ -199,7 +199,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
         conn.flush() catch fatal("запись в сокет Wayland");
 
-        var fds = [7]sys.PollFd{
+        var fds = [8]sys.PollFd{
             .{ .fd = conn.fd, .events = sys.POLLIN },
             .{ .fd = clock_timer, .events = sys.POLLIN },
             .{ .fd = poll_timer, .events = sys.POLLIN },
@@ -207,14 +207,17 @@ pub fn main(init: std.process.Init.Minimal) void {
             .{ .fd = status.route_fd, .events = sys.POLLIN },
             .{ .fd = status.uevent_fd, .events = sys.POLLIN },
             .{ .fd = theme.inotify_fd, .events = sys.POLLIN },
+            .{ .fd = status.mgmt_fd, .events = sys.POLLIN },
         };
         _ = sys.poll(&fds, -1) catch continue;
+        if (sys.trace) traceWake(&fds);
 
         if (fds[0].revents != 0) readWayland();
         if (fds[1].revents != 0) onClockTimer();
         if (fds[2].revents != 0) onPollTimer();
         if (fds[3].revents != 0 and mango.fd >= 0) {
             if (mango.onReadable()) applyTags();
+            if (mango.fd < 0) armPoll(); // mango закрыл IPC — будем переподключаться
         }
         if (fds[4].revents != 0 or fds[5].revents != 0) {
             const ch = status.drainEvents(fds[4].revents != 0, fds[5].revents != 0);
@@ -223,7 +226,23 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (fds[6].revents != 0 and theme.inotify_fd >= 0) {
             if (theme.onInotify()) markAllDirty();
         }
+        if (fds[7].revents != 0 and status.mgmt_fd >= 0) {
+            if (status.drainMgmt()) refreshStatus(false, true);
+        }
     }
+}
+
+/// ZPANEL_TRACE: почему панель проснулась (в простое строк быть не должно, кроме часов).
+fn traceWake(fds: []const sys.PollFd) void {
+    const names = [_][]const u8{ " wayland", " часы", " опрос", " mango", " сеть", " устройства", " тема", " bluetooth" };
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    for (fds, names) |f, nm| {
+        if (f.revents == 0 or n + nm.len > buf.len) continue;
+        @memcpy(buf[n..][0..nm.len], nm);
+        n += nm.len;
+    }
+    sys.tracef("пробуждение:{s}", .{buf[0..n]});
 }
 
 fn fatal(what: []const u8) noreturn {
@@ -269,8 +288,20 @@ fn armClock() void {
     sys.timerfdArm(clock_timer, sys.TFD_TIMER_ABSTIME | sys.TFD_TIMER_CANCEL_ON_SET, next, @intCast(step)) catch {};
 }
 
+/// Запасной опрос — только для того, о чём не приходит событий: уровень сигнала Wi‑Fi,
+/// включение Bluetooth (если ядро не даёт канал mgmt) и переподключение к mango.
+/// Нечего опрашивать — таймер выключен, и панель спит до события.
+fn pollPeriod() u32 {
+    if (burst > 0) return 1;
+    if (mango.fd < 0 or wifi_state.state == .connected) return cfg.status_poll_s;
+    if (bt_state != .none and !status.btEvents()) return cfg.status_poll_s;
+    return 0;
+}
+
 fn armPoll() void {
-    const s: u32 = if (burst > 0) 1 else cfg.status_poll_s;
+    const s = pollPeriod();
+    if (s == poll_period) return; // тот же период — не сбиваем фазу таймера
+    poll_period = s;
     sys.timerfdArm(poll_timer, 0, s, s) catch {};
 }
 
@@ -289,12 +320,10 @@ fn onClockTimer() void {
 
 fn onPollTimer() void {
     _ = drainTimer(poll_timer);
+    if (burst > 0) burst -= 1;
     refreshStatus(true, true);
     if (mango.fd < 0 and mango.connect()) applyTags();
-    if (burst > 0) {
-        burst -= 1;
-        if (burst == 0) armPoll();
-    }
+    armPoll();
 }
 
 fn refreshStatus(do_wifi: bool, do_bt: bool) void {
@@ -310,6 +339,7 @@ fn refreshStatus(do_wifi: bool, do_bt: bool) void {
         bt_state = bt;
     }
     if (changed) markAllDirty();
+    armPoll(); // нужен ли опрос, зависит от состояния (подключён ли Wi‑Fi, есть ли адаптер)
 }
 
 fn two(buf: []u8, v: u32) void {
@@ -654,9 +684,12 @@ fn click(i: u8, button: u32, time: u32) void {
         if (time -% prev < 400) return;
     }
     last_click[slot] = time;
+    sys.tracef("клик: команда {d}", .{slot});
     broker.run(slot);
-    // переключатели Wi‑Fi/Bluetooth не всегда дают событие — несколько секунд проверяем чаще
-    if (h.item == .wifi or h.item == .bluetooth) {
+    // переключатели Wi‑Fi/Bluetooth (ПКМ) не всегда дают событие — несколько секунд проверяем
+    // чаще; из меню Bluetooth питание без канала mgmt тоже узнаётся только опросом
+    const toggle = btn == 1 and (h.item == .wifi or h.item == .bluetooth);
+    if (toggle or (h.item == .bluetooth and !status.btEvents())) {
         burst = 6;
         armPoll();
     }
@@ -834,6 +867,8 @@ fn diffRects(a: []const u32, b: []const u32, w: u32, h: u32, out: *[MAX_RECTS]Re
 
 fn render(i: u8) void {
     const b = &bars[i];
+    const t0 = sys.traceStart();
+    defer if (sys.trace) sys.tracef("кадр {d}: {d} мкс", .{ i, sys.traceSince(t0) });
     if (!ensureBuffers(i)) return;
     // рисуем в буфер, отличный от показанного, чтобы сравнить кадры
     const k: u1 = if (b.last) |l| ~l else 0;
@@ -1039,18 +1074,18 @@ fn paintIcon(cv: *draw.Canvas, h: Hit, S: f32) void {
     const oy = @round((h.y + (h.h - cfg.icon) / 2) * S);
     const st = cfg.icon_stroke * S;
     switch (h.item) {
-        .launcher => cv.prims(&draw.icon_apps, ox, oy, s, st, c.launcher),
-        .wallpaper => cv.prims(&draw.icon_wall, ox, oy, s, st, c.wallpaper),
-        .power => cv.prims(&draw.icon_power, ox, oy, s, st, c.power),
+        .launcher => cv.icon(&draw.icon_apps, ox, oy, s, st, c.launcher),
+        .wallpaper => cv.icon(&draw.icon_wall, ox, oy, s, st, c.wallpaper),
+        .power => cv.icon(&draw.icon_power, ox, oy, s, st, c.power),
         .wifi => {
             const w = wifi_state;
             const on = w.state == .connected or w.state == .disconnected;
             for (&draw.icon_wifi_arcs, 0..) |*arc, k| {
                 const lit = w.state == .connected and k < w.level;
-                cv.prims(arc, ox, oy, s, st, if (lit) c.wifi else c.wifi_inactive);
+                cv.icon(arc, ox, oy, s, st, if (lit) c.wifi else c.wifi_inactive);
             }
-            cv.prims(&draw.icon_wifi_dot, ox, oy, s, st, if (on) c.wifi else c.wifi_inactive);
-            if (w.state == .off) cv.prims(&draw.icon_slash, ox, oy, s, st, c.wifi_off);
+            cv.icon(&draw.icon_wifi_dot, ox, oy, s, st, if (on) c.wifi else c.wifi_inactive);
+            if (w.state == .off) cv.icon(&draw.icon_slash, ox, oy, s, st, c.wifi_off);
         },
         .bluetooth => {
             const col = switch (bt_state) {
@@ -1058,8 +1093,8 @@ fn paintIcon(cv: *draw.Canvas, h: Hit, S: f32) void {
                 .on => c.bluetooth_on,
                 .off, .none => c.bluetooth_off,
             };
-            cv.prims(&draw.icon_bt, ox, oy, s, st, col);
-            if (bt_state == .connected) cv.prims(&draw.icon_bt_dots, ox, oy, s, st, col);
+            cv.icon(&draw.icon_bt, ox, oy, s, st, col);
+            if (bt_state == .connected) cv.icon(&draw.icon_bt_dots, ox, oy, s, st, col);
         },
         .tags, .clock => {},
     }

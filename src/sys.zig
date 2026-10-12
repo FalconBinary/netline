@@ -134,6 +134,27 @@ pub fn exists(path: [*:0]const u8) bool {
     return true;
 }
 
+/// Есть ли что-то по пути (файл, папка, сокет) — без открытия (faccessat F_OK).
+pub fn pathExists(path: [*:0]const u8) bool {
+    return linux.syscall4(.faccessat, ufd(AT_FDCWD), @intFromPtr(path), 0, 0) == 0;
+}
+
+/// Время изменения в наносекундах (fstatat; 0 — нет такого пути) и размер.
+pub const Stamp = extern struct { mtime: u64 = 0, size: u64 = 0 };
+
+pub fn stamp(path: [*:0]const u8) Stamp {
+    // statx(AT_FDCWD, path, 0, STATX_MTIME | STATX_SIZE) — одна структура на всех архитектурах
+    var b: [256]u8 align(8) = undefined;
+    const rc = linux.syscall5(.statx, ufd(AT_FDCWD), @intFromPtr(path), 0, 0x40 | 0x200, @intFromPtr(&b));
+    if (rc != 0) return .{};
+    const sec = std.mem.readInt(i64, b[0x70..0x78], .little);
+    const nsec = std.mem.readInt(u32, b[0x78..0x7c], .little);
+    return .{
+        .mtime = @as(u64, @bitCast(sec)) *% 1_000_000_000 +% nsec,
+        .size = std.mem.readInt(u64, b[0x28..0x30], .little),
+    };
+}
+
 pub fn getdents(fd: i32, buf: []u8) Error!usize {
     return check(linux.syscall3(.getdents64, ufd(fd), @intFromPtr(buf.ptr), buf.len));
 }
@@ -356,6 +377,22 @@ pub fn connectAbstractFd(name: []const u8) Error!i32 {
     return fd;
 }
 
+/// Инструкция классического BPF (фильтры сокетов и seccomp).
+pub const SockFilter = extern struct { code: u16, jt: u8 = 0, jf: u8 = 0, k: u32 };
+pub const SockFprog = extern struct { len: u16, filter: [*]const SockFilter };
+
+/// Фильтр на сокет (SO_ATTACH_FILTER): ненужные сообщения отбрасывает ядро —
+/// процесс из-за них даже не просыпается.
+pub fn attachFilter(fd: i32, prog: []const SockFilter) Error!void {
+    const fp = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
+    _ = try check(linux.syscall5(.setsockopt, ufd(fd), 1, 26, @intFromPtr(&fp), @sizeOf(SockFprog))); // SOL_SOCKET, SO_ATTACH_FILTER
+}
+
+/// bind произвольного адреса (сокеты Bluetooth и т. п.).
+pub fn bindRaw(fd: i32, addr: []const u8) Error!void {
+    _ = try check(linux.syscall3(.bind, ufd(fd), @intFromPtr(addr.ptr), addr.len));
+}
+
 pub fn ioctl(fd: i32, req: usize, arg: usize) Error!usize {
     return check(linux.syscall3(.ioctl, ufd(fd), req, arg));
 }
@@ -555,7 +592,8 @@ fn execvp(av: [*:null]const ?[*:0]const u8) void {
         return;
     }
     var buf: [1024]u8 = undefined;
-    var it = std.mem.tokenizeScalar(u8, getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin", ':');
+    // PATH — из окружения запуска: у брокера в нём первой стоит папка zpanel
+    var it = std.mem.tokenizeScalar(u8, envpGet("PATH") orelse "/usr/local/bin:/usr/bin:/bin", ':');
     while (it.next()) |d| {
         const z = joinZ(&buf, &.{ d, "/", a0 });
         _ = linux.syscall3(.execve, @intFromPtr(z.ptr), @intFromPtr(av), @intFromPtr(envp()));
@@ -578,6 +616,8 @@ var environ: [:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
 pub fn init(m: std.process.Init.Minimal) void {
     argv = m.args.vector;
     environ = m.environ.block.slice;
+    if (getenv("ZPANEL_TRACE")) |v| trace = v.len > 0 and !std.mem.eql(u8, v, "0");
+    if (trace) tracef("запуск", .{});
 }
 
 /// Окружение для execve с PATH, в начале которого папка исполняемого файла
@@ -619,11 +659,56 @@ pub fn envp() [*:null]const ?[*:0]const u8 {
 
 pub fn getenv(name: []const u8) ?[]const u8 {
     for (environ) |p| {
-        const s = std.mem.span(p.?);
-        if (s.len > name.len and s[name.len] == '=' and std.mem.eql(u8, s[0..name.len], name))
-            return s[name.len + 1 ..];
+        if (envMatch(std.mem.span(p.?), name)) |v| return v;
     }
     return null;
+}
+
+/// Переменная из окружения, которое получат запускаемые программы (envp()).
+fn envpGet(name: []const u8) ?[]const u8 {
+    const e = envp();
+    var i: usize = 0;
+    while (e[i]) |p| : (i += 1) {
+        if (envMatch(std.mem.span(p), name)) |v| return v;
+    }
+    return null;
+}
+
+fn envMatch(s: []const u8, name: []const u8) ?[]const u8 {
+    if (s.len > name.len and s[name.len] == '=' and std.mem.eql(u8, s[0..name.len], name)) return s[name.len + 1 ..];
+    return null;
+}
+
+// ---------------------------------------------------------------- трассировка
+// ZPANEL_TRACE=1 — программы пишут в stderr, когда и почему просыпаются, сколько заняли
+// кадр и запуск. Метка — монотонное время в мс: его можно сравнивать между процессами
+// (клик в панели → первый кадр меню).
+
+pub var trace = false;
+
+fn monoUs() u64 {
+    const ts = clockTs(1);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
+}
+
+/// Метка времени для замеров (мкс), 0 — трассировка выключена.
+pub fn traceStart() u64 {
+    return if (trace) monoUs() else 0;
+}
+
+/// Сколько мкс прошло с метки traceStart().
+pub fn traceSince(t0: u64) u64 {
+    return if (trace) monoUs() -% t0 else 0;
+}
+
+pub fn tracef(comptime fmt: []const u8, args: anytype) void {
+    if (!trace) return;
+    const now = monoUs();
+    const a0 = if (argv.len > 0) std.mem.span(argv[0]) else "zpanel";
+    const name = a0[if (std.mem.lastIndexOfScalar(u8, a0, '/')) |i| i + 1 else 0..];
+    var buf: [512]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{s} [{d}.{d:0>3}] " ++ fmt ++ "\n", .{ name, now / 1000, now % 1000 } ++ args) catch return;
+    _ = write(2, s) catch {};
 }
 
 // ---------------------------------------------------------------- аргументы и секреты

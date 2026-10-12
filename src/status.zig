@@ -5,6 +5,7 @@
 //! Обновления приходят событиями netlink, поэтому панель не опрашивает систему впустую.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sys = @import("sys.zig");
 
 pub const WifiState = enum(u8) { none, off, disconnected, connected };
@@ -12,16 +13,130 @@ pub const Wifi = struct { state: WifiState = .none, level: u8 = 0 }; // level 1.
 
 pub const Bt = enum(u8) { none, off, on, connected };
 
-/// Сокеты событий (или -1): изменения сетевых интерфейсов и uevent'ы устройств.
+/// Сокеты событий (или -1): изменения сетевых интерфейсов, uevent'ы устройств
+/// и события управления Bluetooth (включение/выключение адаптера).
 pub var route_fd: i32 = -1;
 pub var uevent_fd: i32 = -1;
+pub var mgmt_fd: i32 = -1;
 var hci_sock: i32 = -1;
 
 /// Открыть всё нужное заранее — после включения песочницы создавать сокеты нельзя.
+/// На сокеты ставятся фильтры BPF: ядро будит панель только событиями, которые меняют
+/// значки, а не каждым процентом заряда батареи, USB-устройством или сканированием Wi‑Fi.
 pub fn init() void {
     route_fd = sys.netlink(0, 1) catch -1; // NETLINK_ROUTE, RTMGRP_LINK
-    uevent_fd = sys.netlink(15, 1) catch -1; // NETLINK_KOBJECT_UEVENT, события ядра
+    if (route_fd >= 0) sys.attachFilter(route_fd, &route_filter) catch {};
+    uevent_fd = openUevents();
     hci_sock = sys.socket(31, 3, 1) catch -1; // AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI
+    mgmt_fd = openMgmt();
+}
+
+// ---------------------------------------------------------------- фильтры
+
+const LD_W_ABS: u16 = 0x20;
+const LD_IMM: u16 = 0x00;
+const LDX_IMM: u16 = 0x01;
+const JEQ: u16 = 0x15;
+const RET: u16 = 0x06;
+const KEEP: u32 = 0xffffffff;
+
+/// RTM_NEWLINK с атрибутом IFLA_WIRELESS — беспроводные события (конец сканирования
+/// и т. п., NetworkManager сканирует каждые несколько минут). Значок они не меняют:
+/// подключение и отключение приходят отдельным RTM_NEWLINK о состоянии интерфейса.
+const route_filter = [_]sys.SockFilter{
+    .{ .code = LDX_IMM, .k = 32 }, // X = начало атрибутов: nlmsghdr (16) + ifinfomsg (16)
+    .{ .code = LD_IMM, .k = 11 }, // A = IFLA_WIRELESS
+    .{ .code = LD_W_ABS, .k = 0xfffff000 + 12 }, // A = смещение атрибута A от X (SKF_AD_NLATTR), 0 — нет
+    .{ .code = JEQ, .k = 0, .jt = 0, .jf = 1 },
+    .{ .code = RET, .k = KEEP },
+    .{ .code = RET, .k = 0 },
+};
+
+/// MurmurHash2 — им udevd подписывает подсистему в заголовке рассылки (как в libudev).
+fn murmur2(comptime s: []const u8) u32 {
+    const m: u32 = 0x5bd1e995;
+    var h: u32 = @as(u32, s.len);
+    var i: usize = 0;
+    while (s.len - i >= 4) : (i += 4) {
+        var k = std.mem.readInt(u32, s[i..][0..4], builtin.cpu.arch.endian());
+        k *%= m;
+        k ^= k >> 24;
+        k *%= m;
+        h *%= m;
+        h ^= k;
+    }
+    const rest = s.len - i;
+    if (rest == 3) h ^= @as(u32, s[i + 2]) << 16;
+    if (rest >= 2) h ^= @as(u32, s[i + 1]) << 8;
+    if (rest >= 1) {
+        h ^= s[i];
+        h *%= m;
+    }
+    h ^= h >> 13;
+    h *%= m;
+    h ^= h >> 15;
+    return h;
+}
+
+/// Рассылка udevd: «libudev\0», магия 0xfeedcafe (смещение 8), хеш подсистемы (24) —
+/// всё в сетевом порядке байт, как и читает BPF. Пропускаем только rfkill и bluetooth.
+const udev_filter = [_]sys.SockFilter{
+    .{ .code = LD_W_ABS, .k = 8 },
+    .{ .code = JEQ, .k = 0xfeedcafe, .jt = 0, .jf = 4 },
+    .{ .code = LD_W_ABS, .k = 24 },
+    .{ .code = JEQ, .k = murmur2("rfkill"), .jt = 1, .jf = 0 },
+    .{ .code = JEQ, .k = murmur2("bluetooth"), .jt = 0, .jf = 1 },
+    .{ .code = RET, .k = KEEP },
+    .{ .code = RET, .k = 0 },
+};
+
+/// События устройств. Если работает udevd — его рассылка (группа 2) с фильтром по
+/// подсистеме прямо в ядре. Без udevd — все события ядра (группа 1), их разбирает drainEvents.
+fn openUevents() i32 {
+    if (sys.pathExists("/run/udev/control")) {
+        if (sys.netlink(15, 2)) |fd| {
+            if (sys.attachFilter(fd, &udev_filter)) |_| return fd else |_| sys.close(fd);
+        } else |_| {}
+    }
+    return sys.netlink(15, 1) catch -1; // NETLINK_KOBJECT_UEVENT, события ядра
+}
+
+/// Канал управления Bluetooth (mgmt): событие New Settings приходит при включении и
+/// выключении адаптера — без него это пришлось бы опрашивать. Права root не нужны:
+/// непривилегированный сокет получает события настроек, но не может ничего менять.
+fn openMgmt() i32 {
+    const fd = sys.socket(31, 3 | sys.O_NONBLOCK, 1) catch return -1; // AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI
+    // struct sockaddr_hci { u16 family; u16 dev = HCI_DEV_NONE; u16 channel = HCI_CHANNEL_CONTROL; }
+    const addr = [6]u8{ 31, 0, 0xff, 0xff, 3, 0 };
+    sys.bindRaw(fd, &addr) catch {
+        sys.close(fd);
+        return -1;
+    };
+    return fd;
+}
+
+/// Есть ли события питания Bluetooth (иначе включение адаптера узнаётся опросом).
+pub fn btEvents() bool {
+    return mgmt_fd >= 0;
+}
+
+/// Вычитать события mgmt. true — что-то изменилось у адаптеров (питание, появление, удаление)
+/// или канал пропал (тогда питание снова узнаётся опросом).
+pub fn drainMgmt() bool {
+    var buf: [512]u8 = undefined;
+    var any = false;
+    while (true) {
+        const n = sys.read(mgmt_fd, &buf) catch |e| {
+            if (e == error.WouldBlock) return any;
+            break;
+        };
+        if (n == 0) break;
+        any = true;
+    }
+    // ошибка или конец потока: закрываем, иначе poll будил бы панель без остановки
+    sys.close(mgmt_fd);
+    mgmt_fd = -1;
+    return true;
 }
 
 pub const Changed = struct { wifi: bool = false, bt: bool = false };

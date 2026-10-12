@@ -5,7 +5,9 @@
 //!
 //! Он отделяется (fork) самым первым, ещё до подключения к Wayland и до песочницы,
 //! и умеет ровно три вещи:
-//!   'C' <номер>   — запустить команду из вшитой при сборке таблицы (config.zig);
+//!   'C' <номер>   — запустить команду из вшитой при сборке таблицы (config.zig):
+//!                   простую («zwifi toggle») — сразу через execve, со спецсимволами
+//!                   shell (кавычки, |, ;, $ …) — через /bin/sh -c;
 //!   'D' <команда> — отправить в mango `dispatch` строго проверенного вида;
 //!   'W'           — подключиться к IPC mango и передать панели готовый сокет.
 //! Сама панель после этого живёт в песочнице без exec, fork, socket и connect:
@@ -16,7 +18,44 @@ const sys = @import("sys.zig");
 
 var sock: i32 = -1;
 
-pub fn start(cmds: []const ?[*:0]const u8) bool {
+/// Команда, разобранная при сборке.
+pub const Cmd = struct {
+    argv: ?[*:null]const ?[*:0]const u8 = null, // простая: слова через пробел
+    shell: ?[*:0]const u8 = null, // со спецсимволами — целиком в /bin/sh -c
+};
+
+/// Символы, при которых строка — просто слова через пробел и shell не нужен.
+fn plain(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', ' ', '-', '_', '.', '/', '=', ',', '+', ':', '@', '%' => true,
+        else => false,
+    };
+}
+
+/// Разобрать команду из config.zig при сборке. Простые команды запускаются без shell:
+/// на каждый клик на один процесс (и загрузку libc для /bin/sh) меньше.
+pub fn compile(comptime s: ?[*:0]const u8) ?Cmd {
+    const z = s orelse return null;
+    comptime {
+        const str = std.mem.span(z);
+        for (str) |c| if (!plain(c)) return .{ .shell = z };
+        var words: [32]?[*:0]const u8 = undefined;
+        var n: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, str, ' ');
+        while (it.next()) |w| : (n += 1) {
+            // «FOO=bar программа» — присваивание переменной, это понимает только shell
+            if (n == 0 and std.mem.indexOfScalar(u8, w, '=') != null) return .{ .shell = z };
+            words[n] = std.fmt.comptimePrint("{s}", .{w});
+        }
+        if (n == 0) return null;
+        var av: [n:null]?[*:0]const u8 = undefined;
+        for (0..n) |i| av[i] = words[i];
+        const final = av;
+        return .{ .argv = &final };
+    }
+}
+
+pub fn start(cmds: []const ?Cmd) bool {
     const pair = sys.socketpair() catch return false;
     const pid = sys.fork() catch {
         sys.close(pair[0]);
@@ -64,7 +103,7 @@ pub fn requestWatch() i32 {
 
 // ---------------------------------------------------------------- сторона брокера
 
-fn serve(fd: i32, cmds: []const ?[*:0]const u8) noreturn {
+fn serve(fd: i32, cmds: []const ?Cmd) noreturn {
     var buf: [256]u8 = undefined;
     while (true) {
         const n = sys.read(fd, &buf) catch sys.exit(0);
@@ -72,7 +111,9 @@ fn serve(fd: i32, cmds: []const ?[*:0]const u8) noreturn {
         const msg = buf[0..n];
         switch (msg[0]) {
             'C' => if (n == 2 and msg[1] < cmds.len) {
-                if (cmds[msg[1]]) |c| sys.spawnShell(c);
+                if (cmds[msg[1]]) |c| {
+                    if (c.argv) |av| sys.spawnArgv(av, null) else if (c.shell) |sh| sys.spawnShell(sh);
+                }
             },
             'D' => if (validDispatch(msg[1..])) mangoDispatch(msg[1..]),
             'W' => sendWatch(fd),
