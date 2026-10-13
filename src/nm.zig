@@ -120,13 +120,6 @@ fn getU32(path: []const u8, iface: []const u8, name: []const u8) ?u32 {
     return p.r.u32_();
 }
 
-fn getPath(path: []const u8, iface: []const u8, name: []const u8, out: *Path) bool {
-    var p = getProp(path, iface, name) orelse return false;
-    if (!std.mem.eql(u8, p.sig, "o")) return false;
-    out.set(p.r.str());
-    return !p.r.bad;
-}
-
 // ================================================================= инициализация
 
 pub fn init() bool {
@@ -157,27 +150,67 @@ pub fn init() bool {
         setError("Wi‑Fi адаптер не найден");
         return false;
     }
-    // подписка на смену состояния устройства: так не теряется причина неудачи
+    // Подписки: всё от нашего устройства (смена состояния — так не теряется причина неудачи;
+    // точки доступа появились/исчезли, закончился поиск — LastScan) и включение радио.
+    // Меню узнаёт о новых сетях и о ходе подключения сразу, а не опросом.
     var rule_buf: [400]u8 = undefined;
-    const rule = sys.joinZ(&rule_buf, &.{ "type='signal',sender='", NM, "',interface='", DEV, "',member='StateChanged',path='", device.get(), "'" });
-    var w = dbus.W{ .buf = &body_buf };
-    w.str(rule);
-    _ = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes()) catch {};
+    addMatch(sys.joinZ(&rule_buf, &.{ "type='signal',sender='", NM, "',path='", device.get(), "'" }));
+    addMatch("type='signal',sender='" ++ NM ++ "',path='" ++ NM_PATH ++ "',member='PropertiesChanged'");
     bus.on_signal = onSignal;
     refreshEnabled();
     return true;
 }
 
+fn addMatch(rule: []const u8) void {
+    var w = dbus.W{ .buf = &body_buf };
+    w.str(rule);
+    _ = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes()) catch {};
+}
+
 /// Последняя причина перехода устройства в FAILED (0 — не было).
 var fail_reason: u32 = 0;
+/// Список сетей изменился (новые/пропавшие точки, закончился поиск) — стоит перечитать.
+pub var nets_changed = false;
+/// Устройство сменило состояние — стоит проверить ход подключения.
+pub var state_changed = false;
 
-fn onSignal(iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
-    if (!std.mem.eql(u8, iface, DEV) or !std.mem.eql(u8, member, "StateChanged") or !std.mem.eql(u8, sig, "uuu")) return;
-    var r = dbus.R{ .d = body };
-    const new_state = r.u32_();
-    _ = r.u32_();
-    const reason = r.u32_();
-    if (new_state == 120 and !r.bad) fail_reason = reason; // NM_DEVICE_STATE_FAILED
+fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
+    const eql = std.mem.eql;
+    if (eql(u8, path, NM_PATH)) {
+        // включили/выключили радио (например, правым кликом по значку на панели)
+        if (!eql(u8, member, "PropertiesChanged") or !eql(u8, sig, "sa{sv}as")) return;
+        var r = dbus.R{ .d = body };
+        if (!eql(u8, r.str(), NM)) return;
+        const end = r.arrayEnd(8);
+        while (r.p < end and !r.bad) {
+            r.alignTo(8);
+            const key = r.str();
+            const vs = r.sig();
+            if (eql(u8, key, "WirelessEnabled") and eql(u8, vs, "b")) {
+                const on = r.boolean();
+                if (!r.bad and on != wifi_enabled) {
+                    wifi_enabled = on;
+                    nets_changed = true;
+                }
+            } else r.skip(vs);
+        }
+        return;
+    }
+    if (!eql(u8, path, device.get())) return;
+    if (eql(u8, iface, DEV) and eql(u8, member, "StateChanged") and eql(u8, sig, "uuu")) {
+        var r = dbus.R{ .d = body };
+        const new_state = r.u32_();
+        _ = r.u32_();
+        const reason = r.u32_();
+        if (new_state == 120 and !r.bad) fail_reason = reason; // NM_DEVICE_STATE_FAILED
+        state_changed = true;
+    } else if (eql(u8, iface, WIFI) and (eql(u8, member, "AccessPointAdded") or eql(u8, member, "AccessPointRemoved"))) {
+        nets_changed = true;
+    } else if (eql(u8, member, "PropertiesChanged")) {
+        // LastScan, AccessPoints, ActiveAccessPoint у Device.Wireless (старые NM шлют сигнал от имени интерфейса)
+        var r = dbus.R{ .d = body };
+        if (eql(u8, iface, WIFI) or (eql(u8, sig, "sa{sv}as") and eql(u8, r.str(), WIFI))) nets_changed = true;
+    }
 }
 
 pub fn refreshEnabled() void {
@@ -196,11 +229,13 @@ pub fn setEnabled(on: bool) bool {
     return true;
 }
 
+/// Попросить NM поискать сети. Ответа не ждём («слишком часто» — не страшно):
+/// о результатах скажут сигналы AccessPointAdded и LastScan.
 pub fn scan() void {
     var w = dbus.W{ .buf = &body_buf };
     const a = w.arrayBegin(8); // пустой a{sv}
     w.arrayEnd(a);
-    _ = call(device.get(), WIFI, "RequestScan", "a{sv}", w.bytes()); // «слишком часто» — не страшно
+    bus.callNoReply(NM, device.get(), WIFI, "RequestScan", "a{sv}", w.bytes());
 }
 
 // ================================================================= список сетей
@@ -295,21 +330,33 @@ fn securityOf(flags: u32, wpa: u32, rsn: u32) Security {
 
 /// Заполнить список видимых сетей (по одной на SSID, самая сильная точка). Возвращает число.
 pub fn networks(out: []Net) usize {
-    var active_ap = Path{};
-    _ = getPath(device.get(), WIFI, "ActiveAccessPoint", &active_ap);
-
-    const rep = call(device.get(), WIFI, "GetAllAccessPoints", "", "") orelse return 0;
-    var aps: [96]Path = undefined;
-    var naps: usize = 0;
-    var r = rep.reader();
-    const end = r.arrayEnd(4);
-    while (r.p < end and !r.bad and naps < aps.len) {
-        aps[naps].set(r.str());
-        naps += 1;
+    nets_changed = false;
+    // активная точка и список точек — одной пачкой, одно ожидание вместо двух
+    var head = Head{};
+    {
+        var w = dbus.W{ .buf = &body_buf };
+        w.str(WIFI);
+        w.str("ActiveAccessPoint");
+        var serials = [2]u32{
+            bus.sendCall(NM, device.get(), PROPS, "Get", "ss", w.bytes()) catch 0,
+            bus.sendCall(NM, device.get(), WIFI, "GetAllAccessPoints", "", "") catch 0,
+        };
+        if (serials[1] == 0) {
+            setError("ошибка связи с NetworkManager");
+            return 0;
+        }
+        bus.collect(&serials, &head, gotHead) catch {
+            setError("ошибка связи с NetworkManager");
+            return 0;
+        };
     }
+    if (!head.ok) return 0;
+    const aps = head.aps[0..head.naps];
+    const naps = head.naps;
+    const active_ap = head.active;
 
     var n: usize = 0;
-    var ctx = ApCtx{ .aps = aps[0..naps], .out = out, .n = &n, .active = active_ap.get() };
+    var ctx = ApCtx{ .aps = aps, .out = out, .n = &n, .active = active_ap.get() };
     var start: usize = 0;
     while (start < naps) : (start += BATCH) {
         const stop = @min(naps, start + BATCH);
@@ -339,6 +386,29 @@ pub fn networks(out: []Net) usize {
         }
     }.lt);
     return n;
+}
+
+const Head = struct { active: Path = .{}, aps: [96]Path = undefined, naps: usize = 0, ok: bool = false };
+
+fn gotHead(h: *Head, i: usize, rep: dbus.Reply) void {
+    if (!rep.ok()) {
+        if (i == 1) setError(rep.message());
+        return;
+    }
+    var r = rep.reader();
+    if (i == 0) {
+        if (std.mem.eql(u8, r.sig(), "o")) {
+            const p = r.str();
+            if (!r.bad) h.active.set(p);
+        }
+        return;
+    }
+    const end = r.arrayEnd(4);
+    while (r.p < end and !r.bad and h.naps < h.aps.len) {
+        h.aps[h.naps].set(r.str());
+        h.naps += 1;
+    }
+    h.ok = !r.bad;
 }
 
 const ApCtx = struct { aps: []Path, out: []Net, n: *usize, active: []const u8, base: usize = 0 };

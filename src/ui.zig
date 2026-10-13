@@ -63,6 +63,9 @@ pub const App = struct {
     start: ?*const fn () void = null,
     /// перед выходом: затереть секреты
     cleanup: ?*const fn () void = null,
+    /// подсветка под курсором рисуется только внутри своего виджета — при движении мыши
+    /// перерисовываются лишь строки старого и нового виджета, а не вся карточка
+    hover_local: bool = false,
 };
 
 // ================================================================= поля ввода
@@ -118,6 +121,7 @@ var compositor_ver: u32 = 0;
 var shm: u32 = 0;
 var layer_shell: u32 = 0;
 var seat: u32 = 0;
+var seat_ver: u32 = 0;
 var pointer: u32 = 0;
 var keyboard: u32 = 0;
 var viewporter: u32 = 0;
@@ -325,7 +329,28 @@ fn fatal(what: []const u8) noreturn {
 
 pub fn redraw() void {
     card.dirty = true;
+    full_dirty = true;
 }
+
+/// Перерисовать только полосу карточки y..y+h (логические пиксели): анимация точек,
+/// подсветка строки. Остальное берётся из прошлого кадра как есть.
+pub fn redrawArea(y: f32, h: f32) void {
+    card.dirty = true;
+    if (full_dirty) return;
+    if (band) |b| {
+        band = .{ @min(b[0], y), @max(b[1], y + h) };
+    } else band = .{ y, y + h };
+}
+
+/// Перерисовать строку текста с базовой линией baseline и кеглем size (анимация «Поиск...»).
+pub fn redrawText(baseline: f32, size: f32) void {
+    redrawArea(baseline - size - 2, size * 1.5 + 4);
+}
+
+/// просили перерисовать всю карточку
+var full_dirty = true;
+/// иначе — только эту полосу (логические пиксели)
+var band: ?[2]f32 = null;
 
 /// Таймер меню: первое срабатывание через first_ms, затем каждые every_ms (0, 0 — выключить).
 pub fn setTimer(first_ms: u32, every_ms: u32) void {
@@ -376,7 +401,8 @@ fn onGlobal(gname: u32, iface: []const u8, ver: u32) void {
     } else if (eql(u8, iface, "zwlr_layer_shell_v1") and layer_shell == 0) {
         layer_shell = bind(gname, iface, @min(ver, 3), .layer_shell);
     } else if (eql(u8, iface, "wl_seat") and seat == 0) {
-        seat = bind(gname, iface, @min(ver, 5), .seat);
+        seat_ver = @min(ver, 5);
+        seat = bind(gname, iface, seat_ver, .seat);
     } else if (eql(u8, iface, "wp_viewporter") and viewporter == 0) {
         viewporter = bind(gname, iface, 1, .viewporter);
     } else if (eql(u8, iface, "wp_single_pixel_buffer_manager_v1") and spb == 0) {
@@ -444,10 +470,23 @@ fn onSeatCaps(caps: u32) void {
             cursor_dev = create(.cursor_dev, 0);
             conn.send(cursor_mgr, 1, .{ cursor_dev, pointer });
         }
+    } else if (caps & 1 == 0 and pointer != 0) {
+        // мышь пропала (отключили): старый объект мёртв — отпускаем, когда вернётся, попросим новый
+        if (cursor_dev != 0) conn.send(cursor_dev, 0, .{});
+        cursor_dev = 0;
+        if (seat_ver >= 3) conn.send(pointer, 1, .{});
+        pointer = 0;
+        ptr_on_card = false;
+        setHover(.{});
     }
     if (caps & 2 != 0 and keyboard == 0) {
         keyboard = create(.keyboard, 0);
         conn.send(seat, 1, .{keyboard});
+    } else if (caps & 2 == 0 and keyboard != 0) {
+        // то же с клавиатурой: иначе после переподключения единственной клавиатуры меню глохнет
+        if (seat_ver >= 3) conn.send(keyboard, 0, .{});
+        keyboard = 0;
+        stopRepeat();
     }
 }
 
@@ -580,17 +619,31 @@ fn render() void {
     const k: u1 = if (card.last) |l| ~l else 0;
     if (card.bufs[k].busy) return;
     const t0 = sys.traceStart();
-    defer if (sys.tracing()) sys.tracef("кадр {d}: {d} мкс", .{ frames, sys.traceSince(t0) });
+    var cv: draw.Canvas = undefined;
+    defer if (sys.tracing()) sys.tracef("кадр {d}: {d} мкс, строки {d}..{d}", .{ frames, sys.traceSince(t0), @max(0, cv.top), @min(cv.h, cv.bot) });
     app.layout();
-    var cv = draw.Canvas{ .px = pixels(k), .w = @intCast(card.pw), .h = @intCast(card.ph) };
+    cv = draw.Canvas{ .px = pixels(k), .w = @intCast(card.pw), .h = @intCast(card.ph) };
     S = @floatFromInt(card.scale);
+    if (!full_dirty and card.last != null) {
+        // частичный кадр: прошлый кадр как основа, рисуем только полосу
+        const b = band orelse .{ 0, 0 };
+        @memcpy(cv.px, pixels(card.last.?));
+        cv.top = @intFromFloat(@max(0, @floor(b[0] * S)));
+        cv.bot = @intFromFloat(@min(@as(f32, @floatFromInt(card.ph)), @max(0, @ceil(b[1] * S))));
+    }
+    defer {
+        if (!card.dirty) {
+            full_dirty = false;
+            band = null;
+        }
+    }
     cv.clear(0);
     rrect(&cv, 0, 0, W(), H(), cfg.menu_radius, theme.t.menu_background);
     outline(&cv, 0.5, 0.5, W() - 1, H() - 1, cfg.menu_radius, theme.t.menu_border, 1);
     app.paint(&cv);
-    // отправляем только изменившуюся полосу строк
-    var y0: u32 = 0;
-    var y1: u32 = card.ph;
+    // отправляем только изменившуюся полосу строк (в частичном кадре меняться могла только она)
+    var y0: u32 = @intCast(@max(0, cv.top));
+    var y1: u32 = @intCast(@min(cv.h, cv.bot));
     if (card.last) |l| {
         const old = pixels(l);
         const w = card.pw;
@@ -759,10 +812,25 @@ fn hitAt(x: f32, y: f32) ?Widget {
 }
 
 fn setHover(r: Ref) void {
-    if (hover.id != r.id or hover.idx != r.idx) {
+    if (hover.id == r.id and hover.idx == r.idx) return;
+    if (app.hover_local and areaOf(hover) and areaOf(r)) {
         hover = r;
-        redraw();
+        return;
     }
+    hover = r;
+    redraw();
+}
+
+/// Пометить полосу виджета к перерисовке (с запасом на рамку фокуса). false — виджета нет в раскладке.
+fn areaOf(r: Ref) bool {
+    if (r.id == 0) return true;
+    for (widgets[0..nwid]) |w| {
+        if (w.id == r.id and w.idx == r.idx) {
+            redrawArea(w.y - 4, w.h + 8);
+            return true;
+        }
+    }
+    return false;
 }
 
 fn updateHover() void {

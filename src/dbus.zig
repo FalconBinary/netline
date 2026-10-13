@@ -293,8 +293,8 @@ pub const Done = struct {
     }
 };
 
-/// Обработчик сигналов, пришедших вперемешку с ответами.
-pub const SignalFn = *const fn (iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void;
+/// Обработчик сигналов, пришедших вперемешку с ответами. Вызывать шину из него нельзя.
+pub const SignalFn = *const fn (path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void;
 /// Обработчик входящих вызовов. Должен ответить (reply/replyError) сразу или позже.
 /// Синхронные вызовы из обработчиков делать нельзя.
 pub const MethodFn = *const fn (c: *Conn, m: *const Incoming) void;
@@ -499,6 +499,11 @@ pub const Conn = struct {
         }
     }
 
+    /// Вызов без ответа (флаг NO_REPLY_EXPECTED): шина ответ не пришлёт, ждать нечего.
+    pub fn callNoReply(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
+        _ = c.send(.{ .kind = 1, .flags = 1, .path = path, .iface = iface, .member = member, .dest = dest, .sig = sig }, body) catch {};
+    }
+
     /// Асинхронный вызов: ответ придёт позже, его забирают через result(serial).
     pub fn callAsync(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!u32 {
         var slot: ?usize = null;
@@ -620,7 +625,7 @@ pub const Conn = struct {
                     return;
                 }
             },
-            4 => if (c.on_signal) |cb| cb(m.iface, m.member, m.sig, m.body),
+            4 => if (c.on_signal) |cb| cb(m.path, m.iface, m.member, m.sig, m.body),
             1 => {
                 const in = Incoming{ .serial = m.serial, .flags = m.flags, .sender = m.sender, .path = m.path, .iface = m.iface, .member = m.member, .sig = m.sig, .body = m.body };
                 if (c.on_method) |cb| cb(c, &in) else c.replyError(&in, "org.freedesktop.DBus.Error.UnknownMethod", "нет такого метода");

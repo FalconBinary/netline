@@ -15,14 +15,26 @@ pub const Canvas = struct {
     px: []u32,
     w: i32,
     h: i32,
+    /// Рисовать только строки [top, bot): частичная перерисовка (анимация, подсветка строки).
+    /// Всё, что ниже или выше, примитивы пропускают, не считая.
+    top: i32 = 0,
+    bot: i32 = std.math.maxInt(i32),
+
+    /// Первая и последняя+1 строка для рисунка в [y0, y1) с учётом полосы.
+    inline fn rows(self: *const Canvas, y0: i32, y1: i32) [2]i32 {
+        return .{ @max(y0, @max(0, self.top)), @min(y1, @min(self.h, self.bot)) };
+    }
 
     pub fn clear(self: *Canvas, color: u32) void {
-        @memset(self.px, premul(color));
+        const r = self.rows(0, self.h);
+        if (r[0] >= r[1]) return;
+        const w: usize = @intCast(self.w);
+        @memset(self.px[@as(usize, @intCast(r[0])) * w .. @as(usize, @intCast(r[1])) * w], premul(color));
     }
 
     /// Наложить цвет (ARGB без предумножения) с покрытием cov (0..1).
     pub inline fn blend(self: *Canvas, x: i32, y: i32, color: u32, cov: f32) void {
-        if (cov <= 0.0) return;
+        if (cov <= 0.0 or y < self.top or y >= self.bot) return;
         const i: usize = @intCast(y * self.w + x);
         blendPx(&self.px[i], color, coverAlpha(color >> 24, cov));
     }
@@ -37,8 +49,9 @@ pub const Canvas = struct {
         const alpha = color >> 24;
         const c0: i32 = @max(0, -x);
         const c1: i32 = @min(@as(i32, w), self.w - x);
-        const r0: i32 = @max(0, -y);
-        const r1: i32 = @min(@as(i32, h), self.h - y);
+        const rr = self.rows(y, y + @as(i32, h));
+        const r0: i32 = rr[0] - y;
+        const r1: i32 = rr[1] - y;
         if (c0 >= c1 or r0 >= r1) return;
         var r = r0;
         while (r < r1) : (r += 1) {
@@ -56,8 +69,9 @@ pub const Canvas = struct {
         const iw: i32 = @intCast(w);
         const c0: i32 = @max(0, -x);
         const c1: i32 = @min(iw, self.w - x);
-        const r0: i32 = @max(0, -y);
-        const r1: i32 = @min(@as(i32, @intCast(h)), self.h - y);
+        const rr = self.rows(y, y + @as(i32, @intCast(h)));
+        const r0: i32 = rr[0] - y;
+        const r1: i32 = rr[1] - y;
         if (c0 >= c1 or r0 >= r1) return;
         var r = r0;
         while (r < r1) : (r += 1) {
@@ -76,9 +90,10 @@ pub const Canvas = struct {
     pub fn image(self: *Canvas, rgb: []const u8, sw: u32, sh: u32, x: f32, y: f32, w: f32, h: f32, r: f32) void {
         if (w < 1 or h < 1 or sw == 0 or sh == 0 or rgb.len < @as(usize, sw) * sh * 3) return;
         const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x))));
-        const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(y))));
         const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x + w))));
-        const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(y + h))));
+        const yr = self.rows(@intFromFloat(@floor(y)), @intFromFloat(@ceil(y + h)));
+        const y0 = yr[0];
+        const y1 = yr[1];
         if (x0 >= x1 or y0 >= y1) return;
         const fx: f32 = @as(f32, @floatFromInt(sw)) / w;
         const fy: f32 = @as(f32, @floatFromInt(sh)) / h;
@@ -154,9 +169,10 @@ pub const Canvas = struct {
     /// Обходит пиксели прямоугольника и красит с покрытием clamp(0.5 - dist).
     fn paint(self: *Canvas, x0f: f32, y0f: f32, x1f: f32, y1f: f32, color: u32, ctx: anytype, comptime dist: fn (@TypeOf(ctx), f32, f32) f32) void {
         const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x0f))));
-        const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(y0f))));
         const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x1f))));
-        const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(y1f))));
+        const yr = self.rows(@intFromFloat(@max(-1e6, @floor(y0f))), @intFromFloat(@min(1e6, @ceil(y1f))));
+        const y0 = yr[0];
+        const y1 = yr[1];
         const alpha = color >> 24;
         var y = y0;
         while (y < y1) : (y += 1) {
@@ -188,9 +204,10 @@ pub const Canvas = struct {
         if (!(w > 0 and h > 0)) return;
         const b = Box{ .cx = x + w / 2, .cy = y + h / 2, .hw = w / 2, .hh = h / 2, .r = @max(0, @min(r, @min(w, h) / 2)) };
         const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x - 1))));
-        const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(y - 1))));
         const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x + w + 1))));
-        const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(y + h + 1))));
+        const yr = self.rows(@intFromFloat(@floor(y - 1)), @intFromFloat(@ceil(y + h + 1)));
+        const y0 = yr[0];
+        const y1 = yr[1];
         if (x0 >= x1) return;
         var py = y0;
         while (py < y1) : (py += 1) {
@@ -207,9 +224,10 @@ pub const Canvas = struct {
         const hw = stroke / 2;
         const pad = hw + 1;
         const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(b.cx - b.hw - pad))));
-        const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(b.cy - b.hh - pad))));
         const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(b.cx + b.hw + pad))));
-        const y1: i32 = @min(self.h, @as(i32, @intFromFloat(@ceil(b.cy + b.hh + pad))));
+        const yr = self.rows(@intFromFloat(@floor(b.cy - b.hh - pad)), @intFromFloat(@ceil(b.cy + b.hh + pad)));
+        const y0 = yr[0];
+        const y1 = yr[1];
         if (x0 >= x1) return;
         var py = y0;
         while (py < y1) : (py += 1) {

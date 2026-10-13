@@ -27,9 +27,8 @@ const LIST_Y: f32 = 62;
 const View = enum { list, add, actions, pairing, done };
 var view: View = .list;
 
-var devs: [128]bz.Dev = undefined;
-var ndev: usize = 0;
-var shown: [128]u8 = undefined; // индексы devs в текущем списке
+const devs = &bz.devs; // таблицу ведёт bz по сигналам bluetoothd
+var shown: [bz.MAX_DEVS]u8 = undefined; // индексы devs в текущем списке
 var list: ui.List = .{};
 var target: bz.Dev = .{};
 var ok = false;
@@ -61,7 +60,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     if (sys.argIs(1, "toggle")) {
         if (!bz.init()) fatalCli();
-        _ = bz.refresh(&devs);
+        _ = bz.load();
         if (bz.adapter.len == 0 or !bz.setPowered(!bz.powered)) fatalCli();
         sys.exit(0);
     }
@@ -85,6 +84,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         .on_extra = onBus,
         .start = start,
         .cleanup = cleanup,
+        .hover_local = true,
     }, .{}, .{});
 }
 
@@ -97,8 +97,7 @@ fn fatalCli() noreturn {
 /// которые видит bluetoothd, с подсказкой, если нужного среди них нет.
 fn scanCli() noreturn {
     if (!bz.init()) fatalCli();
-    bz.keep_all = true;
-    _ = bz.refresh(&devs);
+    _ = bz.load();
     if (bz.adapter.len == 0) fatalCli();
     sys.log("адаптер {s}: {s}", .{ bz.adapter.get(), if (bz.powered) "включён" else "ВЫКЛЮЧЕН — включите Bluetooth" });
     if (!bz.powered) sys.exit(1);
@@ -114,7 +113,7 @@ fn scanCli() noreturn {
         _ = sys.poll(&pfd, 500) catch {};
         bz.bus.pump() catch break;
     }
-    const n = bz.refresh(&devs);
+    const n = bz.load();
     bz.stopDiscovery();
     var named: usize = 0;
     var classic: usize = 0;
@@ -161,6 +160,7 @@ fn start() void {
     list.visible = @intFromFloat((ui.H() - LIST_Y - 64) / ROW_H);
     if (!ok) return;
     if (!bz.registerAgent()) sys.log("агент сопряжения не зарегистрирован: {s}", .{bz.lastError()});
+    _ = bz.load();
     refresh();
     if (bz.adapter.len == 0) {
         ok = false;
@@ -196,10 +196,21 @@ fn lessFound(_: void, a: u8, b: u8) bool {
     return devs[a].rssi > devs[b].rssi;
 }
 
+/// Пересобрать показанный список из таблицы bz — без обращения к bluetoothd.
 fn refresh() void {
-    ndev = bz.refresh(&devs);
+    _ = rebuild();
+    ui.redraw();
+}
+
+/// Пересобрать список; true — изменился состав или порядок строк.
+fn rebuild() bool {
+    bz.changed = false;
+    bz.rssi_changed = false;
+    var old: [bz.MAX_DEVS]u8 = undefined;
+    const old_n = list.n;
+    @memcpy(old[0..old_n], shown[0..old_n]);
     var n: usize = 0;
-    for (devs[0..ndev], 0..) |*d, i| {
+    for (devs[0..bz.ndev], 0..) |*d, i| {
         const want = switch (view) {
             // имя у классических устройств приходит не сразу, а тип (наушники и т. п.) — уже с первым ответом
             .add, .pairing => !d.paired and (d.has_name or d.kind != .generic),
@@ -215,14 +226,15 @@ fn refresh() void {
     } else std.mem.sort(u8, shown[0..n], {}, lessPaired);
     list.setCount(n);
     // свежие данные о выбранном устройстве (статус в «Действиях»)
-    for (devs[0..ndev]) |*d| {
+    for (devs[0..bz.ndev]) |*d| {
         if (d.path.eql(target.path.get())) target = d.*;
     }
-    ui.redraw();
+    return n != old_n or !std.mem.eql(u8, old[0..n], shown[0..n]);
 }
 
 fn devAt(row: usize) *bz.Dev {
-    return &devs[shown[row]];
+    if (bz.changed) refresh(); // таблица могла измениться после последнего кадра
+    return &devs[shown[@min(row, bz.MAX_DEVS - 1)]];
 }
 
 fn busy(path: []const u8) bool {
@@ -241,7 +253,7 @@ fn armTimer() void {
         ui.setTimer(900, 0);
         timer_on = true;
     } else if (want and !timer_on) {
-        ui.setTimer(350, 350);
+        ui.setTimer(500, 500);
         timer_on = true;
     } else if (!want and timer_on) {
         ui.setTimer(0, 0);
@@ -255,14 +267,30 @@ fn onTick() void {
     // Синхронный вызов мог дочитать из сокета сигналы и запросы агента сверх своего ответа:
     // они лежат в буфере, а сокет уже не «готов к чтению» — разбираем их здесь.
     if (ok) pumpBus();
-    if (bz.changed) refresh();
-    ui.redraw(); // анимация точек
+    // уровень сигнала меняется постоянно — порядок найденных обновляем раз в такт, а не на каждый сигнал;
+    // сам RSSI на экране не показан, так что перерисовка нужна, только если строки поменялись местами
+    if (bz.changed) {
+        refresh();
+    } else if (bz.rssi_changed and rebuild()) ui.redraw();
+    animate();
+}
+
+/// Анимация точек: перерисовываем только строку с ними, а не всю карточку.
+fn animate() void {
+    switch (view) {
+        .add, .actions => ui.redrawText(56, 12), // «Поиск...» / «Подключение...» под заголовком
+        .pairing => ui.redrawText(ui.H() / 2 + 6, 14),
+        .list => for (ui.widgets[0..ui.nwid]) |w| {
+            if (wid(w) == .row and busy(devAt(w.idx).path.get())) ui.redrawArea(w.y, w.h);
+        },
+        .done => {},
+    }
 }
 
 fn onBus() void {
     pumpBus();
-    // в простое (таймер выключен) обновляемся сразу по сигналу
-    if (ok and bz.changed and !timer_on) refresh();
+    // новое устройство, имя, подключение — показываем сразу, не дожидаясь такта
+    if (ok and bz.changed) refresh();
 }
 
 fn pumpBus() void {
@@ -466,6 +494,8 @@ fn activate(w: ui.Widget, right: bool) void {
         .secondary => goBack(),
         .field, .none => {},
     }
+    // сигналы, пришедшие в одном чтении с ответом на синхронный вызов, лежат в буфере
+    if (ok) pumpBus();
 }
 
 /// «Подтвердить»/«Готово» на экране сопряжения.
@@ -508,6 +538,7 @@ fn twoButtons(primary: bool) void {
 
 fn layout() void {
     ui.nwid = 0;
+    if (bz.changed) refresh(); // строки — по актуальной таблице
     const W = ui.W();
     switch (view) {
         .list, .add => {

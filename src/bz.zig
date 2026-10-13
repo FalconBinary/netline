@@ -43,7 +43,10 @@ pub const Dev = struct {
     name_len: u8 = 0,
     has_name: bool = false, // настоящее имя, а не адрес
     kind: Kind = .generic,
-    paired: bool = false,
+    paired: bool = false, // Paired или Bonded
+    p_paired: bool = false,
+    p_bonded: bool = false,
+    alias_seen: bool = false,
     trusted: bool = false,
     connected: bool = false,
     battery: u8 = 255, // 255 — неизвестно
@@ -62,10 +65,17 @@ pub var bus: dbus.Conn = .{};
 pub var adapter: Path = .{};
 pub var powered = false;
 pub var discovering = false;
-/// пришёл сигнал от bluetoothd — список стоит перечитать
+
+/// Устройства адаптера. Таблица загружается один раз (load) и дальше живёт сигналами
+/// bluetoothd (InterfacesAdded/Removed, PropertiesChanged): во время поиска не нужно
+/// раз за разом выкачивать все объекты — новое устройство появляется в момент сигнала.
+pub const MAX_DEVS = 255;
+pub var devs: [MAX_DEVS]Dev = undefined;
+pub var ndev: usize = 0;
+/// изменилось что-то видимое (устройство, имя, состояние, адаптер) — список стоит пересобрать
 pub var changed = false;
-/// отдавать из refresh все устройства, в том числе безымянные (для `zbt scan`)
-pub var keep_all = false;
+/// изменился только уровень сигнала (RSSI) — хватит пересобрать при следующем такте
+pub var rssi_changed = false;
 
 var owner_buf: [64]u8 = undefined;
 var owner_len: usize = 0;
@@ -131,12 +141,212 @@ pub fn init() bool {
     return true;
 }
 
-fn onSignal(iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
-    _ = iface;
-    _ = member;
-    _ = sig;
-    _ = body;
-    changed = true;
+fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
+    const eql = std.mem.eql;
+    var r = dbus.R{ .d = body };
+    if (eql(u8, iface, OM) and eql(u8, member, "InterfacesAdded") and eql(u8, sig, "oa{sa{sv}}")) {
+        const p = r.str();
+        if (r.bad or !(isDevPath(p) or (adapter.len == 0 and isAdapterPath(p)))) return;
+        applyObject(&r, p);
+    } else if (eql(u8, iface, OM) and eql(u8, member, "InterfacesRemoved") and eql(u8, sig, "oas")) {
+        const p = r.str();
+        const end = r.arrayEnd(4);
+        while (r.p < end and !r.bad) {
+            switch (whichOf(r.str())) {
+                .device => removeDev(p),
+                .battery => if (find(p)) |d| {
+                    d.battery = 255;
+                    changed = true;
+                },
+                .adapter => if (adapter.eql(p)) {
+                    adapter.len = 0;
+                    powered = false;
+                    discovering = false;
+                    ndev = 0;
+                    changed = true;
+                },
+                .other => {},
+            }
+        }
+    } else if (eql(u8, iface, PROPS) and eql(u8, member, "PropertiesChanged") and eql(u8, sig, "sa{sv}as")) {
+        switch (whichOf(r.str())) {
+            .device, .battery => |w| {
+                if (!isDevPath(path)) return;
+                const d = find(path) orelse devFor(path) orelse return;
+                applyProps(&r, w, d);
+                // RSSI пропадает, когда поиск закончился
+                const end = r.arrayEnd(4);
+                while (r.p < end and !r.bad) {
+                    if (eql(u8, r.str(), "RSSI")) d.rssi = -32768;
+                }
+            },
+            .adapter => if (adapter.eql(path)) applyProps(&r, .adapter, null),
+            .other => {},
+        }
+    }
+}
+
+// ================================================================= таблица устройств
+
+const Which = enum { other, device, adapter, battery };
+
+fn whichOf(iface: []const u8) Which {
+    const eql = std.mem.eql;
+    if (eql(u8, iface, DEVICE)) return .device;
+    if (eql(u8, iface, ADAPTER)) return .adapter;
+    if (eql(u8, iface, BATTERY)) return .battery;
+    return .other;
+}
+
+/// /org/bluez/hciN — без вложенных объектов
+fn isAdapterPath(p: []const u8) bool {
+    const pre = "/org/bluez/hci";
+    return std.mem.startsWith(u8, p, pre) and std.mem.indexOfScalar(u8, p[pre.len..], '/') == null;
+}
+
+/// Устройство нашего адаптера: /org/bluez/hci0/dev_XX_XX… (без вложенных объектов).
+fn isDevPath(p: []const u8) bool {
+    const a = adapter.get();
+    return a.len > 0 and p.len > a.len + 1 and std.mem.startsWith(u8, p, a) and p[a.len] == '/' and
+        std.mem.indexOfScalar(u8, p[a.len + 1 ..], '/') == null;
+}
+
+fn find(path: []const u8) ?*Dev {
+    for (devs[0..ndev]) |*d| {
+        if (d.path.eql(path)) return d;
+    }
+    return null;
+}
+
+/// Видно ли устройство хоть в одном списке меню (иначе это BLE-шум).
+fn useful(d: *const Dev) bool {
+    return d.paired or d.connected or d.has_name or d.kind != .generic;
+}
+
+/// Новая запись. Таблица полна — вытесняем самый слабый безымянный BLE-шум:
+/// десятки чужих телефонов и меток не должны вытеснить нужные устройства.
+fn devFor(path: []const u8) ?*Dev {
+    var slot: ?usize = null;
+    if (ndev < devs.len) {
+        slot = ndev;
+        ndev += 1;
+    } else {
+        for (devs[0..ndev], 0..) |*d, i| {
+            if (useful(d)) continue;
+            if (slot == null or d.rssi < devs[slot.?].rssi) slot = i;
+        }
+    }
+    const i = slot orelse return null;
+    devs[i] = .{};
+    devs[i].path.set(path);
+    return &devs[i];
+}
+
+fn removeDev(path: []const u8) void {
+    for (devs[0..ndev], 0..) |*d, i| {
+        if (!d.path.eql(path)) continue;
+        devs[i] = devs[ndev - 1];
+        ndev -= 1;
+        changed = true;
+        return;
+    }
+}
+
+fn setLabel(d: *Dev, s: []const u8) void {
+    d.name_len = @intCast(@min(s.len, d.name_buf.len));
+    @memcpy(d.name_buf[0..d.name_len], s[0..d.name_len]);
+}
+
+/// Один объект из GetManagedObjects или InterfacesAdded: a{sa{sv}}.
+fn applyObject(r: *dbus.R, path: []const u8) void {
+    const iend = r.arrayEnd(8);
+    while (r.p < iend and !r.bad) {
+        r.alignTo(8);
+        const w = whichOf(r.str());
+        switch (w) {
+            .device, .battery => {
+                if (find(path) orelse devFor(path)) |d| applyProps(r, w, d) else r.skip("a{sv}");
+            },
+            .adapter => {
+                // первый найденный адаптер — наш
+                if (adapter.len == 0) adapter.set(path);
+                if (adapter.eql(path)) applyProps(r, .adapter, null) else r.skip("a{sv}");
+            },
+            .other => r.skip("a{sv}"),
+        }
+    }
+    r.p = @max(r.p, iend);
+}
+
+/// Словарь свойств a{sv} одного интерфейса → запись устройства (или адаптер).
+fn applyProps(r: *dbus.R, w: Which, dev: ?*Dev) void {
+    const eql = std.mem.eql;
+    const pend = r.arrayEnd(8);
+    while (r.p < pend and !r.bad) {
+        r.alignTo(8);
+        const key = r.str();
+        const vs = r.sig();
+        const vt = if (vs.len == 1) vs[0] else 0;
+        var minor = false; // меняется только сигнал или реклама — список не пересобираем сразу
+        if (w == .adapter) {
+            if (vt == 'b' and eql(u8, key, "Powered")) {
+                powered = r.boolean();
+            } else if (vt == 'b' and eql(u8, key, "Discovering")) {
+                discovering = r.boolean();
+            } else {
+                r.skip(vs);
+                continue;
+            }
+        } else if (w == .battery) {
+            const d = dev.?;
+            if (vt == 'y' and eql(u8, key, "Percentage")) d.battery = @min(r.byte(), 100) else {
+                r.skip(vs);
+                continue;
+            }
+        } else {
+            const d = dev.?;
+            if (vt == 's' and eql(u8, key, "Alias")) {
+                setLabel(d, r.str());
+                d.alias_seen = true;
+            } else if (vt == 's' and eql(u8, key, "Name")) {
+                const nm = r.str();
+                d.has_name = nm.len > 0;
+                if (!d.alias_seen or d.name_len == 0) setLabel(d, nm);
+            } else if (vt == 's' and eql(u8, key, "Icon")) {
+                d.kind = kindOf(r.str());
+            } else if (vt == 'b' and eql(u8, key, "Paired")) {
+                d.p_paired = r.boolean();
+            } else if (vt == 'b' and eql(u8, key, "Bonded")) {
+                d.p_bonded = r.boolean();
+            } else if (vt == 'b' and eql(u8, key, "Trusted")) {
+                d.trusted = r.boolean();
+            } else if (vt == 'b' and eql(u8, key, "Connected")) {
+                d.connected = r.boolean();
+            } else if (vt == 'n' and eql(u8, key, "RSSI")) {
+                d.rssi = @bitCast(r.u16_());
+                minor = true;
+            } else if (vt == 's' and eql(u8, key, "AddressType")) {
+                d.random = eql(u8, r.str(), "random");
+            } else if (vt == 'u' and eql(u8, key, "Class")) {
+                _ = r.u32_();
+                d.classic = true;
+            } else if (eql(u8, vs, "a{qv}") and eql(u8, key, "ManufacturerData")) {
+                const mend = r.arrayEnd(8);
+                if (r.p < mend) {
+                    r.alignTo(8);
+                    d.maker = r.u16_();
+                }
+                r.p = @max(r.p, mend);
+                minor = true;
+            } else {
+                r.skip(vs);
+                continue;
+            }
+            d.paired = d.p_paired or d.p_bonded;
+        }
+        if (minor) rssi_changed = true else changed = true;
+    }
+    r.p = @max(r.p, pend);
 }
 
 /// Зарегистрировать наш агент сопряжения (только для сопряжений, которые начали мы).
@@ -163,120 +373,41 @@ fn kindOf(icon: []const u8) Kind {
     return .generic;
 }
 
-/// Перечитать адаптер и устройства (GetManagedObjects). Возвращает число устройств.
-pub fn refresh(out: []Dev) usize {
-    changed = false;
+/// Загрузить адаптер и все устройства (GetManagedObjects). Дальше таблицу ведут сигналы.
+/// Возвращает число устройств.
+pub fn load() usize {
     const rep = call("/", OM, "GetManagedObjects", "", "") orelse return 0;
+    ndev = 0;
+    adapter.len = 0;
+    powered = false;
+    discovering = false;
     var r = rep.reader();
     const end = r.arrayEnd(8);
-    var n: usize = 0;
-    var found_adapter = false;
-    var ad = Path{};
-    var ad_powered = false;
-    var ad_disc = false;
-    const eql = std.mem.eql;
     while (r.p < end and !r.bad) {
         r.alignTo(8);
         const path = r.str();
-        const iend = r.arrayEnd(8);
-        var d = Dev{};
-        d.path.set(path);
-        var is_dev = false;
-        var is_ad = false;
-        var p_powered = false;
-        var p_disc = false;
-        var alias: []const u8 = "";
-        var nm: []const u8 = "";
-        while (r.p < iend and !r.bad) {
-            r.alignTo(8);
-            const iface = r.str();
-            const pend = r.arrayEnd(8);
-            const which: u8 = if (eql(u8, iface, DEVICE)) 1 else if (eql(u8, iface, ADAPTER)) 2 else if (eql(u8, iface, BATTERY)) 3 else 0;
-            if (which == 1) is_dev = true;
-            if (which == 2) is_ad = true;
-            while (r.p < pend and !r.bad) {
-                r.alignTo(8);
-                const key = r.str();
-                const vs = r.sig();
-                const vt = if (vs.len == 1) vs[0] else 0;
-                if (which == 1 and vt == 's' and eql(u8, key, "Alias")) {
-                    alias = r.str();
-                } else if (which == 1 and vt == 's' and eql(u8, key, "Name")) {
-                    nm = r.str();
-                } else if (which == 1 and vt == 's' and eql(u8, key, "Icon")) {
-                    d.kind = kindOf(r.str());
-                } else if (which == 1 and vt == 'b' and eql(u8, key, "Paired")) {
-                    d.paired = d.paired or r.boolean();
-                } else if (which == 1 and vt == 'b' and eql(u8, key, "Bonded")) {
-                    d.paired = d.paired or r.boolean();
-                } else if (which == 1 and vt == 'b' and eql(u8, key, "Trusted")) {
-                    d.trusted = r.boolean();
-                } else if (which == 1 and vt == 'b' and eql(u8, key, "Connected")) {
-                    d.connected = r.boolean();
-                } else if (which == 1 and vt == 'n' and eql(u8, key, "RSSI")) {
-                    d.rssi = @bitCast(r.u16_());
-                } else if (which == 1 and vt == 's' and eql(u8, key, "AddressType")) {
-                    d.random = eql(u8, r.str(), "random");
-                } else if (which == 1 and vt == 'u' and eql(u8, key, "Class")) {
-                    _ = r.u32_();
-                    d.classic = true;
-                } else if (which == 1 and eql(u8, vs, "a{qv}") and eql(u8, key, "ManufacturerData")) {
-                    const mend = r.arrayEnd(8);
-                    if (r.p < mend) {
-                        r.alignTo(8);
-                        d.maker = r.u16_();
-                    }
-                    r.p = @max(r.p, mend);
-                } else if (which == 2 and vt == 'b' and eql(u8, key, "Powered")) {
-                    p_powered = r.boolean();
-                } else if (which == 2 and vt == 'b' and eql(u8, key, "Discovering")) {
-                    p_disc = r.boolean();
-                } else if (which == 3 and vt == 'y' and eql(u8, key, "Percentage")) {
-                    d.battery = @min(r.byte(), 100);
-                } else r.skip(vs);
-            }
-            r.p = @max(r.p, pend);
-        }
-        r.p = @max(r.p, iend);
-        if (is_ad and !found_adapter) {
-            found_adapter = true;
-            ad.set(path);
-            ad_powered = p_powered;
-            ad_disc = p_disc;
-        }
-        // Во время поиска bluetoothd копит десятки безымянных BLE-устройств (телефоны со
-        // случайными адресами, метки, телевизоры). Их отбрасываем сразу, чтобы они не
-        // вытеснили из списка нужные: оставляем сопряжённые, с именем или с известным типом.
-        const useful = keep_all or d.paired or nm.len > 0 or d.kind != .generic;
-        if (is_dev and useful and n < out.len) {
-            const label = if (alias.len > 0) alias else nm;
-            d.has_name = nm.len > 0;
-            d.name_len = @intCast(@min(label.len, d.name_buf.len));
-            @memcpy(d.name_buf[0..d.name_len], label[0..d.name_len]);
-            out[n] = d;
-            n += 1;
-        }
+        applyObject(&r, path);
     }
+    changed = true;
     if (r.bad) {
         setError("неверный ответ bluetoothd");
+        ndev = 0;
         return 0;
     }
-    adapter = ad;
-    powered = ad_powered;
-    discovering = ad_disc;
-    if (!found_adapter) {
+    if (adapter.len == 0) {
         setError("Адаптер Bluetooth не найден");
+        ndev = 0;
         return 0;
     }
     // только устройства нашего адаптера: /org/bluez/hci0/dev_...
     var k: usize = 0;
-    for (out[0..n]) |d| {
-        const p = d.path.get();
-        if (p.len > ad.len and std.mem.startsWith(u8, p, ad.get()) and p[ad.len] == '/') {
-            out[k] = d;
+    for (devs[0..ndev]) |d| {
+        if (isDevPath(d.path.get())) {
+            devs[k] = d;
             k += 1;
         }
     }
+    ndev = k;
     return k;
 }
 
@@ -306,16 +437,17 @@ pub fn setPowered(on: bool) bool {
         return false;
     }
     if (on) rfkillUnblock();
-    // после снятия rfkill адаптеру нужно мгновение, чтобы стать доступным
+    // после снятия rfkill адаптеру нужно мгновение, чтобы стать доступным:
+    // пробуем часто (раз в 50 мс, до 2 с), чтобы не ждать лишнего
     var attempt: u32 = 0;
-    while (attempt < 8) : (attempt += 1) {
+    while (attempt < 40) : (attempt += 1) {
         if (setBool(adapter.get(), ADAPTER, "Powered", on)) {
             powered = on;
             return true;
         }
         if (!on) return false;
         var none = [0]sys.PollFd{};
-        _ = sys.poll(&none, 250) catch {};
+        _ = sys.poll(&none, 50) catch {};
     }
     return false;
 }

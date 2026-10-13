@@ -92,15 +92,50 @@ pub fn main(init: std.process.Init.Minimal) void {
         .tick = onTick,
         .field = fieldAt,
         .cycle = cycleSelect,
+        .extra_fd = busFd,
+        .on_extra = onBus,
         .start = start,
         .cleanup = cleanup,
+        .hover_local = true,
     }, .{}, .{});
 }
 
 fn start() void {
     list.visible = @intFromFloat((ui.H() - LIST_Y - 64) / ROW_H);
     // меню появляется сразу («Поиск сетей…»), список подгружается первым тактом таймера
-    if (nm_ok) ui.setTimer(1, 3000) else armTimer();
+    if (nm_ok) ui.setTimer(1, SCAN_MS) else armTimer();
+}
+
+fn busFd() i32 {
+    return if (nm_ok) nm.bus.fd else -1;
+}
+
+/// Сигналы NetworkManager: новые сети показываем, как только NM их нашёл,
+/// а результат подключения — как только устройство сменило состояние.
+fn onBus() void {
+    // второй круг: синхронные вызовы из handleSignals могли дочитать сигналы в буфер
+    for (0..2) |_| {
+        if (!nm_ok) return;
+        nm.bus.pump() catch {
+            nm_ok = false;
+            ui.setMsg("связь с NetworkManager потеряна");
+            return;
+        };
+        handleSignals();
+    }
+}
+
+fn handleSignals() void {
+    if (nm.nets_changed and view == .list and loaded and !refresh_pending) {
+        // NM шлёт изменения пачкой (точки, LastScan) — перечитываем один раз, чуть погодя;
+        // следующий поиск — через полный интервал после свежих результатов
+        refresh_pending = true;
+        ui.setTimer(SETTLE_MS, SCAN_MS);
+    }
+    if (nm.state_changed and view == .connecting) {
+        nm.state_changed = false;
+        checkProgress();
+    }
 }
 
 fn cleanup() void {
@@ -114,24 +149,33 @@ fn fieldAt(idx: u16) ?*ui.Field {
 
 // ================================================================= логика
 
+/// Перечитать список сетей. Включено ли радио, сообщает сигнал — отдельно не спрашиваем.
 fn refresh() void {
-    nm.refreshEnabled();
+    nm.nets_changed = false; // и при выключенном радио: иначе сигнал перепланировал бы обновление снова и снова
     list.setCount(if (nm.wifi_enabled) nm.networks(&nets) else 0);
     ui.redraw();
 }
 
-/// Таймер: список обновляется раз в 3 с, при подключении состояние проверяется 3 раза в секунду.
+/// Как часто просить NM искать сети, пока открыт список. Сам список обновляется по сигналам.
+const SCAN_MS = 10_000;
+/// Сколько подождать после первого сигнала об изменении списка, чтобы собрать всю пачку.
+const SETTLE_MS = 40;
+var refresh_pending = false;
+
+/// Таймер: в списке — повторный поиск сетей; при подключении — анимация точек
+/// (результат приходит сигналом, опрос — только запасной).
 fn armTimer() void {
     switch (view) {
-        .connecting => ui.setTimer(330, 330),
+        .connecting => ui.setTimer(500, 500),
         .done => ui.setTimer(900, 0),
-        .list => ui.setTimer(3000, 3000),
+        .list => ui.setTimer(SCAN_MS, SCAN_MS),
         else => ui.setTimer(0, 0), // в формах ничего не опрашиваем
     }
 }
 
 fn setView(v: View) void {
     view = v;
+    refresh_pending = false;
     armTimer();
     ui.resetFocus(v == .actions);
 }
@@ -142,25 +186,35 @@ fn onTick() void {
         .list => {
             if (!nm_ok) return;
             if (!loaded) {
+                // сначала то, что NM уже знает (список виден сразу), потом новый поиск
                 loaded = true;
                 nm.loadSaved();
+                refresh();
                 nm.scan();
-            } else if (ticks % 4 == 0) nm.scan();
-            refresh();
+            } else if (refresh_pending) {
+                refresh_pending = false;
+                refresh();
+            } else nm.scan(); // результаты придут сигналами (AccessPointAdded, LastScan)
         },
         .connecting => {
-            ui.redraw(); // анимация точек
-            switch (nm.progress()) {
-                .working => if (ticks > 3 * 90) fail("Превышено время ожидания"),
-                .done => {
-                    for (&fields) |*f| f.clear();
-                    setView(.done);
-                },
-                .failed => fail(nm.lastError()),
-            }
+            ui.redrawText(ui.H() / 2 + 14, 14); // анимация точек — только её строка
+            if (ticks > 90 * 1000 / 500) return fail("Превышено время ожидания");
+            checkProgress();
         },
         .done => ui.quit(),
         else => {},
+    }
+    onBus();
+}
+
+fn checkProgress() void {
+    switch (nm.progress()) {
+        .working => {},
+        .done => {
+            for (&fields) |*f| f.clear();
+            setView(.done);
+        },
+        .failed => fail(nm.lastError()),
     }
 }
 
