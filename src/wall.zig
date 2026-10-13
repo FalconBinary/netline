@@ -116,8 +116,16 @@ fn prepare() void {
 
 fn connectZbg() void {
     var lb: [48]u8 = undefined;
-    const lock = std.fmt.bufPrint(&lb, "zbg-{d}", .{sys.getuid()}) catch return;
+    const uid: u32 = @intCast(sys.getuid());
+    const lock = std.fmt.bufPrint(&lb, "zbg-{d}", .{uid}) catch return;
     zbg_fd = sys.connectAbstractFd(lock) catch -1;
+    // only our own zbg: an abstract name can be taken by another user, who would then
+    // learn the wallpaper file names and answer whatever they like
+    if (zbg_fd >= 0 and sys.peerUid(zbg_fd) != uid) {
+        sys.say(&.{ lock, " belongs to another user — not using it" });
+        sys.close(zbg_fd);
+        zbg_fd = -1;
+    }
 }
 
 fn isImage(n: []const u8) bool {

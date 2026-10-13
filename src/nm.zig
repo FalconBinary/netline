@@ -114,34 +114,50 @@ fn getProp(path: []const u8, iface: []const u8, name: []const u8) ?struct { r: d
     return .{ .r = r, .sig = s };
 }
 
-fn getU32(path: []const u8, iface: []const u8, name: []const u8) ?u32 {
-    var p = getProp(path, iface, name) orelse return null;
-    if (!std.mem.eql(u8, p.sig, "u")) return null;
-    return p.r.u32_();
-}
-
 // ================================================================= initialization
+
+const Devices = struct { paths: [32]Path = undefined, n: usize = 0, types: [32]u32 = [_]u32{0} ** 32, ok: bool = false, enabled: ?bool = null };
 
 pub fn init() bool {
     bus.connectSystem() catch {
         setError("no access to the D-Bus system bus");
         return false;
     };
-    const rep = call(NM_PATH, NM, "GetDevices", "", "") orelse {
+    // who owns the NetworkManager name (signals are accepted only from it) and the device list — one wait
+    var devs = Devices{};
+    {
+        var w = dbus.W{ .buf = &body_buf };
+        w.str(NM);
+        var serials = [2]u32{
+            bus.sendCall("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", w.bytes()) catch 0,
+            bus.sendCall(NM, NM_PATH, NM, "GetDevices", "", "") catch 0,
+        };
+        bus.collect(&serials, &devs, gotDevices) catch {};
+    }
+    if (!devs.ok or bus.peer_len == 0) {
         setError("NetworkManager is not running");
         return false;
-    };
-    // copy the paths: the next call overwrites the reply buffer
-    var paths: [32]Path = undefined;
-    var n: usize = 0;
-    var r = rep.reader();
-    const end = r.arrayEnd(4);
-    while (r.p < end and !r.bad and n < paths.len) {
-        paths[n].set(r.str());
-        n += 1;
     }
-    for (paths[0..n]) |*p| {
-        if (getU32(p.get(), DEV, "DeviceType") == 2) { // NM_DEVICE_TYPE_WIFI
+    // Subscriptions: radio power (before reading it, so a change in between isn't lost), then everything
+    // from our device (state changes — so the failure reason isn't lost; access points added/removed,
+    // scan finished — LastScan). The menu learns about new networks and connection progress right away.
+    addMatch("type='signal',sender='" ++ NM ++ "',path='" ++ NM_PATH ++ "',member='PropertiesChanged'");
+    // the type of every device and whether the radio is on — in one batch too
+    {
+        var w = dbus.W{ .buf = &body_buf };
+        w.str(DEV);
+        w.str("DeviceType");
+        var serials = [_]u32{0} ** 33;
+        for (devs.paths[0..devs.n], 0..) |*p, i| serials[i] = bus.sendCall(NM, p.get(), PROPS, "Get", "ss", w.bytes()) catch 0;
+        w = .{ .buf = &body_buf };
+        w.str(NM);
+        w.str("WirelessEnabled");
+        serials[devs.n] = bus.sendCall(NM, NM_PATH, PROPS, "Get", "ss", w.bytes()) catch 0;
+        bus.collect(serials[0 .. devs.n + 1], &devs, gotType) catch {};
+    }
+    if (devs.enabled) |on| wifi_enabled = on;
+    for (devs.paths[0..devs.n], devs.types[0..devs.n]) |*p, t| {
+        if (t == 2) { // NM_DEVICE_TYPE_WIFI
             device = p.*;
             break;
         }
@@ -150,21 +166,50 @@ pub fn init() bool {
         setError("Wi‑Fi adapter not found");
         return false;
     }
-    // Subscriptions: everything from our device (state changes — so the failure reason isn't lost;
-    // access points added/removed, scan finished — LastScan) and radio power.
-    // The menu learns about new networks and connection progress right away, not by polling.
     var rule_buf: [400]u8 = undefined;
     addMatch(sys.joinZ(&rule_buf, &.{ "type='signal',sender='", NM, "',path='", device.get(), "'" }));
-    addMatch("type='signal',sender='" ++ NM ++ "',path='" ++ NM_PATH ++ "',member='PropertiesChanged'");
     bus.on_signal = onSignal;
-    refreshEnabled();
     return true;
 }
 
+fn gotDevices(d: *Devices, i: usize, rep: dbus.Reply) void {
+    if (!rep.ok()) return;
+    var r = rep.reader();
+    if (i == 0) {
+        const owner = r.str();
+        if (!r.bad) bus.setPeer(owner);
+        return;
+    }
+    const end = r.arrayEnd(4);
+    while (r.p < end and !r.bad and d.n < d.paths.len) {
+        d.paths[d.n].set(r.str());
+        d.n += 1;
+    }
+    d.ok = !r.bad;
+}
+
+/// The reply to Get DeviceType of device i, or (i == n) to Get WirelessEnabled.
+fn gotType(d: *Devices, i: usize, rep: dbus.Reply) void {
+    if (!rep.ok()) return;
+    var r = rep.reader();
+    const sig = r.sig();
+    if (i == d.n) {
+        if (!std.mem.eql(u8, sig, "b")) return;
+        const on = r.boolean();
+        if (!r.bad) d.enabled = on;
+        return;
+    }
+    if (!std.mem.eql(u8, sig, "u")) return;
+    const t = r.u32_();
+    if (!r.bad) d.types[i] = t;
+}
+
+/// A match rule without waiting for the reply: the bus handles a connection's messages in order,
+/// so the rule is in place before the next call — and there's one round trip less per rule.
 fn addMatch(rule: []const u8) void {
     var w = dbus.W{ .buf = &body_buf };
     w.str(rule);
-    _ = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes()) catch {};
+    bus.callNoReply("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes());
 }
 
 /// The last reason the device went to FAILED (0 — none).
@@ -211,11 +256,6 @@ fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []cons
         var r = dbus.R{ .d = body };
         if (eql(u8, iface, WIFI) or (eql(u8, sig, "sa{sv}as") and eql(u8, r.str(), WIFI))) nets_changed = true;
     }
-}
-
-pub fn refreshEnabled() void {
-    var p = getProp(NM_PATH, NM, "WirelessEnabled") orelse return;
-    if (std.mem.eql(u8, p.sig, "b")) wifi_enabled = p.r.boolean();
 }
 
 pub fn setEnabled(on: bool) bool {

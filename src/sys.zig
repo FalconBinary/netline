@@ -363,10 +363,12 @@ pub fn listenAbstract(name: []const u8) Error!i32 {
     return fd;
 }
 
-pub fn connectAbstract(name: []const u8) bool {
-    const fd = connectAbstractFd(name) catch return false;
-    close(fd);
-    return true;
+/// uid of whoever listens on an abstract socket (null — nobody). Abstract names are shared by all
+/// users of the network namespace: a name can be taken by someone else, so the owner is checked.
+pub fn abstractOwner(name: []const u8) ?u32 {
+    const fd = connectAbstractFd(name) catch return null;
+    defer close(fd);
+    return peerUid(fd) orelse 0xffffffff;
 }
 
 /// Connect to an abstract unix socket; returns the descriptor.
@@ -401,9 +403,16 @@ pub fn ioctl(fd: i32, req: usize, arg: usize) Error!usize {
 
 // ---------------------------------------------------------------- memory
 
+/// Shared memory for frame buffers. MFD_NOEXEC_SEAL (Linux 6.3+) seals it non-executable for good;
+/// with vm.memfd_noexec = 2 a memfd without that flag is refused outright. Older kernels don't know
+/// the flag (EINVAL) — then plain MFD_CLOEXEC.
 pub fn memfd(name: [*:0]const u8) Error!i32 {
-    const rc = try check(linux.syscall2(.memfd_create, @intFromPtr(name), 1)); // MFD_CLOEXEC
-    return @intCast(rc);
+    const MFD_CLOEXEC = 1;
+    const MFD_NOEXEC_SEAL = 8;
+    if (check(linux.syscall2(.memfd_create, @intFromPtr(name), MFD_CLOEXEC | MFD_NOEXEC_SEAL))) |rc| {
+        return @intCast(rc);
+    } else |e| if (last_errno != 22) return e; // EINVAL
+    return @intCast(try check(linux.syscall2(.memfd_create, @intFromPtr(name), MFD_CLOEXEC)));
 }
 
 pub fn ftruncate(fd: i32, len: usize) Error!void {
@@ -602,9 +611,9 @@ fn execvp(av: [*:null]const ?[*:0]const u8) void {
     }
 }
 
-/// Rename (atomic file replacement).
+/// Rename (atomic file replacement). renameat2 with no flags: riscv64 has no plain renameat.
 pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
-    _ = try check(linux.syscall4(.renameat, ufd(AT_FDCWD), @intFromPtr(from), ufd(AT_FDCWD), @intFromPtr(to)));
+    _ = try check(linux.syscall5(.renameat2, ufd(AT_FDCWD), @intFromPtr(from), ufd(AT_FDCWD), @intFromPtr(to), 0));
 }
 
 // ---------------------------------------------------------------- environment and arguments
@@ -763,6 +772,17 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "netline: " ++ fmt ++ "\n", args) catch return;
     _ = write(2, s) catch {};
+}
+
+/// A message from string pieces, without std.fmt: every distinct log() format string compiles
+/// into its own copy of the formatting code (kilobytes per message), this costs nothing extra.
+pub fn say(parts: []const []const u8) void {
+    var buf: [512]u8 = undefined;
+    const head = "netline: ";
+    @memcpy(buf[0..head.len], head);
+    const s = joinZ(buf[head.len .. buf.len - 1], parts);
+    buf[head.len + s.len] = '\n';
+    _ = write(2, buf[0 .. head.len + s.len + 1]) catch {};
 }
 
 /// Join pieces into a zero-terminated buffer (excess is truncated).

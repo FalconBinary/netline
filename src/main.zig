@@ -71,6 +71,10 @@ const Bar = struct {
     ph: u32 = 0,
     bufs: [2]Buf = .{ .{}, .{} },
     last: ?u1 = null, // buffer with the last shown frame
+    // the opaque region handed to the compositor: for which size, and whether there is one
+    opaque_on: bool = false,
+    opaque_w: u32 = 0,
+    opaque_h: u32 = 0,
     tags: [mango.MAX_TAGS]mango.Tag = [_]mango.Tag{.{}} ** mango.MAX_TAGS,
     ntags: u8 = 0,
     hits: [48]Hit = undefined,
@@ -208,7 +212,7 @@ pub fn main(init: std.process.Init.Minimal) void {
             .{ .fd = theme.inotify_fd, .events = sys.POLLIN },
             .{ .fd = status.mgmt_fd, .events = sys.POLLIN },
         };
-        _ = sys.poll(&fds, -1) catch continue;
+        _ = sys.poll(&fds, theme.timeout()) catch continue;
         if (sys.tracing()) traceWake(&fds);
 
         if (fds[0].revents != 0) readWayland();
@@ -222,9 +226,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             const ch = status.drainEvents(fds[4].revents != 0, fds[5].revents != 0);
             refreshStatus(ch.wifi, ch.bt);
         }
-        if (fds[6].revents != 0 and theme.inotify_fd >= 0) {
-            if (theme.onInotify()) markAllDirty();
-        }
+        if (fds[6].revents != 0 and theme.inotify_fd >= 0) theme.onInotify();
+        if (theme.settle()) markAllDirty();
         if (fds[7].revents != 0 and status.mgmt_fd >= 0) {
             if (status.drainMgmt()) refreshStatus(false, true);
         }
@@ -780,6 +783,7 @@ fn ensureBuffers(i: u8) bool {
     const stride = pw * 4;
     const size: usize = @as(usize, stride) * ph;
     const total = size * 2;
+    if (total == 0 or total > std.math.maxInt(i32)) return false; // wl_shm takes the pool size as i32
     const fd = sys.memfd("netline") catch return false;
     defer sys.close(fd);
     sys.ftruncate(fd, total) catch return false;
@@ -877,6 +881,7 @@ fn render(i: u8) void {
         }
     }
 
+    syncOpaque(b);
     conn.send(b.surface, 1, .{ b.bufs[k].id, @as(i32, 0), @as(i32, 0) }); // attach
     if (compositor_ver >= 3) conn.send(b.surface, 8, .{@as(i32, @intCast(b.scale))}); // set_buffer_scale
     if (compositor_ver >= 4) {
@@ -890,6 +895,18 @@ fn render(i: u8) void {
     b.bufs[k].busy = true;
     b.last = k;
     b.dirty = false;
+}
+
+/// With an opaque background (alpha ff in the theme) the compositor gets an opaque region — the panel
+/// without its rounded corners — and doesn't draw or blend what is under it. Sent with the next commit,
+/// only when the size or the background's opacity changed.
+fn syncOpaque(b: *Bar) void {
+    const want = theme.solid(theme.t.background);
+    if (want == b.opaque_on and (!want or (b.opaque_w == b.w and b.opaque_h == b.h))) return;
+    b.opaque_on = want;
+    b.opaque_w = b.w;
+    b.opaque_h = b.h;
+    conn.setOpaque(compositor, b.surface, want, b.w, b.h, cfg.radius);
 }
 
 fn sameTags(a: []const mango.Tag, b: []const mango.Tag) bool {

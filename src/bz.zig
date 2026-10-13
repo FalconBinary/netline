@@ -133,10 +133,13 @@ pub fn init() bool {
     const o = rr.str();
     owner_len = @min(o.len, owner_buf.len);
     @memcpy(owner_buf[0..owner_len], o[0..owner_len]);
+    // signals only from bluetoothd itself — a unicast "signal" from another process is ignored
+    bus.setPeer(owner_buf[0..owner_len]);
 
+    // the bus handles our messages in order: the rule is in place before the next call, no need to wait for a reply
     w = .{ .buf = &body_buf };
     w.str("type='signal',sender='org.bluez'");
-    _ = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes()) catch {};
+    bus.callNoReply("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes());
     bus.on_signal = onSignal;
     return true;
 }

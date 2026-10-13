@@ -326,11 +326,27 @@ pub const Conn = struct {
     on_method: ?MethodFn = null,
     serial: u32 = 0,
     in: *[1024 * 1024]u8 = &in_buf,
+    head: usize = 0, // start of the unhandled data (handled messages aren't shifted out one by one)
     ilen: usize = 0,
-    consumed: usize = 0, // length of the last returned reply at the start of the buffer
+    consumed: usize = 0, // length of the last returned reply at `head`
     out: *[64 * 1024]u8 = &out_buf,
     waiting: [MAX_ASYNC]u32 = [_]u32{0} ** MAX_ASYNC,
     done: [MAX_ASYNC]Done = [_]Done{.{}} ** MAX_ASYNC,
+    /// The unique bus name (":1.23") of the service we talk to. Signals are accepted only from it:
+    /// match rules filter broadcasts, but any local process may send a signal straight to us
+    /// (a fake network or device in the list, or a flood that keeps the menu busy).
+    peer_buf: [64]u8 = undefined,
+    peer_len: usize = 0,
+
+    /// Take signals only from this sender (the GetNameOwner reply).
+    pub fn setPeer(c: *Conn, name: []const u8) void {
+        c.peer_len = @min(name.len, c.peer_buf.len);
+        @memcpy(c.peer_buf[0..c.peer_len], name[0..c.peer_len]);
+    }
+
+    pub fn peer(c: *const Conn) []const u8 {
+        return c.peer_buf[0..c.peer_len];
+    }
 
     /// Connect to the system bus (or to the address in DBUS_SYSTEM_BUS_ADDRESS).
     pub fn connectSystem(c: *Conn) Error!void {
@@ -388,10 +404,13 @@ pub const Conn = struct {
             got += k;
         };
         if (!std.mem.startsWith(u8, c.in[0..end], "OK ")) return error.Auth;
-        const rest = got - (end + 2);
-        std.mem.copyForwards(u8, c.in[0..rest], c.in[end + 2 .. got]);
-        c.ilen = rest;
+        c.head = end + 2;
+        c.ilen = got;
         c.consumed = 0;
+        if (c.head == c.ilen) {
+            c.head = 0;
+            c.ilen = 0;
+        }
     }
 
     fn waitReadable(c: *Conn, timeout_ms: i32) Error!void {
@@ -492,10 +511,7 @@ pub const Conn = struct {
             }
             if (left == 0) break;
             try c.waitReadable(10000);
-            if (c.ilen == c.in.len) return error.TooBig;
-            const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
-            if (k == 0) return error.Io;
-            c.ilen += k;
+            try c.readMore();
         }
     }
 
@@ -550,26 +566,47 @@ pub const Conn = struct {
         w.str(val);
     }
 
+    /// A handled message is just stepped over: a burst of signals is no longer shifted
+    /// through the buffer once per message.
     fn drop(c: *Conn, n: usize) void {
-        std.mem.copyForwards(u8, c.in[0 .. c.ilen - n], c.in[n..c.ilen]);
-        c.ilen -= n;
+        c.head += n;
+        if (c.head == c.ilen) {
+            c.head = 0;
+            c.ilen = 0;
+        }
     }
 
-    /// Size of the first message in the buffer (null — it hasn't fully arrived yet).
+    /// Read what has arrived after the unhandled tail. The tail (an incomplete message, usually
+    /// short or nothing) moves to the start of the buffer only now. Replies handed out earlier
+    /// are already invalid by this point (see `consumed`).
+    fn readMore(c: *Conn) Error!void {
+        if (c.head > 0) {
+            std.mem.copyForwards(u8, c.in[0 .. c.ilen - c.head], c.in[c.head..c.ilen]);
+            c.ilen -= c.head;
+            c.head = 0;
+        }
+        if (c.ilen == c.in.len) return error.TooBig;
+        const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
+        if (k == 0) return error.Io;
+        c.ilen += k;
+    }
+
+    /// Size of the first unhandled message (null — it hasn't fully arrived yet).
     fn complete(c: *Conn) Error!?usize {
-        if (c.ilen < 16) return null;
-        if (c.in[0] != 'l') return error.Protocol; // big-endian is not supported
-        const body_len = std.mem.readInt(u32, c.in[4..8], .little);
-        const flen = std.mem.readInt(u32, c.in[12..16], .little);
+        const d = c.in[c.head..c.ilen];
+        if (d.len < 16) return null;
+        if (d[0] != 'l') return error.Protocol; // big-endian is not supported
+        const body_len = std.mem.readInt(u32, d[4..8], .little);
+        const flen = std.mem.readInt(u32, d[12..16], .little);
         const hdr = (16 + @as(usize, flen) + 7) & ~@as(usize, 7);
         const total = hdr + @as(usize, body_len);
         if (total > c.in.len) return error.TooBig;
-        if (c.ilen < total) return null;
+        if (d.len < total) return null;
         return total;
     }
 
     fn parse(c: *Conn, total: usize) Error!Msg {
-        const msg = c.in[0..total];
+        const msg = c.in[c.head..][0..total];
         const flen = std.mem.readInt(u32, msg[12..16], .little);
         const hdr = (16 + @as(usize, flen) + 7) & ~@as(usize, 7);
         var m = Msg{ .kind = msg[1], .flags = msg[2], .serial = std.mem.readInt(u32, msg[8..12], .little), .body = msg[hdr..total] };
@@ -625,7 +662,10 @@ pub const Conn = struct {
                     return;
                 }
             },
-            4 => if (c.on_signal) |cb| cb(m.path, m.iface, m.member, m.sig, m.body),
+            4 => if (c.on_signal) |cb| {
+                if (c.peer_len > 0 and !std.mem.eql(u8, m.sender, c.peer())) return;
+                cb(m.path, m.iface, m.member, m.sig, m.body);
+            },
             1 => {
                 const in = Incoming{ .serial = m.serial, .flags = m.flags, .sender = m.sender, .path = m.path, .iface = m.iface, .member = m.member, .sig = m.sig, .body = m.body };
                 if (c.on_method) |cb| cb(c, &in) else c.replyError(&in, "org.freedesktop.DBus.Error.UnknownMethod", "no such method");
@@ -651,9 +691,7 @@ pub const Conn = struct {
                 c.drop(total); // a foreign message is handled — drop it
             }
             try c.waitReadable(10000);
-            const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
-            if (k == 0) return error.Io;
-            c.ilen += k;
+            try c.readMore();
         }
     }
 
@@ -665,12 +703,7 @@ pub const Conn = struct {
             c.consumed = 0;
         }
         var pfd = [1]sys.PollFd{.{ .fd = c.fd, .events = sys.POLLIN }};
-        if ((sys.poll(&pfd, 0) catch 0) > 0) {
-            if (c.ilen == c.in.len) return error.TooBig;
-            const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
-            if (k == 0) return error.Io;
-            c.ilen += k;
-        }
+        if ((sys.poll(&pfd, 0) catch 0) > 0) try c.readMore();
         while (try c.complete()) |total| {
             const m = try c.parse(total);
             c.handle(&m);

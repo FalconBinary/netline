@@ -156,6 +156,14 @@ const Surf = struct {
     ph: u32 = 0,
     bufs: [2]Buf = .{ .{}, .{} },
     last: ?u1 = null,
+    /// the buffer holds a whole frame (the one before the last shown)
+    full: [2]bool = .{ false, false },
+    /// rows (device pixels) in which the last shown frame differs from the one before it
+    dmg: [2]u32 = .{ 0, 0 },
+    /// the opaque region handed to the compositor: whether there is one, and for which size
+    solid: bool = false,
+    solid_w: u32 = 0,
+    solid_h: u32 = 0,
 };
 
 var card: Surf = .{}; // owner 0
@@ -207,7 +215,12 @@ pub fn begin(menu_name: []const u8) void {
     name = name_buf[0..k];
     var lock_buf: [64]u8 = undefined;
     const lock_name = std.fmt.bufPrint(&lock_buf, "{s}-{d}", .{ name, my_uid }) catch name;
-    if (sys.connectAbstract(lock_name)) sys.exit(0);
+    if (sys.abstractOwner(lock_name)) |uid| {
+        // our own copy is open: connecting has already asked it to close — and that's all this launch does
+        if (uid == my_uid) sys.exit(0);
+        // the name is taken by someone else (any user can create an abstract socket): don't obey, run without the lock
+        sys.say(&.{ lock_name, ": the menu lock is held by another user — ignoring it" });
+    }
     lock_fd = sys.listenAbstract(lock_name) catch -1;
 
     if (!ttf.load(&cfg.font_paths)) {
@@ -289,7 +302,7 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
             .{ .fd = theme.inotify_fd, .events = sys.POLLIN },
             .{ .fd = xfd, .events = sys.POLLIN },
         };
-        _ = sys.poll(&fds, -1) catch continue;
+        _ = sys.poll(&fds, theme.timeout()) catch continue;
         if (fds[0].revents != 0) readWayland();
         if (fds[5].revents != 0) {
             if (app.on_extra) |f| f();
@@ -308,11 +321,10 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
                 if (uid == my_uid) quit();
             }
         }
-        if (fds[4].revents != 0 and theme.inotify_fd >= 0) {
-            if (theme.onInotify()) {
-                redraw();
-                paintBackdrop();
-            }
+        if (fds[4].revents != 0 and theme.inotify_fd >= 0) theme.onInotify();
+        if (theme.settle()) {
+            redraw();
+            paintBackdrop();
         }
     }
 }
@@ -587,8 +599,10 @@ fn ensureBuffers() bool {
     if (card.mem) |m| sys.munmap(m, card.mem_len);
     card.mem = null;
     card.last = null;
+    card.full = .{ false, false };
     const stride = pw * 4;
     const size: usize = @as(usize, stride) * ph;
+    if (size == 0 or size * 2 > std.math.maxInt(i32)) return false; // wl_shm takes the pool size as i32
     const fd = sys.memfd("zmenu") catch return false;
     defer sys.close(fd);
     sys.ftruncate(fd, size * 2) catch return false;
@@ -625,12 +639,20 @@ fn render() void {
     cv = draw.Canvas{ .px = pixels(k), .w = @intCast(card.pw), .h = @intCast(card.ph) };
     S = @floatFromInt(card.scale);
     if (!full_dirty and card.last != null) {
-        // partial frame: the previous frame as the base, draw only the band
+        // partial frame: the previous frame as the base, draw only the band.
+        // This buffer already holds the frame before the last one, and the last one differs from it only
+        // in the rows sent to the compositor last time (dmg) — only those are copied, not the whole frame.
         const b = band orelse .{ 0, 0 };
-        @memcpy(cv.px, pixels(card.last.?));
+        const prev = pixels(card.last.?);
+        if (card.full[k]) {
+            const a = card.dmg[0] * card.pw;
+            const e = card.dmg[1] * card.pw;
+            @memcpy(cv.px[a..e], prev[a..e]);
+        } else @memcpy(cv.px, prev);
         cv.top = @intFromFloat(@max(0, @floor(b[0] * S)));
         cv.bot = @intFromFloat(@min(@as(f32, @floatFromInt(card.ph)), @max(0, @ceil(b[1] * S))));
     }
+    card.full[k] = true; // after this frame the buffer holds a whole frame again
     defer {
         if (!card.dirty) {
             full_dirty = false;
@@ -654,6 +676,7 @@ fn render() void {
             return;
         }
     }
+    syncOpaque();
     conn.send(card.surface, 1, .{ card.bufs[k].id, @as(i32, 0), @as(i32, 0) });
     if (compositor_ver >= 3) conn.send(card.surface, 8, .{@as(i32, @intCast(card.scale))});
     if (compositor_ver >= 4) {
@@ -664,8 +687,20 @@ fn render() void {
     conn.send(card.surface, 6, .{});
     card.bufs[k].busy = true;
     card.last = k;
+    card.dmg = .{ y0, y1 };
     card.dirty = false;
     frames += 1;
+}
+
+/// An opaque card background (alpha ff in the theme): the compositor gets an opaque region —
+/// the card without its rounded corners — and doesn't draw the dimming and windows under it.
+fn syncOpaque() void {
+    const want = theme.solid(theme.t.menu_background);
+    if (want == card.solid and (!want or (card.solid_w == card.w and card.solid_h == card.h))) return;
+    card.solid = want;
+    card.solid_w = card.w;
+    card.solid_h = card.h;
+    conn.setOpaque(compositor, card.surface, want, card.w, card.h, cfg.menu_radius);
 }
 
 // ================================================================= widgets
@@ -1088,22 +1123,63 @@ fn paste(f: *Field) void {
     defer sys.close(p[0]);
     var buf: [512]u8 = undefined;
     var n: usize = 0;
+    // half a second for the whole paste, not per read: a clipboard owner trickling a byte at a time
+    // can't freeze the menu (with a password field open) for minutes
+    const deadline = sys.monoMs() + 500;
     while (n < buf.len) {
+        const now = sys.monoMs();
+        if (now >= deadline) break;
         var pfd = [1]sys.PollFd{.{ .fd = p[0], .events = sys.POLLIN }};
-        const r = sys.poll(&pfd, 500) catch break;
+        const r = sys.poll(&pfd, @intCast(deadline - now)) catch break;
         if (r == 0) break;
         const k = sys.read(p[0], buf[n..]) catch break;
         if (k == 0) break;
         n += k;
     }
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const c = buf[i];
-        if (c == '\n' or c == '\r') break;
-        if (c < 0x20 or c == 0x7f) continue;
-        insertBytes(f, buf[i .. i + 1]);
-    }
+    insertPasted(f, buf[0..n]);
     sys.secureZero(&buf);
+}
+
+/// Pasted data into a field: the first line, valid UTF-8 characters only and only whole ones
+/// (a full field never ends up with half a character), no control characters. Invalid UTF-8 would
+/// otherwise go on to NetworkManager, and the bus drops a client that sends it.
+fn insertPasted(f: *Field, data: []const u8) void {
+    const end = std.mem.indexOfAny(u8, data, "\r\n") orelse data.len;
+    var i: usize = 0;
+    while (i < end) {
+        const len = std.unicode.utf8ByteSequenceLength(data[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > end) break;
+        const ch = data[i..][0..len];
+        const cp = std.unicode.utf8Decode(ch) catch {
+            i += 1;
+            continue;
+        };
+        i += len;
+        if (cp < 0x20 or (cp >= 0x7f and cp < 0xa0)) continue;
+        if (f.len + len > f.buf.len) break;
+        insertBytes(f, ch);
+    }
+}
+
+test "paste: one line, whole valid UTF-8 characters, no control characters" {
+    const tt = std.testing;
+    var f = Field{};
+    insertPasted(&f, "ab\xff\xc3\xa9\x01\xc2\x85cd\xc0\xaf\xed\xa0\x80e\nsecond line");
+    try tt.expectEqualStrings("ab\xc3\xa9cde", f.text());
+    // a truncated character at the end is dropped
+    f = .{};
+    insertPasted(&f, "x\xe2\x82");
+    try tt.expectEqualStrings("x", f.text());
+    // a field with room for one byte takes no half of "é"
+    f = .{};
+    @memset(f.buf[0..255], 'x');
+    f.len = 255;
+    f.caret = 255;
+    insertPasted(&f, "\xc3\xa9y");
+    try tt.expectEqual(@as(usize, 255), f.len);
 }
 
 fn onDataDevice(op: u16, a: *wl.Args) void {

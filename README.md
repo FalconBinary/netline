@@ -87,6 +87,8 @@ Apps are launched without a shell: the `Exec` line is parsed per the spec (quote
 - **A wrong password** is detected, the failed profile is removed, and the data stays in the form for correction.
 
 `Ctrl+V` — paste, `Ctrl+U` — clear the field. Input follows the keyboard layout (Latin and Cyrillic), Shift and Caps Lock.
+A paste takes the first line only, whole valid UTF-8 characters without control characters, and waits for the clipboard
+at most half a second in total.
 Authentication and encryption are done by NetworkManager (with wpa_supplicant/iwd underneath): the password is passed to it once
 and stored in its profiles (readable by root only). In zwifi's memory passwords are wiped right after sending and on exit.
 
@@ -105,7 +107,9 @@ and stored in its profiles (readable by root only). In zwifi's memory passwords 
 - **Diagnostics:** `zbt scan [seconds]` — discovery (20 seconds by default) and the full list of what bluetoothd sees: device type, classic or BLE, manufacturer; if there is nothing to show in the menu, a hint on what to do.
 
 The pairing agent accepts requests only from bluetoothd itself: another program on the bus cannot slip in
-a forged request. Canceling or closing the menu during pairing rejects the device's request.
+a forged request. The device list, too, follows signals from bluetoothd only (zwifi — from NetworkManager only):
+a signal another program sends straight to the menu is ignored, so it can't add a fake device or "turn off" Wi‑Fi on screen.
+Canceling or closing the menu during pairing rejects the device's request.
 
 ### Wallpaper: zwall and zbg
 
@@ -167,7 +171,8 @@ and all menu colors.
 Two ways to change them:
 
 - **Without rebuilding** — the file `~/.config/netline/theme` (or `$XDG_CONFIG_HOME/netline/theme`).
-  Copy `theme.example` and edit it: the panel, menus and zbg reread the file right after you save it.
+  Copy `theme.example` and edit it: the panel, menus and zbg reread the file right after you save it
+  (once, 80 ms after the last change — an editor's save is several file events) and redraw only if a color actually changed.
   ```ini
   background = #2e3440e6
   clock      = #ebcb8b
@@ -211,9 +216,11 @@ The panel uses practically nothing while nothing changes (measured: 0 wakeups an
   frames it is just blended with a color — 7–30 times faster.
   Text (the clock and the menus): a "character → glyph" cache, rasterized glyphs are cached, and a binary search over the font table (~40% faster).
 - **Tags are redrawn only if they changed** — the mango IPC also sends events for things the panel doesn't show.
+  Every line of `watch all-tags` is a full snapshot of all monitors, so of the lines that arrived together only the last one
+  is parsed; monitors missing from the snapshot (unplugged) free their slot.
 - **Small binaries.** Our own panic handler instead of the standard one (stack printing and formatting),
-  buffers in `.bss`: all seven programs together were about 1.1 MB (ReleaseSafe, x86_64), the panel in memory is ~0.6 MB,
-  0.4 MB of which are the two frame buffers the compositor reads.
+  buffers in `.bss`: all eight programs together are about 1.6 MB (ReleaseSafe, x86_64), the panel in memory is ~0.9 MB
+  on a 1600-pixel-wide screen, 0.4 MB of which are the two frame buffers the compositor reads.
 
 Measured (aarch64, headless sway): 10 s idle — 0 wakeups and 0 µs of CPU; 400 mouse movements
 with icon highlighting — 33 ms of CPU; 200 tag events — 78 ms.
@@ -247,7 +254,29 @@ Measured (aarch64 VM, NetworkManager + hwsim, bluetoothd + btvirt):
 
 **Partial redraw in menus.** The dots animation ("Searching...", "Connecting...") and the highlight of the row under the pointer
 redraw only their own band of rows: the frame takes the previous one as the base, and the drawing primitives skip everything outside
-the band. The dots update twice a second, not three times.
+the band. The base isn't copied whole: the buffer being drawn already holds the frame before the last one, so only the rows that changed
+in the last frame are copied (a few rows instead of 0.8 MB at 1× and 3.2 MB at 2× per animation step).
+The dots update twice a second, not three times.
+
+**Saving the theme** costs one reread and at most one frame: before, vim's save (rename to a backup, create, write)
+meant three rereads and three frames of the panel and of every open menu (one of them in default colors), and zbg decoded the
+wallpaper three times. Now zbg decodes it again only if the `desktop` color changed.
+
+**zwifi starts with fewer bus round trips**: the NetworkManager name owner and the device list, then the types of all
+devices and the radio state — two batches instead of a chain of calls; match rules are sent without waiting for a reply.
+The D-Bus client steps over handled messages instead of shifting the buffer after each one.
+
+Measured in the same VM, before → after this version:
+
+| | before | after |
+|---|---|---|
+| panel: CPU for a burst of 2000 mango lines | 32 ms | 2.2 ms |
+| menus: partial frame (dots animation), median at 1× | 404 µs | 190 µs |
+| zbt: CPU over 20 s of discovery | 27–35 ms | 20 ms |
+| zwifi: launch → first frame, median | 12.5 ms | 6.5 ms |
+| zwifi: sequential waits for a bus reply at startup | ~19 | ~7 |
+| theme saved by vim: panel frames / zbg CPU with a PNG wallpaper | 3 / 47 ms | 1 / 0 ms |
+| theme saved without a color change: panel frames | 4 | 0 |
 
 ### Timing: `NETLINE_TRACE=1`
 
@@ -274,7 +303,10 @@ a baseline image turns into pixels right away (the whole frame's coefficients ar
 photo that's 72 MB). Scaling to the screen keeps a few rows in memory, not an intermediate image.
 A 6000×4000 photo → 1600×900 wallpaper takes about 0.16 s, → 4K about 0.37 s; a thumbnail 0.04 s.
 
-For minimal GPU load: keep `blur_layer=0` in mango and, if you don't need transparency, make the background opaque (`#RRGGBB`).
+For minimal GPU load: keep `blur_layer=0` in mango and, if you don't need transparency, make the background opaque (`#RRGGBB`):
+with an opaque `background` (`menu_background` for the menus) the panel and the menu card hand the compositor an opaque region —
+the surface without its rounded corners — and it neither draws nor blends the windows and wallpaper underneath. zbg's wallpaper
+is always opaque (XRGB). With a translucent background nothing extra is sent.
 
 ## Security
 
@@ -312,6 +344,12 @@ zrun reads the apps, `PATH` and the history before the sandbox and immediately f
 only by its number in the already-read list, and the broker parses `Exec` and launches it itself, without a shell. A line from the
 "Commands" tab is run by the broker via `/bin/sh -c` — the same as a terminal would.
 A repeated launch closes a menu only if it comes from the same user; only the same user can control zbg as well.
+The menus and zbg find each other through abstract sockets (`zwifi-<uid>`, `zbg-<uid>`), and anyone on the machine can create
+such a name first. So the owner is checked (`SO_PEERCRED`): a name taken by another user doesn't make a menu or zbg exit
+(they run without the lock or the control socket and say so), and zwall doesn't talk to a stranger's "zbg".
+D-Bus signals are accepted only from the service itself (NetworkManager, bluetoothd), by its unique bus name.
+Frame buffers are created with `MFD_NOEXEC_SEAL` (Linux ≥ 6.3, otherwise as before): this memory can never be made executable,
+and on kernels 6.3–6.5 with `vm.memfd_noexec = 2` the panel would otherwise get no buffers at all.
 The image decoders check all bounds and limit sizes (up to 16384 px per side, 80 MP, files up to 128 MB);
 broken files and "bombs" give an error, not a buffer overrun; they have been through mutation fuzzing.
 
@@ -375,7 +413,7 @@ Check: `zig version` should print `0.16.0`. On ARM use `aarch64` instead of `x86
 
 ### 3. Clone
 
-The new version is on the `lite` branch; without `-b lite` you get `main` with the old version:
+`lite` is the only branch:
 
 ```sh
 git clone -b lite https://github.com/FalconBinary/netline.git ~/netline

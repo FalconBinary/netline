@@ -16,6 +16,7 @@ pub const Tag = struct { active: bool = false, urgent: bool = false, clients: u1
 
 pub const Mon = struct {
     used: bool = false,
+    seen: bool = false, // present in the snapshot being parsed
     name_buf: [64]u8 = undefined,
     name_len: usize = 0,
     tags: [MAX_TAGS]Tag = [_]Tag{.{}} ** MAX_TAGS,
@@ -43,7 +44,9 @@ pub fn disconnect() void {
     fd = -1;
 }
 
-/// Call when the socket is readable. true — the tag state changed.
+/// Call when the socket is readable. true — a new tag state arrived.
+/// Every `watch all-tags` line is a full snapshot of all monitors (mango ipc_notify_all_tags →
+/// build_all_tags_response), so of a burst of lines only the last complete one is parsed.
 pub fn onReadable() bool {
     if (len == buf.len) len = 0; // the line did not fit — drop it
     const n = sys.read(fd, buf[len..]) catch 0;
@@ -52,15 +55,13 @@ pub fn onReadable() bool {
         return false;
     }
     len += n;
-    var changed = false;
-    while (std.mem.indexOfScalar(u8, buf[0..len], '\n')) |nl| {
-        parse(buf[0..nl]);
-        changed = true;
-        const rest = len - (nl + 1);
-        std.mem.copyForwards(u8, buf[0..rest], buf[nl + 1 .. len]);
-        len = rest;
-    }
-    return changed;
+    const nl = std.mem.lastIndexOfScalar(u8, buf[0..len], '\n') orelse return false;
+    const start = if (std.mem.lastIndexOfScalar(u8, buf[0..nl], '\n')) |p| p + 1 else 0;
+    parse(buf[start..nl]);
+    const rest = len - (nl + 1);
+    std.mem.copyForwards(u8, buf[0..rest], buf[nl + 1 .. len]);
+    len = rest;
+    return true;
 }
 
 pub fn find(name: []const u8) ?*const Mon {
@@ -73,12 +74,15 @@ pub fn find(name: []const u8) ?*const Mon {
 
 fn slotFor(name: []const u8) ?*Mon {
     for (&mons) |*m| {
-        if (m.used and std.mem.eql(u8, m.name(), name)) return m;
+        if (m.used and std.mem.eql(u8, m.name(), name)) {
+            m.seen = true;
+            return m;
+        }
     }
     for (&mons) |*m| {
         if (!m.used) {
             const k = @min(name.len, m.name_buf.len);
-            m.* = .{ .used = true, .name_len = k };
+            m.* = .{ .used = true, .seen = true, .name_len = k };
             @memcpy(m.name_buf[0..k], name[0..k]);
             return m;
         }
@@ -150,6 +154,15 @@ fn parse(line: []const u8) void {
     var mon: ?*Mon = null;
     var cur = Tag{};
     var cur_index: i64 = -1;
+    var snapshot = false;
+    for (&mons) |*m| m.seen = false;
+    // monitors missing from a full snapshot are gone (unplugged): free their slots,
+    // otherwise after a few replugs under new names there would be no room left
+    defer if (snapshot) {
+        for (&mons) |*m| {
+            if (m.used and !m.seen) m.* = .{};
+        }
+    };
     while (nextTok(line, &p)) |tok| {
         switch (tok.kind) {
             .str => {
@@ -158,6 +171,7 @@ fn parse(line: []const u8) void {
                 while (q < line.len and line[q] == ' ') q += 1;
                 if (q < line.len and line[q] == ':') {
                     key = tok.s;
+                    if (std.mem.eql(u8, key, "all_tags")) snapshot = true;
                     p = q + 1;
                     continue;
                 }

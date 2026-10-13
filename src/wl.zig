@@ -225,6 +225,25 @@ pub const Conn = struct {
         return .{ .obj = obj, .op = @truncate(hdr), .args = .{ .d = p[8..size] } };
     }
 
+    /// The opaque region of a surface (applied with its next commit): solid — the w×h rectangle
+    /// minus its corners rounded with radius r (the part of a rounded panel or card that is fully
+    /// covered), otherwise none. The compositor doesn't draw or blend what lies under an opaque region.
+    /// The region object gets no events, so it needs no entry in the program's object table.
+    pub noinline fn setOpaque(self: *Conn, compositor: u32, surface: u32, solid: bool, w: u32, h: u32, r: f32) void {
+        if (!solid) return self.send(surface, 4, .{@as(u32, 0)}); // set_opaque_region(null)
+        const region = self.newId();
+        self.send(compositor, 1, .{region}); // create_region
+        const k: u32 = @min(@as(u32, @intFromFloat(@ceil(@max(r, 0)))), @min(w, h) / 2);
+        const iw: i32 = @intCast(w);
+        const ih: i32 = @intCast(h);
+        const ik: i32 = @intCast(k);
+        // wl_region.add: the full-height middle and, between the corners, the full-width band
+        self.send(region, 1, .{ ik, @as(i32, 0), iw - 2 * ik, ih });
+        if (k > 0 and ih > 2 * ik) self.send(region, 1, .{ @as(i32, 0), ik, iw, ih - 2 * ik });
+        self.send(surface, 4, .{region}); // set_opaque_region
+        self.send(region, 0, .{}); // wl_region.destroy: the surface keeps a copy
+    }
+
     fn fatal() noreturn {
         sys.log("error writing to the Wayland socket", .{});
         sys.exit(1);

@@ -93,13 +93,18 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
     var lock_buf: [48]u8 = undefined;
     const lock = std.fmt.bufPrint(&lock_buf, "zbg-{d}", .{my_uid}) catch "zbg";
-    if (sys.connectAbstract(lock)) {
-        sys.log("zbg is already running", .{});
-        sys.exit(0);
+    if (sys.abstractOwner(lock)) |uid| {
+        if (uid == my_uid) {
+            sys.log("zbg is already running", .{});
+            sys.exit(0);
+        }
+        // anyone can take an abstract name: that mustn't leave the desktop without a wallpaper
+        sys.say(&.{ "the control socket ", lock, " is held by another user — the wallpaper is shown, zwall can't switch it" });
     }
-    listen_fd = sys.listenAbstract(lock) catch {
+    // without the socket the wallpaper is still shown (from the saved choice), only switching it doesn't work
+    listen_fd = sys.listenAbstract(lock) catch blk: {
         sys.log("could not open the control socket", .{});
-        sys.exit(1);
+        break :blk -1;
     };
     dir = expandHome(&dir_buf, cfg.wallpaper_dir) orelse {
         sys.log("$HOME is not set", .{});
@@ -139,12 +144,14 @@ pub fn main(init: std.process.Init.Minimal) void {
         fds[1] = .{ .fd = listen_fd, .events = sys.POLLIN };
         fds[2] = .{ .fd = theme.inotify_fd, .events = sys.POLLIN };
         for (clients, 0..) |c, i| fds[3 + i] = .{ .fd = c.fd, .events = sys.POLLIN };
-        _ = sys.poll(&fds, -1) catch continue;
+        _ = sys.poll(&fds, theme.timeout()) catch continue;
         if (fds[0].revents != 0) readWayland();
         if (fds[1].revents != 0) acceptClient();
-        if (fds[2].revents != 0 and theme.inotify_fd >= 0) {
-            if (theme.onInotify()) markAll(); // the desktop color changed
-        }
+        if (fds[2].revents != 0 and theme.inotify_fd >= 0) theme.onInotify();
+        // the wallpaper is decoded again (a fraction of a second of CPU) only if the desktop color changed:
+        // editing the panel or menu colors doesn't touch zbg
+        const desktop = theme.t.desktop;
+        if (theme.settle() and theme.t.desktop != desktop) markAll();
         for (&clients, 0..) |*c, i| {
             if (fds[3 + i].revents != 0 and c.fd >= 0) readClient(c);
         }
@@ -510,6 +517,7 @@ fn paint(i: u8, pic: ?*const img.Image) void {
     const pw = ps[0];
     const ph = ps[1];
     const size: usize = @as(usize, pw) * ph * 4;
+    if (size > std.math.maxInt(i32)) return; // wl_shm takes the pool size as i32
     const fd = sys.memfd("zbg") catch return;
     defer sys.close(fd);
     sys.ftruncate(fd, size) catch return;

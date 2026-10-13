@@ -147,9 +147,9 @@ fn scanCli() noreturn {
 /// ", Apple" etc. by the manufacturer code from the BLE advertisement.
 fn makerLabel(id: u16, buf: []u8) []const u8 {
     const known = [_]struct { u16, []const u8 }{
-        .{ 0x004c, "Apple" },     .{ 0x0006, "Microsoft" }, .{ 0x0075, "Samsung" },
-        .{ 0x00e0, "Google" },    .{ 0x038f, "Xiaomi" },    .{ 0x027d, "Huawei" },
-        .{ 0x012d, "Sony" },      .{ 0x009e, "Bose" },      .{ 0x0087, "Garmin" },
+        .{ 0x004c, "Apple" },  .{ 0x0006, "Microsoft" }, .{ 0x0075, "Samsung" },
+        .{ 0x00e0, "Google" }, .{ 0x038f, "Xiaomi" },    .{ 0x027d, "Huawei" },
+        .{ 0x012d, "Sony" },   .{ 0x009e, "Bose" },      .{ 0x0087, "Garmin" },
     };
     if (id == 0xffff) return "";
     for (known) |k| if (k[0] == id) return std.fmt.bufPrint(buf, ", {s}", .{k[1]}) catch "";
