@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Общий каркас меню zpanel (zrun, zwifi, zbt, zwall, zpower, zcal).
+//! Shared menu framework for netline (zrun, zwifi, zbt, zwall, zpower, zcal).
 //!
-//! Карточка по центру экрана поверх лёгкого затемнения, указатель, клавиатура (XKB, повтор
-//! клавиш), буфер обмена, поля ввода, кнопки, тема с перезагрузкой на лету, песочница.
-//! Каждое меню описывает только свои экраны: раскладку виджетов, рисование и реакцию на них.
-//! Повторный запуск того же меню закрывает уже открытое.
+//! A card centered on screen over a light dimming, pointer, keyboard (XKB, key
+//! repeat), clipboard, input fields, buttons, a live-reloading theme, the sandbox.
+//! Each menu describes only its own screens: the widget layout, drawing and reactions.
+//! Launching the same menu again closes the one already open.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -19,16 +19,16 @@ const cfg = @import("config.zig");
 const xkb = @import("xkb.zig");
 const sandbox = @import("sandbox.zig");
 
-// ================================================================= описание меню
+// ================================================================= menu description
 
-/// Как виджет ведёт себя с клавиатурой и курсором.
+/// How a widget behaves with the keyboard and pointer.
 pub const Kind = enum(u8) {
-    plain, // только клик
-    row, // строка списка: выбор стрелками ↑/↓ делает само меню
-    button, // фокус Tab, Enter/Пробел — нажатие
-    field, // поле ввода
-    select, // выбор из вариантов: ←/→/Пробел
-    toggle, // переключатель: только клик
+    plain, // click only
+    row, // list row: the menu itself handles ↑/↓ selection
+    button, // Tab focus, Enter/Space presses
+    field, // input field
+    select, // choice among options: ←/→/Space
+    toggle, // switch: click only
 };
 
 pub const Widget = struct { id: u8, idx: u16 = 0, kind: Kind = .plain, x: f32, y: f32, w: f32, h: f32 };
@@ -40,35 +40,35 @@ pub const App = struct {
     height: u32,
     layout: *const fn () void,
     paint: *const fn (cv: *draw.Canvas) void,
-    /// клик или Enter по виджету
+    /// click or Enter on a widget
     activate: *const fn (w: Widget, right: bool) void,
     /// Esc
     back: *const fn () void,
-    /// Enter, когда в фокусе поле ввода (или ничего)
+    /// Enter while an input field (or nothing) has focus
     submit: ?*const fn () void = null,
-    /// клавиша раньше общей обработки; true — обработано
+    /// a key before the shared handling; true — handled
     key: ?*const fn (k: Key) bool = null,
-    /// колёсико над карточкой: +1 вниз, -1 вверх
+    /// wheel over the card: +1 down, -1 up
     scroll: ?*const fn (dir: i32) void = null,
-    /// таймер, взведённый через setTimer
+    /// a timer armed via setTimer
     tick: ?*const fn () void = null,
-    /// поле ввода по индексу виджета-поля
+    /// input field by the field widget's index
     field: ?*const fn (idx: u16) ?*Field = null,
-    /// выбор в select: ←/→ или клик (back = назад по списку)
+    /// choice in a select: ←/→ or click (back = backwards through the list)
     cycle: ?*const fn (idx: u16, back: bool) void = null,
-    /// дополнительный дескриптор в цикле событий (например, D-Bus)
+    /// an extra descriptor in the event loop (e.g. D-Bus)
     extra_fd: ?*const fn () i32 = null,
     on_extra: ?*const fn () void = null,
-    /// после включения песочницы, перед первым кадром
+    /// after the sandbox is on, before the first frame
     start: ?*const fn () void = null,
-    /// перед выходом: затереть секреты
+    /// before exiting: wipe secrets
     cleanup: ?*const fn () void = null,
-    /// подсветка под курсором рисуется только внутри своего виджета — при движении мыши
-    /// перерисовываются лишь строки старого и нового виджета, а не вся карточка
+    /// the hover highlight is drawn only inside its own widget — when the mouse moves
+    /// only the rows of the old and new widget are redrawn, not the whole card
     hover_local: bool = false,
 };
 
-// ================================================================= поля ввода
+// ================================================================= input fields
 
 pub const Field = struct {
     buf: [256]u8 = undefined,
@@ -85,7 +85,7 @@ pub const Field = struct {
     }
 };
 
-// ================================================================= состояние
+// ================================================================= state
 
 const OKind = enum(u8) {
     none,
@@ -132,7 +132,7 @@ var cursor_mgr: u32 = 0;
 var cursor_dev: u32 = 0;
 var sync_done = false;
 
-// буфер обмена: предложения данных создаёт сервер (id >= 0xff000000)
+// clipboard: data offers are created by the server (id >= 0xff000000)
 const SRV_BASE: u32 = 0xff000000;
 const Offer = struct { id: u32 = 0, mime: u8 = 0 };
 var offers: [16]Offer = [_]Offer{.{}} ** 16;
@@ -159,7 +159,7 @@ const Surf = struct {
 };
 
 var card: Surf = .{}; // owner 0
-var back: Surf = .{}; // owner 1 — затемнение, ловит клики вокруг карточки
+var back: Surf = .{}; // owner 1 — the dimming, catches clicks around the card
 var back_buffer: u32 = 0;
 var back_viewport: u32 = 0;
 
@@ -183,23 +183,23 @@ var lock_fd: i32 = -1;
 var name_buf: [32]u8 = undefined;
 var name: []const u8 = "zmenu";
 var app: App = undefined;
-var my_uid: u32 = 0; // запоминаем до песочницы: getuid в ней запрещён
+var my_uid: u32 = 0; // remembered before the sandbox: getuid is forbidden inside it
 
 pub var widgets: [64]Widget = undefined;
 pub var nwid: usize = 0;
 pub var focus: Ref = .{};
 pub var hover: Ref = .{};
-/// строку выбрали стрелками — подсвечиваем её, а не строку под мышью
+/// a row was selected with the arrows — highlight it, not the row under the mouse
 pub var kbd_nav = false;
 
-// ================================================================= запуск
+// ================================================================= startup
 
-/// Первая часть запуска: окружение, «повторный запуск закрывает», шрифт, тема.
-/// После неё меню подключается к своим службам (D-Bus и т.п.), затем вызывает run().
+/// First part of startup: environment, "launching again closes", font, theme.
+/// After it the menu connects to its services (D-Bus etc.), then calls run().
 pub fn begin(menu_name: []const u8) void {
     my_uid = @intCast(sys.getuid());
     if (my_uid == 0) {
-        sys.log("запуск от root запрещён", .{});
+        sys.log("running as root is not allowed", .{});
         sys.exit(1);
     }
     const k = @min(menu_name.len, name_buf.len);
@@ -211,31 +211,31 @@ pub fn begin(menu_name: []const u8) void {
     lock_fd = sys.listenAbstract(lock_name) catch -1;
 
     if (!ttf.load(&cfg.font_paths)) {
-        sys.log("не найден шрифт TrueType — укажите путь в font_paths (config.zig)", .{});
+        sys.log("no TrueType font found — set a path in font_paths (config.zig)", .{});
         sys.exit(1);
     }
     theme.init();
 }
 
 pub const Access = struct {
-    /// что ещё разрешить читать
+    /// what else to allow reading
     read: []const [:0]const u8 = &.{},
-    /// куда разрешить писать (папки)
+    /// where to allow writing (folders)
     write: []const [:0]const u8 = &.{},
 };
 
 pub const Sandbox = struct {
-    /// дополнительные системные вызовы
+    /// extra system calls
     extra: []const linux.SYS = &.{},
-    /// разрешить создавать и писать файлы (только в Access.write — это решает Landlock)
+    /// allow creating and writing files (only in Access.write — Landlock decides that)
     write_files: bool = false,
 };
 
-/// Вторая часть: окно, песочница, цикл событий.
+/// Second part: window, sandbox, event loop.
 pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
     app = a;
     conn.connect() catch {
-        sys.log("не удалось подключиться к Wayland", .{});
+        sys.log("could not connect to Wayland", .{});
         sys.exit(1);
     };
     kinds[1] = .display;
@@ -243,7 +243,7 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
     conn.send(1, 1, .{registry});
     roundtrip();
     if (compositor == 0 or shm == 0 or layer_shell == 0) {
-        sys.log("композитор не поддерживает wlr-layer-shell", .{});
+        sys.log("the compositor does not support wlr-layer-shell", .{});
         sys.exit(1);
     }
     if (ddm != 0 and seat != 0) {
@@ -266,20 +266,20 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
             paths[n] = p;
             n += 1;
         }
-        // pipe2 — вставка из буфера обмена; accept4/getsockopt — проверка, кто нас закрывает
+        // pipe2 — clipboard paste; accept4/getsockopt — checking who is closing us
         sandbox.apply(paths[0..n], access.write, .{
             .extra = &([_]linux.SYS{ .pipe2, .accept4, .getsockopt } ++ sb.extra[0..sb.extra.len].*),
             .write_files = sb.write_files,
         });
     }
 
-    sys.tracef("окно и песочница готовы", .{});
+    sys.tracef("window and sandbox ready", .{});
     if (app.start) |f| f();
     redraw();
 
     while (true) {
         if (card.configured and card.dirty) render();
-        conn.flush() catch fatal("запись в сокет Wayland");
+        conn.flush() catch fatal("writing to the Wayland socket");
         const xfd: i32 = if (app.extra_fd) |f| f() else -1;
         var fds = [6]sys.PollFd{
             .{ .fd = conn.fd, .events = sys.POLLIN },
@@ -303,7 +303,7 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
             if (repeat_key != 0) keyPress(repeat_key);
         }
         if (fds[3].revents != 0) {
-            // нас закрывает повторный запуск — но только от того же пользователя
+            // a repeated launch is closing us — but only from the same user
             if (sys.acceptPeerUid(lock_fd)) |uid| {
                 if (uid == my_uid) quit();
             }
@@ -323,7 +323,7 @@ pub fn quit() noreturn {
 }
 
 fn fatal(what: []const u8) noreturn {
-    sys.log("ошибка: {s}", .{what});
+    sys.log("error: {s}", .{what});
     sys.exit(1);
 }
 
@@ -332,8 +332,8 @@ pub fn redraw() void {
     full_dirty = true;
 }
 
-/// Перерисовать только полосу карточки y..y+h (логические пиксели): анимация точек,
-/// подсветка строки. Остальное берётся из прошлого кадра как есть.
+/// Redraw only the card band y..y+h (logical pixels): dots animation,
+/// row highlight. The rest is taken from the previous frame as is.
 pub fn redrawArea(y: f32, h: f32) void {
     card.dirty = true;
     if (full_dirty) return;
@@ -342,17 +342,17 @@ pub fn redrawArea(y: f32, h: f32) void {
     } else band = .{ y, y + h };
 }
 
-/// Перерисовать строку текста с базовой линией baseline и кеглем size (анимация «Поиск...»).
+/// Redraw a text line with baseline baseline and size size (the "Searching..." animation).
 pub fn redrawText(baseline: f32, size: f32) void {
     redrawArea(baseline - size - 2, size * 1.5 + 4);
 }
 
-/// просили перерисовать всю карточку
+/// a redraw of the whole card was requested
 var full_dirty = true;
-/// иначе — только эту полосу (логические пиксели)
+/// otherwise — only this band (logical pixels)
 var band: ?[2]f32 = null;
 
-/// Таймер меню: первое срабатывание через first_ms, затем каждые every_ms (0, 0 — выключить).
+/// Menu timer: first expiry after first_ms, then every every_ms (0, 0 — off).
 pub fn setTimer(first_ms: u32, every_ms: u32) void {
     sys.timerfdArmMs(app_timer, first_ms, every_ms);
 }
@@ -374,13 +374,13 @@ fn create(kind: OKind, own: u8) u32 {
 fn roundtrip() void {
     const cb = create(.callback, 0);
     conn.send(1, 0, .{cb});
-    conn.flush() catch fatal("запись в сокет Wayland");
+    conn.flush() catch fatal("writing to the Wayland socket");
     sync_done = false;
     while (!sync_done) readWayland();
 }
 
 fn readWayland() void {
-    const alive = conn.fill() catch fatal("чтение из сокета Wayland");
+    const alive = conn.fill() catch fatal("reading from the Wayland socket");
     if (!alive) quit();
     while (conn.next()) |ev| dispatch(ev);
 }
@@ -424,7 +424,7 @@ fn dispatch(ev: wl.Event) void {
             0 => {
                 const obj = a.uint();
                 const code = a.uint();
-                sys.log("ошибка протокола (объект {d}, код {d}): {s}", .{ obj, code, a.string() });
+                sys.log("protocol error (object {d}, code {d}): {s}", .{ obj, code, a.string() });
                 sys.exit(1);
             },
             1 => {
@@ -471,7 +471,7 @@ fn onSeatCaps(caps: u32) void {
             conn.send(cursor_mgr, 1, .{ cursor_dev, pointer });
         }
     } else if (caps & 1 == 0 and pointer != 0) {
-        // мышь пропала (отключили): старый объект мёртв — отпускаем, когда вернётся, попросим новый
+        // the mouse is gone (unplugged): the old object is dead — release it, ask for a new one when it returns
         if (cursor_dev != 0) conn.send(cursor_dev, 0, .{});
         cursor_dev = 0;
         if (seat_ver >= 3) conn.send(pointer, 1, .{});
@@ -483,7 +483,7 @@ fn onSeatCaps(caps: u32) void {
         keyboard = create(.keyboard, 0);
         conn.send(seat, 1, .{keyboard});
     } else if (caps & 2 == 0 and keyboard != 0) {
-        // то же с клавиатурой: иначе после переподключения единственной клавиатуры меню глохнет
+        // same for the keyboard: otherwise after re-plugging the only keyboard the menu goes deaf
         if (seat_ver >= 3) conn.send(keyboard, 0, .{});
         keyboard = 0;
         stopRepeat();
@@ -503,27 +503,27 @@ fn onLayer(own: u8, op: u16, a: *wl.Args) void {
             s.configured = true;
             if (own == 0) s.dirty = true else paintBackdrop();
         },
-        1 => quit(), // композитор закрыл наш слой
+        1 => quit(), // the compositor closed our layer
         else => {},
     }
 }
 
-// ---------------------------------------------------------------- поверхности
+// ---------------------------------------------------------------- surfaces
 
 fn setupCard() void {
     card.surface = create(.surface, 0);
     conn.send(compositor, 0, .{card.surface});
     card.layer = create(.layer_surface, 0);
-    // get_layer_surface(id, surface, output = любой, layer = overlay, namespace)
+    // get_layer_surface(id, surface, output = any, layer = overlay, namespace)
     conn.send(layer_shell, 0, .{ card.layer, card.surface, @as(u32, 0), @as(u32, 3), wl.str(name) });
     conn.send(card.layer, 0, .{ app.width, app.height }); // set_size
-    conn.send(card.layer, 1, .{@as(u32, 0)}); // без якорей — по центру
-    conn.send(card.layer, 4, .{@as(u32, 1)}); // клавиатура: exclusive
+    conn.send(card.layer, 1, .{@as(u32, 0)}); // no anchors — centered
+    conn.send(card.layer, 4, .{@as(u32, 1)}); // keyboard: exclusive
     conn.send(card.surface, 6, .{});
 }
 
 fn setupBackdrop() void {
-    if (viewporter == 0) return; // без масштабирования буфера затемнение не делаем
+    if (viewporter == 0) return; // without buffer scaling there is no dimming
     back.surface = create(.surface, 1);
     conn.send(compositor, 0, .{back.surface});
     back.layer = create(.layer_surface, 1);
@@ -531,14 +531,14 @@ fn setupBackdrop() void {
     const ns = std.fmt.bufPrint(&ns_buf, "{s}-backdrop", .{name}) catch "zmenu-backdrop";
     conn.send(layer_shell, 0, .{ back.layer, back.surface, @as(u32, 0), @as(u32, 3), wl.str(ns) });
     conn.send(back.layer, 0, .{ @as(u32, 0), @as(u32, 0) });
-    conn.send(back.layer, 1, .{@as(u32, 1 | 2 | 4 | 8)}); // на весь экран
-    conn.send(back.layer, 2, .{@as(i32, -1)}); // поверх панелей тоже
+    conn.send(back.layer, 1, .{@as(u32, 1 | 2 | 4 | 8)}); // full screen
+    conn.send(back.layer, 2, .{@as(i32, -1)}); // over the panels too
     back_viewport = create(.viewport, 1);
     conn.send(viewporter, 1, .{ back_viewport, back.surface });
     conn.send(back.surface, 6, .{});
 }
 
-/// Затемнение — один пиксель, растянутый на весь экран: память и GPU почти не тратятся.
+/// The dimming is one pixel stretched over the whole screen: almost no memory or GPU.
 fn paintBackdrop() void {
     if (!back.configured or back_viewport == 0) return;
     const c = theme.t.menu_backdrop;
@@ -563,7 +563,7 @@ fn paintBackdrop() void {
         sys.munmap(m, 4);
         const pool = create(.pool, 2);
         conn.send(shm, 0, .{ pool, wl.Fd{ .fd = fd }, @as(i32, 4) });
-        conn.flush() catch fatal("запись в сокет Wayland");
+        conn.flush() catch fatal("writing to the Wayland socket");
         back_buffer = create(.buffer, 2);
         conn.send(pool, 0, .{ back_buffer, @as(i32, 0), @as(i32, 1), @as(i32, 1), @as(i32, 4), @as(u32, 0) });
         conn.send(pool, 1, .{});
@@ -598,7 +598,7 @@ fn ensureBuffers() bool {
     card.ph = ph;
     card.pool = create(.pool, 0);
     conn.send(shm, 0, .{ card.pool, wl.Fd{ .fd = fd }, @as(i32, @intCast(size * 2)) });
-    conn.flush() catch fatal("запись в сокет Wayland");
+    conn.flush() catch fatal("writing to the Wayland socket");
     for (&card.bufs, 0..) |*bf, k| {
         bf.* = .{ .id = create(.buffer, @intCast(k)) };
         conn.send(card.pool, 0, .{ bf.id, @as(i32, @intCast(k * size)), @as(i32, @intCast(pw)), @as(i32, @intCast(ph)), @as(i32, @intCast(stride)), @as(u32, 0) });
@@ -620,12 +620,12 @@ fn render() void {
     if (card.bufs[k].busy) return;
     const t0 = sys.traceStart();
     var cv: draw.Canvas = undefined;
-    defer if (sys.tracing()) sys.tracef("кадр {d}: {d} мкс, строки {d}..{d}", .{ frames, sys.traceSince(t0), @max(0, cv.top), @min(cv.h, cv.bot) });
+    defer if (sys.tracing()) sys.tracef("frame {d}: {d} µs, rows {d}..{d}", .{ frames, sys.traceSince(t0), @max(0, cv.top), @min(cv.h, cv.bot) });
     app.layout();
     cv = draw.Canvas{ .px = pixels(k), .w = @intCast(card.pw), .h = @intCast(card.ph) };
     S = @floatFromInt(card.scale);
     if (!full_dirty and card.last != null) {
-        // частичный кадр: прошлый кадр как основа, рисуем только полосу
+        // partial frame: the previous frame as the base, draw only the band
         const b = band orelse .{ 0, 0 };
         @memcpy(cv.px, pixels(card.last.?));
         cv.top = @intFromFloat(@max(0, @floor(b[0] * S)));
@@ -641,7 +641,7 @@ fn render() void {
     rrect(&cv, 0, 0, W(), H(), cfg.menu_radius, theme.t.menu_background);
     outline(&cv, 0.5, 0.5, W() - 1, H() - 1, cfg.menu_radius, theme.t.menu_border, 1);
     app.paint(&cv);
-    // отправляем только изменившуюся полосу строк (в частичном кадре меняться могла только она)
+    // send only the changed band of rows (in a partial frame only it could change)
     var y0: u32 = @intCast(@max(0, cv.top));
     var y1: u32 = @intCast(@min(cv.h, cv.bot));
     if (card.last) |l| {
@@ -668,7 +668,7 @@ fn render() void {
     frames += 1;
 }
 
-// ================================================================= виджеты
+// ================================================================= widgets
 
 pub fn add(id: anytype, idx: usize, kind: Kind, x: f32, y: f32, w: f32, h: f32) void {
     if (nwid == widgets.len) return;
@@ -688,7 +688,7 @@ fn focusable(w: Widget) bool {
     return w.kind == .button or w.kind == .field or w.kind == .select;
 }
 
-/// После смены экрана: сбросить фокус и поставить его на первое поле (или первую кнопку).
+/// After a screen change: reset focus and put it on the first field (or first button).
 pub fn resetFocus(prefer_button: bool) void {
     focus = .{};
     hover = .{};
@@ -710,7 +710,7 @@ fn fieldOf(idx: u16) ?*Field {
     return if (app.field) |f| f(idx) else null;
 }
 
-/// Навигация по списку строк (↑/↓, колёсико).
+/// Navigation through a list of rows (↑/↓, wheel).
 pub const List = struct {
     n: usize = 0,
     sel: usize = 0,
@@ -738,14 +738,14 @@ pub const List = struct {
         redraw();
         updateHover();
     }
-    /// Подсвечивать ли строку i (мышь или выбор стрелками).
+    /// Whether to highlight row i (mouse or arrow selection).
     pub fn lit(l: *const List, w: Widget) bool {
         if (kbd_nav) return w.idx == l.sel;
         return isHover(w);
     }
 };
 
-// ================================================================= указатель
+// ================================================================= pointer
 
 fn setCursor(shape: u32) void {
     if (cursor_dev == 0 or shape == cursor_shape) return;
@@ -803,7 +803,7 @@ fn onPointer(op: u16, a: *wl.Args) void {
 fn hitAt(x: f32, y: f32) ?Widget {
     app.layout();
     var i = nwid;
-    while (i > 0) { // последние добавленные — сверху (кнопка «⋯» поверх строки)
+    while (i > 0) { // the last added are on top (the "⋯" button over a row)
         i -= 1;
         const w = widgets[i];
         if (x >= w.x and x < w.x + w.w and y >= w.y and y < w.y + w.h) return w;
@@ -821,7 +821,7 @@ fn setHover(r: Ref) void {
     redraw();
 }
 
-/// Пометить полосу виджета к перерисовке (с запасом на рамку фокуса). false — виджета нет в раскладке.
+/// Mark a widget's band for redraw (with room for the focus ring). false — the widget isn't in the layout.
 fn areaOf(r: Ref) bool {
     if (r.id == 0) return true;
     for (widgets[0..nwid]) |w| {
@@ -845,12 +845,12 @@ fn updateHover() void {
 }
 
 fn onClick(btn: u32) void {
-    if (!ptr_on_card) return quit(); // клик мимо карточки
+    if (!ptr_on_card) return quit(); // a click outside the card
     const w = hitAt(ptr_x, ptr_y) orelse return;
     const right = btn == 0x111;
     if (focusable(w)) focus = .{ .id = w.id, .idx = w.idx };
     if (w.kind == .field) {
-        if (fieldOf(w.idx)) |f| f.caret = f.len; // курсор в конец поля
+        if (fieldOf(w.idx)) |f| f.caret = f.len; // caret to the end of the field
     } else if (w.kind == .select) {
         if (app.cycle) |f| f(w.idx, right);
     } else {
@@ -859,7 +859,7 @@ fn onClick(btn: u32) void {
     redraw();
 }
 
-// ================================================================= клавиатура
+// ================================================================= keyboard
 
 pub const K_ESC = 1;
 pub const K_BACKSPACE = 14;
@@ -1022,7 +1022,7 @@ fn enter() void {
     if (app.submit) |f| f();
 }
 
-// ---------------------------------------------------------------- редактирование поля
+// ---------------------------------------------------------------- field editing
 
 fn insertCp(f: *Field, cp: u21) void {
     var tmp: [4]u8 = undefined;
@@ -1073,7 +1073,7 @@ fn delete(f: *Field) void {
     removeRange(f, f.caret, nextCp(f, f.caret));
 }
 
-/// Вставка из буфера обмена (одна строка, управляющие символы отбрасываются).
+/// Paste from the clipboard (one line, control characters are dropped).
 fn paste(f: *Field) void {
     if (selection == 0) return;
     var mime: u8 = 0;
@@ -1083,7 +1083,7 @@ fn paste(f: *Field) void {
     if (mime == 0) return;
     const p = sys.pipe() catch return;
     conn.send(selection, 1, .{ wl.str(mimes[mime]), wl.Fd{ .fd = p[1] } }); // wl_data_offer.receive
-    conn.flush() catch fatal("запись в сокет Wayland");
+    conn.flush() catch fatal("writing to the Wayland socket");
     sys.close(p[1]);
     defer sys.close(p[0]);
     var buf: [512]u8 = undefined;
@@ -1116,7 +1116,7 @@ fn onDataDevice(op: u16, a: *wl.Args) void {
                     return;
                 }
             }
-            conn.send(id, 2, .{}); // некуда записать — сразу уничтожаем
+            conn.send(id, 2, .{}); // nowhere to write — destroy right away
         },
         5 => { // selection(offer | null)
             const id = a.uint();
@@ -1143,7 +1143,7 @@ fn onOffer(id: u32, op: u16, a: *wl.Args) void {
     }
 }
 
-// ================================================================= сообщение об ошибке
+// ================================================================= error message
 
 var msg_buf: [200]u8 = undefined;
 var msg_len: usize = 0;
@@ -1167,13 +1167,13 @@ pub fn paintMsg(cv: *draw.Canvas, y: f32) void {
     _ = wrap(cv, msg(), PAD, y, 13, theme.t.menu_error, W() - 2 * PAD, 17, false);
 }
 
-/// Текст с переносом по словам. Возвращает базовую линию после последней строки.
+/// Word-wrapped text. Returns the baseline after the last line.
 pub fn wrap(cv: *draw.Canvas, s: []const u8, x: f32, y: f32, size: f32, c: u32, max_w: f32, line_h: f32, center: bool) f32 {
     var rest = std.mem.trim(u8, s, " ");
     var base = y;
     var lines: u32 = 0;
     while (rest.len > 0 and lines < 6) : (lines += 1) {
-        // самый длинный префикс по границе слова, который влезает
+        // the longest prefix at a word boundary that fits
         var cut: usize = rest.len;
         if (textW(rest, size) > max_w) {
             cut = 0;
@@ -1184,7 +1184,7 @@ pub fn wrap(cv: *draw.Canvas, s: []const u8, x: f32, y: f32, size: f32, c: u32, 
                     cut = i;
                 }
             }
-            if (cut == 0) cut = rest.len; // одно длинное слово — обрежется при выводе
+            if (cut == 0) cut = rest.len; // one long word — it gets clipped on output
         }
         const line = rest[0..cut];
         if (center) centered(cv, line, x + max_w / 2, base, size, c) else _ = text(cv, line, x, base, size, c, x + max_w);
@@ -1194,7 +1194,7 @@ pub fn wrap(cv: *draw.Canvas, s: []const u8, x: f32, y: f32, size: f32, c: u32, 
     return base;
 }
 
-// ================================================================= рисование
+// ================================================================= drawing
 
 pub const PAD: f32 = 18;
 pub var S: f32 = 1;
@@ -1223,12 +1223,12 @@ pub fn outline(cv: *draw.Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32,
     cv.prims(&b, 0, 0, 1, px(width), c);
 }
 
-/// Текст: (x, baseline) в логических пикселях. Возвращает X после текста.
+/// Text: (x, baseline) in logical pixels. Returns X after the text.
 pub fn text(cv: *draw.Canvas, s: []const u8, x: f32, baseline: f32, size: f32, c: u32, max_x: f32) f32 {
     return ttf.drawText(cv, s, @round(px(x)), px(baseline), fpx(size), c, px(max_x)) / S;
 }
 
-/// Текст с подсветкой: байты, отмеченные в hl (по первому байту символа), — цветом hc.
+/// Highlighted text: bytes marked in hl (by a character's first byte) use color hc.
 pub fn textMarked(cv: *draw.Canvas, s: []const u8, x: f32, baseline: f32, size: f32, c: u32, hc: u32, max_x: f32, hl: *const [4]u64) f32 {
     var pen = @round(px(x));
     var i: usize = 0;
@@ -1250,7 +1250,7 @@ pub fn textW(s: []const u8, size: f32) f32 {
     return ttf.width(s, fpx(size)) / S;
 }
 
-/// Базовая линия, при которой текст размера size по центру полосы [y, y+h].
+/// The baseline at which text of size size is centered in the band [y, y+h].
 pub fn mid(y: f32, h: f32, size: f32) f32 {
     return y + h / 2 + size * 0.36;
 }
@@ -1259,7 +1259,7 @@ pub fn centered(cv: *draw.Canvas, s: []const u8, cx: f32, baseline: f32, size: f
     _ = text(cv, s, cx - textW(s, size) / 2, baseline, size, c, W());
 }
 
-/// Иконка из примитивов в сетке 16×16, размером size логических пикселей.
+/// An icon from primitives on a 16×16 grid, size logical pixels large.
 pub fn icon(cv: *draw.Canvas, prims: []const draw.Prim, x: f32, y: f32, size: f32, stroke: f32, c: u32) void {
     cv.icon(prims, @round(px(x)), @round(px(y)), px(size / 16), px(stroke), c);
 }
@@ -1300,7 +1300,7 @@ pub const ic_plus = [_]draw.Prim{
     .{ .seg = .{ .x0 = 3, .y0 = 8, .x1 = 13, .y1 = 8 } },
 };
 
-/// Заголовок экрана: (стрелка «назад») название и подзаголовок.
+/// Screen header: (a "back" arrow) title and subtitle.
 pub fn header(cv: *draw.Canvas, title: []const u8, sub: []const u8, with_back: bool) void {
     const t = &theme.t;
     const x: f32 = if (with_back) PAD + 26 else PAD;
@@ -1308,7 +1308,7 @@ pub fn header(cv: *draw.Canvas, title: []const u8, sub: []const u8, with_back: b
     if (sub.len > 0) _ = text(cv, sub, x, 56, 12, t.menu_muted, W() - PAD);
 }
 
-/// Стрелка «назад» в заголовке (виджет добавляет само меню).
+/// The "back" arrow in the header (the menu itself adds the widget).
 pub fn paintBack(cv: *draw.Canvas, w: Widget) void {
     if (isHover(w)) rrect(cv, w.x, w.y, w.w, w.h, 8, theme.t.menu_hover);
     icon(cv, &ic_back, w.x + 7, w.y + 7, 16, 2, theme.t.menu_text);
@@ -1346,8 +1346,8 @@ pub fn select(cv: *draw.Canvas, w: Widget, label: []const u8) void {
     icon(cv, &ic_chevron, w.x + w.w - 24, w.y + (w.h - 16) / 2, 16, 1.6, t.menu_muted);
 }
 
-/// Поле ввода: плейсхолдер, точки вместо секрета, курсор, прокрутка к курсору.
-/// right_pad — место справа под кнопку (например, «показать пароль»).
+/// Input field: placeholder, dots instead of a secret, caret, scrolling to the caret.
+/// right_pad — space on the right for a button (e.g. "show password").
 pub fn field(cv: *draw.Canvas, w: Widget, f: *const Field, placeholder: []const u8, hidden: bool, right_pad: f32) void {
     const t = &theme.t;
     const foc = isFocus(w);
@@ -1361,7 +1361,7 @@ pub fn field(cv: *draw.Canvas, w: Widget, f: *const Field, placeholder: []const 
         if (foc) rrect(cv, x0, w.y + 8, 1.5, w.h - 16, 0.5, t.menu_accent);
         return;
     }
-    // что показываем: текст или точки
+    // what to show: the text or dots
     var shown: [768]u8 = undefined;
     var slen: usize = 0;
     var caret_s: usize = 0;
@@ -1381,7 +1381,7 @@ pub fn field(cv: *draw.Canvas, w: Widget, f: *const Field, placeholder: []const 
         caret_s = f.caret;
     }
     const s = shown[0..slen];
-    // окно прокрутки: курсор всегда виден
+    // scroll window: the caret is always visible
     var start: usize = 0;
     while (start < caret_s and textW(s[start..caret_s], size) > avail) {
         start += 1;
@@ -1395,7 +1395,7 @@ pub fn field(cv: *draw.Canvas, w: Widget, f: *const Field, placeholder: []const 
     if (hidden) sys.secureZero(&shown);
 }
 
-/// Экран «готово»: кольцо с галочкой и подпись.
+/// The "done" screen: a ring with a check mark and a caption.
 pub fn paintDone(cv: *draw.Canvas, label: []const u8) void {
     const t = &theme.t;
     const r: f32 = 26;
@@ -1405,16 +1405,16 @@ pub fn paintDone(cv: *draw.Canvas, label: []const u8) void {
     centered(cv, label, W() / 2, H() / 2 + 30, 16, t.menu_text);
 }
 
-/// Анимированное «Подключение...» (n — номер тика).
+/// Animated "Connecting..." (n is the tick number).
 pub fn dots(base: []const u8, n: u32, buf: []u8) []const u8 {
-    const b = base[0..@min(base.len, buf.len)]; // длинная подпись не выйдет за буфер
+    const b = base[0..@min(base.len, buf.len)]; // a long caption won't overflow the buffer
     const len = @min(b.len + n % 4, buf.len);
     @memcpy(buf[0..b.len], b);
     @memset(buf[b.len..len], '.');
     return buf[0..len];
 }
 
-/// Полоса прокрутки списка справа.
+/// The list scroll bar on the right.
 pub fn scrollbar(cv: *draw.Canvas, l: *const List, top: f32, row_h: f32) void {
     if (l.n <= l.visible) return;
     const track = @as(f32, @floatFromInt(l.visible)) * row_h;

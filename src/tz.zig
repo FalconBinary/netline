@@ -1,26 +1,26 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Локальное время без libc: разбор /etc/localtime (TZif v1–v4) и POSIX-строки TZ
-//! из его хвоста (нужно для «тонких» tzdata, где переходы на будущее не записаны).
-//! Все смещения проверяются по длине файла; при неудачной перезагрузке остаются старые данные.
+//! Local time without libc: parses /etc/localtime (TZif v1–v4) and the POSIX TZ string
+//! in its footer (needed for "slim" tzdata, where future transitions are not stored).
+//! All offsets are checked against the file length; a failed reload keeps the old data.
 
 const std = @import("std");
 const sys = @import("sys.zig");
 
 const Rule = struct {
-    // тип даты: 'M' — Mm.w.d, 'J' — Jn (без 29 февраля), 'N' — n (с нуля, с 29 февраля)
+    // date kind: 'M' — Mm.w.d, 'J' — Jn (no Feb 29), 'N' — n (zero-based, with Feb 29)
     kind: u8 = 'M',
     m: u8 = 0,
     w: u8 = 0,
     d: u8 = 0,
     n: u16 = 0,
-    time: i32 = 7200, // секунды от полуночи (местное время)
+    time: i32 = 7200, // seconds since midnight (local time)
 };
 
 const Posix = struct {
     valid: bool = false,
-    std_off: i32 = 0, // смещение от UTC, сек (уже с «нормальным» знаком)
+    std_off: i32 = 0, // offset from UTC, seconds (already with the "normal" sign)
     has_dst: bool = false,
     dst_off: i32 = 0,
     start: Rule = .{},
@@ -42,7 +42,7 @@ var cur: State = .{};
 var active_buf: [64 * 1024]u8 = undefined;
 var scratch: [64 * 1024]u8 = undefined;
 var path_buf: [512]u8 = undefined;
-/// Путь к файлу зоны, который читается (нужен для правил песочницы).
+/// Path of the zone file being read (needed for sandbox rules).
 pub var path: [:0]const u8 = "/etc/localtime";
 var loaded = false;
 
@@ -59,7 +59,7 @@ pub fn load() void {
         if (sys.readFile(path, &scratch)) |d| {
             if (parseTzif(d, &st)) return commit(d, st);
         }
-        // возможно, это сама POSIX-строка вида "CET-1CEST,M3.5.0,M10.5.0/3"
+        // maybe this is the POSIX string itself, like "CET-1CEST,M3.5.0,M10.5.0/3"
         const px = parsePosix(tz);
         if (px.valid) cur = .{ .posix = px };
         return;
@@ -105,7 +105,7 @@ fn parseTzif(d: []const u8, st: *State) bool {
     var hdr: usize = 0;
     st.tsize = 4;
     if (version >= '2') {
-        // пропускаем блок v1 и берём 64-битный блок v2+
+        // skip the v1 block and take the 64-bit v2+ block
         hdr = 44 + blockSize(cnt, 4);
         cnt = readCounts(d, hdr) orelse return false;
         st.tsize = 8;
@@ -118,9 +118,9 @@ fn parseTzif(d: []const u8, st: *State) bool {
     st.times_off = hdr + 44;
     st.idx_off = st.times_off + cnt.timecnt * st.tsize;
     st.types_off = st.idx_off + cnt.timecnt;
-    // индексы типов должны указывать на существующие типы
+    // type indices must point at existing types
     for (d[st.idx_off..st.types_off]) |ti| if (ti >= cnt.typecnt) return false;
-    // хвост: "\n<POSIX TZ>\n"
+    // footer: "\n<POSIX TZ>\n"
     if (version >= '2' and end + 1 < d.len and d[end] == '\n') {
         const rest = d[end + 1 ..];
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
@@ -140,7 +140,7 @@ fn typeOffset(t: usize) i32 {
     return @bitCast(be32(cur.data, cur.types_off + t * 6));
 }
 
-/// Смещение местного времени от UTC (в секундах) в момент `t`.
+/// Offset of local time from UTC (in seconds) at moment `t`.
 pub fn offsetAt(t: i64) i32 {
     if (!loaded) load();
     if (cur.typecnt > 0) {
@@ -149,7 +149,7 @@ pub fn offsetAt(t: i64) i32 {
             return typeOffset(0);
         }
         if (t >= transition(cur.timecnt - 1) and cur.posix.valid) return posixOffset(t);
-        // двоичный поиск последнего перехода <= t
+        // binary search for the last transition <= t
         var lo: usize = 0;
         var hi: usize = cur.timecnt;
         while (hi - lo > 1) {
@@ -162,9 +162,9 @@ pub fn offsetAt(t: i64) i32 {
     return 0;
 }
 
-// ---------------------------------------------------------------- календарь
+// ---------------------------------------------------------------- calendar
 
-/// Дни от 1970-01-01 (алгоритм Х. Хиннанта).
+/// Days since 1970-01-01 (H. Hinnant's algorithm).
 pub fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
     const y = if (m <= 2) y0 - 1 else y0;
     const era = @divFloor(y, 400);
@@ -199,7 +199,7 @@ fn daysInMonth(y: i64, m: u32) u32 {
     return t[m - 1];
 }
 
-/// Момент (в «локальных секундах» от эпохи) срабатывания правила в году y.
+/// The moment (in "local seconds" since the epoch) a rule fires in year y.
 fn ruleTime(r: Rule, y: i64) i64 {
     const jan1 = daysFromCivil(y, 1, 1);
     var day: i64 = 0;
@@ -211,7 +211,7 @@ fn ruleTime(r: Rule, y: i64) i64 {
         'N' => day = jan1 + r.n,
         else => {
             const first = daysFromCivil(y, r.m, 1);
-            const wd: i64 = @mod(first + 4, 7); // 1970-01-01 — четверг
+            const wd: i64 = @mod(first + 4, 7); // 1970-01-01 was a Thursday
             var md: i64 = 1 + @mod(@as(i64, r.d) - wd + 7, 7) + (@as(i64, r.w) - 1) * 7;
             while (md > daysInMonth(y, r.m)) md -= 7;
             day = first + md - 1;
@@ -224,7 +224,7 @@ fn posixOffset(t: i64) i32 {
     const px = cur.posix;
     if (!px.has_dst) return px.std_off;
     const y = civilFromDays(@divFloor(t + px.std_off, 86400)).year;
-    const start = ruleTime(px.start, y) - px.std_off; // в UTC
+    const start = ruleTime(px.start, y) - px.std_off; // in UTC
     const end = ruleTime(px.end, y) - px.dst_off;
     const dst = if (start < end) (t >= start and t < end) else !(t >= end and t < start);
     return if (dst) px.dst_off else px.std_off;
@@ -259,7 +259,7 @@ const P = struct {
         }
         return if (self.i == st) null else v;
     }
-    /// [+-]hh[:mm[:ss]] -> секунды (часы ограничены 167, как в POSIX)
+    /// [+-]hh[:mm[:ss]] -> seconds (hours capped at 167, as in POSIX)
     fn hms(self: *P) ?i32 {
         var sign: i32 = 1;
         if (self.peek() == '+') self.i += 1 else if (self.peek() == '-') {
@@ -318,7 +318,7 @@ fn parsePosix(s: []const u8) Posix {
     var p = P{ .s = s };
     var r = Posix{};
     if (!p.name()) return r;
-    r.std_off = -(p.hms() orelse return r); // в POSIX знак инвертирован
+    r.std_off = -(p.hms() orelse return r); // POSIX inverts the sign
     r.valid = true;
     if (p.peek() == 0) return r;
     if (!p.name()) return r;
@@ -335,7 +335,7 @@ fn parsePosix(s: []const u8) Posix {
         p.i += 1;
         r.end = p.rule() orelse return std_only;
     } else {
-        // правило по умолчанию (США)
+        // default rule (USA)
         r.start = .{ .m = 3, .w = 2, .d = 0 };
         r.end = .{ .m = 11, .w = 1, .d = 0 };
     }
@@ -359,6 +359,6 @@ pub fn now() Local {
         .day = date.day,
         .month = date.month,
         .year = date.year,
-        .wday = @intCast(@mod(days + 3, 7)), // 0 = понедельник; 1970-01-01 — четверг
+        .wday = @intCast(@mod(days + 3, 7)), // 0 = Monday; 1970-01-01 was a Thursday
     };
 }

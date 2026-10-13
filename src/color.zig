@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Разбор цветов вида "#RRGGBB" и "#RRGGBBAA" во внутренний формат 0xAARRGGBB.
-//! Одна и та же функция работает и при компиляции (config.zig), и при чтении файла темы.
+//! Parses colors like "#RRGGBB" and "#RRGGBBAA" into the internal 0xAARRGGBB format.
+//! The same function works at compile time (config.zig) and when reading the theme file.
 
 pub fn parse(s: []const u8) ?u32 {
     const h = if (s.len > 0 and s[0] == '#') s[1..] else s;
@@ -22,9 +22,9 @@ pub fn parse(s: []const u8) ?u32 {
     return (v >> 8) | ((v & 0xff) << 24);
 }
 
-/// Цвет, проверяемый при компиляции: опечатка в config.zig — ошибка сборки.
+/// A color checked at compile time: a typo in config.zig is a build error.
 pub fn hex(comptime s: []const u8) u32 {
-    return comptime parse(s) orelse @compileError("неверный цвет: " ++ s);
+    return comptime parse(s) orelse @compileError("invalid color: " ++ s);
 }
 
 pub fn alpha(c: u32) u8 {

@@ -1,30 +1,30 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Процесс-брокер — разделение привилегий.
+//! The broker process — privilege separation.
 //!
-//! Он отделяется (fork) самым первым, ещё до подключения к Wayland и до песочницы,
-//! и умеет ровно три вещи:
-//!   'C' <номер>   — запустить команду из вшитой при сборке таблицы (config.zig):
-//!                   простую («zwifi toggle») — сразу через execve, со спецсимволами
-//!                   shell (кавычки, |, ;, $ …) — через /bin/sh -c;
-//!   'D' <команда> — отправить в mango `dispatch` строго проверенного вида;
-//!   'W'           — подключиться к IPC mango и передать панели готовый сокет.
-//! Сама панель после этого живёт в песочнице без exec, fork, socket и connect:
-//! даже если её взломать, запустить можно только то, что вы сами вписали в конфиг.
+//! It forks off first of all, before connecting to Wayland and before the sandbox,
+//! and can do exactly three things:
+//!   'C' <number>  — run a command from the table built in at compile time (config.zig):
+//!                   a simple one ("zwifi toggle") directly via execve, one with shell
+//!                   special characters (quotes, |, ;, $ …) via /bin/sh -c;
+//!   'D' <command> — send mango a `dispatch` of a strictly checked form;
+//!   'W'           — connect to the mango IPC and hand the panel the ready socket.
+//! After that the panel itself lives in a sandbox without exec, fork, socket and connect:
+//! even if it is compromised, it can only run what you wrote into the config yourself.
 
 const std = @import("std");
 const sys = @import("sys.zig");
 
 var sock: i32 = -1;
 
-/// Команда, разобранная при сборке.
+/// A command parsed at compile time.
 pub const Cmd = struct {
-    argv: ?[*:null]const ?[*:0]const u8 = null, // простая: слова через пробел
-    shell: ?[*:0]const u8 = null, // со спецсимволами — целиком в /bin/sh -c
+    argv: ?[*:null]const ?[*:0]const u8 = null, // simple: words separated by spaces
+    shell: ?[*:0]const u8 = null, // with special characters — passed whole to /bin/sh -c
 };
 
-/// Символы, при которых строка — просто слова через пробел и shell не нужен.
+/// Characters with which a string is just space-separated words and needs no shell.
 fn plain(c: u8) bool {
     return switch (c) {
         'a'...'z', 'A'...'Z', '0'...'9', ' ', '-', '_', '.', '/', '=', ',', '+', ':', '@', '%' => true,
@@ -32,8 +32,8 @@ fn plain(c: u8) bool {
     };
 }
 
-/// Разобрать команду из config.zig при сборке. Простые команды запускаются без shell:
-/// на каждый клик на один процесс (и загрузку libc для /bin/sh) меньше.
+/// Parse a command from config.zig at compile time. Simple commands run without a shell:
+/// one process fewer per click (and no libc load for /bin/sh).
 pub fn compile(comptime s: ?[*:0]const u8) ?Cmd {
     const z = s orelse return null;
     comptime {
@@ -43,7 +43,7 @@ pub fn compile(comptime s: ?[*:0]const u8) ?Cmd {
         var n: usize = 0;
         var it = std.mem.tokenizeScalar(u8, str, ' ');
         while (it.next()) |w| : (n += 1) {
-            // «FOO=bar программа» — присваивание переменной, это понимает только shell
+            // "FOO=bar program" is a variable assignment, only a shell understands that
             if (n == 0 and std.mem.indexOfScalar(u8, w, '=') != null) return .{ .shell = z };
             words[n] = std.fmt.comptimePrint("{s}", .{w});
         }
@@ -63,10 +63,10 @@ pub fn start(cmds: []const ?Cmd) bool {
         return false;
     };
     if (pid == 0) {
-        // брокеру не нужны чужие дескрипторы (сокет «меню открыто», Wayland, D-Bus) —
-        // оставляем только свой конец пары и stdin/stdout/stderr
+        // the broker needs none of the other descriptors ("menu open" socket, Wayland, D-Bus) —
+        // keep only our end of the pair and stdin/stdout/stderr
         const own = sys.keepOnlyFd(pair[1]);
-        sys.prependExeDirToPath(); // меню и zbg рядом с zpanel найдутся без настройки PATH
+        sys.prependExeDirToPath(); // menus and zbg next to netline are found without PATH setup
         serve(own, cmds);
     }
     sys.close(pair[1]);
@@ -74,7 +74,7 @@ pub fn start(cmds: []const ?Cmd) bool {
     return true;
 }
 
-// ---------------------------------------------------------------- сторона панели
+// ---------------------------------------------------------------- panel side
 
 pub fn run(slot: u8) void {
     const m = [2]u8{ 'C', slot };
@@ -89,7 +89,7 @@ pub fn dispatch(cmd: []const u8) void {
     sys.sendAll(sock, buf[0 .. cmd.len + 1]) catch {};
 }
 
-/// Попросить у брокера сокет `watch all-tags`. -1 — mango недоступен.
+/// Ask the broker for a `watch all-tags` socket. -1 — mango is unavailable.
 pub fn requestWatch() i32 {
     sys.sendAll(sock, "W") catch return -1;
     var pfd = [1]sys.PollFd{.{ .fd = sock, .events = sys.POLLIN }};
@@ -101,13 +101,13 @@ pub fn requestWatch() i32 {
     return fd;
 }
 
-// ---------------------------------------------------------------- сторона брокера
+// ---------------------------------------------------------------- broker side
 
 fn serve(fd: i32, cmds: []const ?Cmd) noreturn {
     var buf: [256]u8 = undefined;
     while (true) {
         const n = sys.read(fd, &buf) catch sys.exit(0);
-        if (n == 0) sys.exit(0); // панель завершилась
+        if (n == 0) sys.exit(0); // the panel has exited
         const msg = buf[0..n];
         switch (msg[0]) {
             'C' => if (n == 2 and msg[1] < cmds.len) {
@@ -131,7 +131,7 @@ fn mangoDispatch(cmd: []const u8) void {
     defer sys.close(s);
     var b: [256]u8 = undefined;
     sys.sendAll(s, sys.joinZ(&b, &.{ "dispatch ", cmd, "\n" })) catch return;
-    // ждём ответ, чтобы не закрыть сокет раньше, чем mango его отправит
+    // wait for the reply so the socket isn't closed before mango sends it
     var pfd = [1]sys.PollFd{.{ .fd = s, .events = sys.POLLIN }};
     _ = sys.poll(&pfd, 300) catch return;
     var tmp: [256]u8 = undefined;
@@ -166,7 +166,7 @@ pub fn isMonName(s: []const u8) bool {
     return true;
 }
 
-/// Разрешены только: viewcrossmon,N,МОНИТОР | view,N,0 | toggleview,N
+/// Allowed only: viewcrossmon,N,MONITOR | view,N,0 | toggleview,N
 fn validDispatch(s: []const u8) bool {
     var parts: [4][]const u8 = undefined;
     var n: usize = 0;

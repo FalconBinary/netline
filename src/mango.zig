@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! IPC MangoWM (≥ 0.14): поток `watch all-tags` в формате JSON-строк.
-//! Сокет открывает брокер и передаёт сюда — сама панель подключаться никуда не может.
-//! JSON разбирается маленьким токенайзером с проверкой границ.
+//! MangoWM IPC (≥ 0.14): the `watch all-tags` stream as JSON lines.
+//! The broker opens the socket and hands it over — the panel itself cannot connect anywhere.
+//! JSON is parsed by a tiny bounds-checked tokenizer.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -43,9 +43,9 @@ pub fn disconnect() void {
     fd = -1;
 }
 
-/// Вызывать, когда сокет готов к чтению. true — состояние тегов обновилось.
+/// Call when the socket is readable. true — the tag state changed.
 pub fn onReadable() bool {
-    if (len == buf.len) len = 0; // строка не влезла — выбрасываем
+    if (len == buf.len) len = 0; // the line did not fit — drop it
     const n = sys.read(fd, buf[len..]) catch 0;
     if (n == 0) {
         disconnect();
@@ -87,7 +87,7 @@ fn slotFor(name: []const u8) ?*Mon {
 }
 
 // ---------------------------------------------------------------- JSON
-// Ответ: {"all_tags":[{"monitor":"eDP-1","tags":[{"index":1,"is_active":true,
+// Reply: {"all_tags":[{"monitor":"eDP-1","tags":[{"index":1,"is_active":true,
 //         "is_urgent":false,"layout":"T","client_count":2}, ...]}, ...]}
 
 const TokKind = enum { lbrace, rbrace, lbrack, rbrack, colon, comma, str, num, tru, fals, nul };
@@ -135,7 +135,7 @@ fn nextTok(s: []const u8, p: *usize) ?Tok {
                 j += 1;
             }
             var v: i64 = 0;
-            // насыщающая арифметика: длинное число не вызовет переполнения
+            // saturating arithmetic: a long number cannot overflow
             while (j < s.len and std.ascii.isDigit(s[j])) : (j += 1) v = (v *| 10) +| (s[j] - '0');
             while (j < s.len and (std.ascii.isDigit(s[j]) or s[j] == '.' or s[j] == 'e' or s[j] == 'E' or s[j] == '+' or s[j] == '-')) j += 1;
             p.* = @max(j, i + 1);
@@ -153,7 +153,7 @@ fn parse(line: []const u8) void {
     while (nextTok(line, &p)) |tok| {
         switch (tok.kind) {
             .str => {
-                // строка перед двоеточием — ключ
+                // a string before a colon is a key
                 var q = p;
                 while (q < line.len and line[q] == ' ') q += 1;
                 if (q < line.len and line[q] == ':') {

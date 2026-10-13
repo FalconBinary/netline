@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! zpanel — минималистичная панель для MangoWM на чистом Zig.
-//! Wayland-клиент без libwayland: wl_shm + wlr-layer-shell + wl_pointer (+ cursor-shape).
+//! netline — a minimalist panel for MangoWM in pure Zig.
+//! A Wayland client without libwayland: wl_shm + wlr-layer-shell + wl_pointer (+ cursor-shape).
 //!
-//! Нагрузка: процесс спит в ppoll и просыпается только по событиям — раз в минуту для часов,
-//! по netlink-событиям ядра для Wi‑Fi/Bluetooth, по вводу и редкому запасному таймеру.
-//! Кадр рисуется только при изменении, а композитору отдаётся лишь изменившийся прямоугольник.
+//! Load: the process sleeps in ppoll and wakes only on events — once a minute for the clock,
+//! on kernel netlink events for Wi‑Fi/Bluetooth, on input and on a rare fallback timer.
+//! A frame is drawn only on change, and only the changed rectangle is handed to the compositor.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -52,7 +52,7 @@ const Hit = struct { item: cfg.Item, idx: u8 = 0, x: f32, y: f32, w: f32, h: f32
 
 const Bar = struct {
     used: bool = false,
-    out_name: u32 = 0, // имя глобала wl_output
+    out_name: u32 = 0, // name of the wl_output global
     output: u32 = 0,
     out_ver: u32 = 0,
     mon_buf: [64]u8 = undefined,
@@ -70,7 +70,7 @@ const Bar = struct {
     pw: u32 = 0,
     ph: u32 = 0,
     bufs: [2]Buf = .{ .{}, .{} },
-    last: ?u1 = null, // буфер с последним показанным кадром
+    last: ?u1 = null, // buffer with the last shown frame
     tags: [mango.MAX_TAGS]mango.Tag = [_]mango.Tag{.{}} ** mango.MAX_TAGS,
     ntags: u8 = 0,
     hits: [48]Hit = undefined,
@@ -82,7 +82,7 @@ const Bar = struct {
     }
 };
 
-// Таблица команд для брокера: [элемент][кнопка]. Строится при компиляции из config.zig.
+// Command table for the broker: [item][button]. Built at compile time from config.zig.
 const actions = [_]cfg.Action{ cfg.launcher, cfg.clock, cfg.wifi, cfg.bluetooth, cfg.wallpaper, cfg.power };
 const commands = blk: {
     var c: [actions.len * 3]?broker.Cmd = undefined;
@@ -134,36 +134,35 @@ var wifi_state: status.Wifi = .{};
 var bt_state: status.Bt = .none;
 var clock_buf: [64]u8 = undefined;
 var clock_len: usize = 0;
-var clock_date: usize = 0; // начало clock_buf — дата словами, рисуется шрифтом TrueType
 var clock_hour: u32 = 99;
 
 var clock_timer: i32 = -1;
 var poll_timer: i32 = -1;
-var poll_period: u32 = 0; // на сколько секунд взведён запасной опрос (0 — выключен)
-var burst: u32 = 0; // сколько ещё быстрых (раз в секунду) проверок после клика
+var poll_period: u32 = 0; // how many seconds the fallback poll is armed for (0 — off)
+var burst: u32 = 0; // how many more quick (once a second) checks after a click
 
 // ================================================================= main
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     if (sys.getuid() == 0) {
-        sys.log("запуск от root запрещён", .{});
+        sys.log("running as root is not allowed", .{});
         sys.exit(1);
     }
-    // Брокер отделяется первым: у него нет ни сокета Wayland, ни других дескрипторов панели.
+    // The broker forks off first: it has no Wayland socket or any other panel descriptors.
     if (!broker.start(&commands)) {
-        sys.log("не удалось запустить процесс-брокер", .{});
+        sys.log("could not start the broker process", .{});
         sys.exit(1);
     }
     tz.load();
     theme.init();
     status.init();
-    // Векторный шрифт панели умеет только цифры; дату словами рисуем TrueType-шрифтом меню.
-    // Загружаем до песочницы; не нашёлся — дата будет цифрами.
-    if (cfg.clock_format == .full) _ = ttf.load(&cfg.font_paths);
+    // The date and time are drawn with one TrueType font (clock_font_paths). Loaded before the
+    // sandbox; if none is found, the clock falls back to the panel's vector digits.
+    _ = ttf.load(&cfg.clock_font_paths);
 
     conn.connect() catch {
-        sys.log("не удалось подключиться к Wayland (WAYLAND_DISPLAY/XDG_RUNTIME_DIR)", .{});
+        sys.log("could not connect to Wayland (WAYLAND_DISPLAY/XDG_RUNTIME_DIR)", .{});
         sys.exit(1);
     };
     kinds[1] = .display;
@@ -171,22 +170,22 @@ pub fn main(init: std.process.Init.Minimal) void {
     conn.send(1, 1, .{registry}); // wl_display.get_registry
     roundtrip();
     if (compositor == 0 or shm == 0 or layer_shell == 0) {
-        sys.log("композитор не поддерживает wl_compositor/wl_shm/zwlr_layer_shell_v1", .{});
+        sys.log("the compositor does not support wl_compositor/wl_shm/zwlr_layer_shell_v1", .{});
         sys.exit(1);
     }
-    roundtrip(); // имена и масштаб выходов
+    roundtrip(); // output names and scale
     ready = true;
     for (&bars, 0..) |*b, i| {
         if (b.used) setupBar(@intCast(i));
     }
 
-    if (mango.connect()) applyTags() else burst = 5; // mango мог ещё не поднять IPC — повторим
+    if (mango.connect()) applyTags() else burst = 5; // mango may not have its IPC up yet — retry
 
     clock_timer = sys.timerfdCreate(sys.CLOCK_REALTIME) catch fatal("timerfd");
     poll_timer = sys.timerfdCreate(sys.CLOCK_MONOTONIC) catch fatal("timerfd");
     armClock();
     _ = updateClock();
-    refreshStatus(true, true); // заодно взводит запасной опрос, если он нужен
+    refreshStatus(true, true); // also arms the fallback poll if it's needed
 
     if (cfg.sandbox) {
         const paths = [_][:0]const u8{ "/sys", "/proc", "/usr/share/zoneinfo", "/etc/localtime", tz.path, theme.dir };
@@ -197,7 +196,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         for (&bars, 0..) |*b, i| {
             if (b.used and b.configured and b.dirty) render(@intCast(i));
         }
-        conn.flush() catch fatal("запись в сокет Wayland");
+        conn.flush() catch fatal("writing to the Wayland socket");
 
         var fds = [8]sys.PollFd{
             .{ .fd = conn.fd, .events = sys.POLLIN },
@@ -217,7 +216,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (fds[2].revents != 0) onPollTimer();
         if (fds[3].revents != 0 and mango.fd >= 0) {
             if (mango.onReadable()) applyTags();
-            if (mango.fd < 0) armPoll(); // mango закрыл IPC — будем переподключаться
+            if (mango.fd < 0) armPoll(); // mango closed the IPC — we'll reconnect
         }
         if (fds[4].revents != 0 or fds[5].revents != 0) {
             const ch = status.drainEvents(fds[4].revents != 0, fds[5].revents != 0);
@@ -232,9 +231,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 }
 
-/// ZPANEL_TRACE: почему панель проснулась (в простое строк быть не должно, кроме часов).
+/// NETLINE_TRACE: why the panel woke up (when idle there should be no lines except the clock).
 fn traceWake(fds: []const sys.PollFd) void {
-    const names = [_][]const u8{ " wayland", " часы", " опрос", " mango", " сеть", " устройства", " тема", " bluetooth" };
+    const names = [_][]const u8{ " wayland", " clock", " poll", " mango", " net", " devices", " theme", " bluetooth" };
     var buf: [128]u8 = undefined;
     var n: usize = 0;
     for (fds, names) |f, nm| {
@@ -242,11 +241,11 @@ fn traceWake(fds: []const sys.PollFd) void {
         @memcpy(buf[n..][0..nm.len], nm);
         n += nm.len;
     }
-    sys.tracef("пробуждение:{s}", .{buf[0..n]});
+    sys.tracef("wakeup:{s}", .{buf[0..n]});
 }
 
 fn fatal(what: []const u8) noreturn {
-    sys.log("ошибка: {s}", .{what});
+    sys.log("error: {s}", .{what});
     sys.exit(1);
 }
 
@@ -265,21 +264,21 @@ fn forget(id: *u32) void {
 fn roundtrip() void {
     const cb = create(.callback, 0);
     conn.send(1, 0, .{cb}); // wl_display.sync
-    conn.flush() catch fatal("запись в сокет Wayland");
+    conn.flush() catch fatal("writing to the Wayland socket");
     sync_done = false;
     while (!sync_done) readWayland();
 }
 
 fn readWayland() void {
-    const alive = conn.fill() catch fatal("чтение из сокета Wayland");
+    const alive = conn.fill() catch fatal("reading from the Wayland socket");
     if (!alive) {
-        sys.log("композитор закрыл соединение", .{});
+        sys.log("the compositor closed the connection", .{});
         sys.exit(0);
     }
     while (conn.next()) |ev| dispatch(ev);
 }
 
-// ================================================================= таймеры и статусы
+// ================================================================= timers and status
 
 fn armClock() void {
     const step: i64 = if (cfg.clock_format == .hms) 1 else 60;
@@ -288,9 +287,9 @@ fn armClock() void {
     sys.timerfdArm(clock_timer, sys.TFD_TIMER_ABSTIME | sys.TFD_TIMER_CANCEL_ON_SET, next, @intCast(step)) catch {};
 }
 
-/// Запасной опрос — только для того, о чём не приходит событий: уровень сигнала Wi‑Fi,
-/// включение Bluetooth (если ядро не даёт канал mgmt) и переподключение к mango.
-/// Нечего опрашивать — таймер выключен, и панель спит до события.
+/// The fallback poll is only for things that send no events: Wi‑Fi signal level,
+/// Bluetooth power (if the kernel gives no mgmt channel) and reconnecting to mango.
+/// Nothing to poll — the timer is off and the panel sleeps until an event.
 fn pollPeriod() u32 {
     if (burst > 0) return 1;
     if (mango.fd < 0 or wifi_state.state == .connected) return cfg.status_poll_s;
@@ -300,7 +299,7 @@ fn pollPeriod() u32 {
 
 fn armPoll() void {
     const s = pollPeriod();
-    if (s == poll_period) return; // тот же период — не сбиваем фазу таймера
+    if (s == poll_period) return; // same period — don't reset the timer phase
     poll_period = s;
     sys.timerfdArm(poll_timer, 0, s, s) catch {};
 }
@@ -308,7 +307,7 @@ fn armPoll() void {
 fn drainTimer(fd: i32) bool {
     var exp: [8]u8 = undefined;
     _ = sys.read(fd, &exp) catch {
-        return sys.last_errno == sys.ECANCELED; // часы перевели — таймер надо взвести заново
+        return sys.last_errno == sys.ECANCELED; // the clock was changed — the timer must be re-armed
     };
     return false;
 }
@@ -339,7 +338,7 @@ fn refreshStatus(do_wifi: bool, do_bt: bool) void {
         bt_state = bt;
     }
     if (changed) markAllDirty();
-    armPoll(); // нужен ли опрос, зависит от состояния (подключён ли Wi‑Fi, есть ли адаптер)
+    armPoll(); // whether polling is needed depends on the state (Wi‑Fi connected, adapter present)
 }
 
 fn two(buf: []u8, v: u32) void {
@@ -347,13 +346,13 @@ fn two(buf: []u8, v: u32) void {
     buf[1] = '0' + @as(u8, @intCast(v % 10));
 }
 
-const wshort = [_][]const u8{ "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс" };
-const months_gen = [_][]const u8{ "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря" };
+const wshort = [_][]const u8{ "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+const months = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
 
 fn updateClock() bool {
     var t = tz.now();
     if (t.hour != clock_hour) {
-        // раз в час перечитываем часовой пояс (смена зоны, обновление tzdata)
+        // reread the time zone once an hour (zone change, tzdata update)
         if (clock_hour != 99) {
             tz.load();
             t = tz.now();
@@ -362,14 +361,12 @@ fn updateClock() bool {
     }
     var buf: [64]u8 = undefined;
     var n: usize = 0;
-    var date_len: usize = 0;
     if (cfg.clock_format == .full) {
         if (ttf.font != null) {
-            const d = std.fmt.bufPrint(&buf, "{s}, {d} {s} {d}", .{ wshort[t.wday % 7], t.day, months_gen[(t.month -% 1) % 12], t.year }) catch "";
+            const d = std.fmt.bufPrint(&buf, "{s}, {d} {s} {d}  ", .{ wshort[t.wday % 7], t.day, months[(t.month -% 1) % 12], t.year }) catch "";
             n = d.len;
-            date_len = n;
         } else {
-            // без TrueType-шрифта — только цифры: 12.10.2026  13:31
+            // without a TrueType font — digits only: 12.10.2026  13:31
             two(buf[0..], t.day);
             buf[2] = '.';
             two(buf[3..], t.month);
@@ -395,36 +392,27 @@ fn updateClock() bool {
         two(buf[n + 1 ..], t.sec);
         n += 3;
     }
-    if (n == clock_len and date_len == clock_date and std.mem.eql(u8, buf[0..n], clock_buf[0..n])) return false;
+    if (n == clock_len and std.mem.eql(u8, buf[0..n], clock_buf[0..n])) return false;
     @memcpy(clock_buf[0..n], buf[0..n]);
     clock_len = n;
-    clock_date = date_len;
     return true;
 }
 
-/// Время (и дата цифрами) — векторным шрифтом панели.
 fn clockText() []const u8 {
-    return clock_buf[clock_date..clock_len];
+    return clock_buf[0..clock_len];
 }
 
-fn dateText() []const u8 {
-    return clock_buf[0..clock_date];
-}
-
-const date_gap: f32 = 10; // промежуток между датой и временем
-
-/// Кегль даты: строчные и прописные чуть ниже цифр времени.
-fn dateSize(S: f32) u16 {
+/// Font size in pixels per em: the digits come out about clock_size tall.
+fn clockFontSize(S: f32) u16 {
     return @intFromFloat(@round(cfg.clock_size * 1.3 * S));
 }
 
 fn clockWidth(S: f32) f32 {
-    var w = draw.textWidth(clockText(), cfg.clock_size);
-    if (clock_date > 0) w += ttf.width(dateText(), dateSize(S)) / S + date_gap;
-    return w;
+    if (ttf.font != null) return ttf.width(clockText(), clockFontSize(S)) / S;
+    return draw.textWidth(clockText(), cfg.clock_size);
 }
 
-// ================================================================= события Wayland
+// ================================================================= Wayland events
 
 fn dispatch(ev: wl.Event) void {
     if (ev.obj >= wl.MAX_IDS) return;
@@ -436,7 +424,7 @@ fn dispatch(ev: wl.Event) void {
                 const obj = a.uint();
                 const code = a.uint();
                 const msg = a.string();
-                sys.log("ошибка протокола (объект {d}, код {d}): {s}", .{ obj, code, msg });
+                sys.log("protocol error (object {d}, code {d}): {s}", .{ obj, code, msg });
                 sys.exit(1);
             },
             1 => {
@@ -571,7 +559,7 @@ fn onLayer(own: u8, op: u16, a: *wl.Args) void {
             const w = a.uint();
             const h = a.uint();
             conn.send(b.layer, 6, .{serial}); // ack_configure
-            // размеры от композитора ограничиваем разумными рамками
+            // clamp the sizes from the compositor to sane limits
             b.w = if (w > 0) @min(w, 16384) else 1280;
             b.h = if (h > 0) @min(h, 512) else cfg.height;
             b.configured = true;
@@ -582,7 +570,7 @@ fn onLayer(own: u8, op: u16, a: *wl.Args) void {
     }
 }
 
-// ---------------------------------------------------------------- указатель
+// ---------------------------------------------------------------- pointer
 
 fn barBySurface(id: u32) ?u8 {
     for (&bars, 0..) |*b, i| {
@@ -679,15 +667,15 @@ fn click(i: u8, button: u32, time: u32) void {
     };
     const slot = (actionIndex(h.item) orelse return) * 3 + btn;
     if (commands[slot] == null) return;
-    // защита от двойного клика: одна и та же команда не чаще раза в 400 мс
+    // double-click guard: the same command no more than once per 400 ms
     if (last_click[slot]) |prev| {
         if (time -% prev < 400) return;
     }
     last_click[slot] = time;
-    sys.tracef("клик: команда {d}", .{slot});
+    sys.tracef("click: command {d}", .{slot});
     broker.run(slot);
-    // переключатели Wi‑Fi/Bluetooth (ПКМ) не всегда дают событие — несколько секунд проверяем
-    // чаще; из меню Bluetooth питание без канала mgmt тоже узнаётся только опросом
+    // Wi‑Fi/Bluetooth toggles (right click) don't always produce an event — check more often
+    // for a few seconds; Bluetooth power from the menu without an mgmt channel is also learned only by polling
     const toggle = btn == 1 and (h.item == .wifi or h.item == .bluetooth);
     if (toggle or (h.item == .bluetooth and !status.btEvents())) {
         burst = 6;
@@ -706,7 +694,7 @@ fn tagClick(b: *Bar, idx: u8, button: u32) void {
 
 fn viewTag(b: *Bar, idx: u8) void {
     var buf: [128]u8 = undefined;
-    // имя монитора уходит в IPC — берём только безопасные имена, иначе текущий монитор
+    // the monitor name goes into the IPC — take only safe names, otherwise the current monitor
     const cmd = if (broker.isMonName(b.monName()))
         std.fmt.bufPrint(&buf, "viewcrossmon,{d},{s}", .{ idx + 1, b.monName() }) catch return
     else
@@ -732,7 +720,7 @@ fn scroll(i: u8, v: f32) void {
     viewTag(b, next);
 }
 
-// ================================================================= панели
+// ================================================================= bars
 
 fn setupBar(i: u8) void {
     const b = &bars[i];
@@ -740,8 +728,8 @@ fn setupBar(i: u8) void {
     conn.send(compositor, 0, .{b.surface}); // create_surface
     b.layer = create(.layer_surface, i);
     // get_layer_surface(id, surface, output, layer = top, namespace)
-    conn.send(layer_shell, 0, .{ b.layer, b.surface, b.output, @as(u32, 2), wl.str("zpanel") });
-    conn.send(b.layer, 0, .{ @as(u32, 0), cfg.height }); // set_size (ширину задаст композитор)
+    conn.send(layer_shell, 0, .{ b.layer, b.surface, b.output, @as(u32, 2), wl.str("netline") });
+    conn.send(b.layer, 0, .{ @as(u32, 0), cfg.height }); // set_size (the compositor sets the width)
     const anchor: u32 = switch (cfg.position) {
         .top => 1 | 4 | 8,
         .bottom => 2 | 4 | 8,
@@ -751,7 +739,7 @@ fn setupBar(i: u8) void {
     const top: i32 = if (cfg.position == .top) cfg.margin_edge else 0;
     const bottom: i32 = if (cfg.position == .bottom) cfg.margin_edge else 0;
     conn.send(b.layer, 3, .{ top, cfg.margin_side, bottom, cfg.margin_side }); // set_margin
-    conn.send(b.surface, 6, .{}); // commit без буфера -> придёт configure
+    conn.send(b.surface, 6, .{}); // commit without a buffer -> a configure will come
 }
 
 fn freeBuffers(b: *Bar) void {
@@ -792,7 +780,7 @@ fn ensureBuffers(i: u8) bool {
     const stride = pw * 4;
     const size: usize = @as(usize, stride) * ph;
     const total = size * 2;
-    const fd = sys.memfd("zpanel") catch return false;
+    const fd = sys.memfd("netline") catch return false;
     defer sys.close(fd);
     sys.ftruncate(fd, total) catch return false;
     const mem = sys.mmap(total, fd) catch return false;
@@ -802,7 +790,7 @@ fn ensureBuffers(i: u8) bool {
     b.ph = ph;
     b.pool = create(.pool, i);
     conn.send(shm, 0, .{ b.pool, wl.Fd{ .fd = fd }, @as(i32, @intCast(total)) }); // create_pool
-    conn.flush() catch fatal("запись в сокет Wayland"); // дескриптор ушёл — его можно закрыть
+    conn.flush() catch fatal("writing to the Wayland socket"); // the descriptor is sent — it can be closed
     for (&b.bufs, 0..) |*bf, k| {
         bf.* = .{ .id = create(.buffer, i * 2 + @as(u8, @intCast(k))) };
         // create_buffer(id, offset, width, height, stride, format = ARGB8888)
@@ -821,8 +809,8 @@ const Rect = struct { x0: u32, y0: u32, x1: u32, y1: u32 };
 const MAX_RECTS = 6;
 var col_changed: [16384 * 4]bool = undefined;
 
-/// Области, где кадры различаются: несколько прямоугольников, чтобы, например, смена
-/// подсветки слева и справа не превращалась в одну полосу на всю ширину. 0 — кадры равны.
+/// Areas where the frames differ: several rectangles, so that, for example, a highlight
+/// change on the left and on the right doesn't turn into one full-width band. 0 — the frames are equal.
 fn diffRects(a: []const u32, b: []const u32, w: u32, h: u32, out: *[MAX_RECTS]Rect) usize {
     const cols = col_changed[0..w];
     @memset(cols, false);
@@ -840,7 +828,7 @@ fn diffRects(a: []const u32, b: []const u32, w: u32, h: u32, out: *[MAX_RECTS]Re
         y1 = y + 1;
     }
     if (y1 == 0) return 0;
-    // склеиваем изменённые столбцы, если между ними меньше `gap` пикселей
+    // merge changed columns if fewer than `gap` pixels lie between them
     const gap: u32 = @max(16, h / 2);
     var n: usize = 0;
     var x: u32 = 0;
@@ -855,7 +843,7 @@ fn diffRects(a: []const u32, b: []const u32, w: u32, h: u32, out: *[MAX_RECTS]Re
             if (cols[end]) last = end + 1;
         }
         if (n == MAX_RECTS) {
-            out[n - 1].x1 = last; // лишнее присоединяем к последнему
+            out[n - 1].x1 = last; // attach the excess to the last one
         } else {
             out[n] = .{ .x0 = x, .y0 = y0, .x1 = last, .y1 = y1 };
             n += 1;
@@ -868,11 +856,11 @@ fn diffRects(a: []const u32, b: []const u32, w: u32, h: u32, out: *[MAX_RECTS]Re
 fn render(i: u8) void {
     const b = &bars[i];
     const t0 = sys.traceStart();
-    defer if (sys.tracing()) sys.tracef("кадр {d}: {d} мкс", .{ i, sys.traceSince(t0) });
+    defer if (sys.tracing()) sys.tracef("frame {d}: {d} µs", .{ i, sys.traceSince(t0) });
     if (!ensureBuffers(i)) return;
-    // рисуем в буфер, отличный от показанного, чтобы сравнить кадры
+    // draw into a buffer other than the shown one, to compare frames
     const k: u1 = if (b.last) |l| ~l else 0;
-    if (b.bufs[k].busy) return; // композитор ещё читает — дорисуем после release
+    if (b.bufs[k].busy) return; // the compositor is still reading — finish after release
 
     layout(b);
     var cv = draw.Canvas{ .px = pixels(b, k), .w = @intCast(b.pw), .h = @intCast(b.ph) };
@@ -884,7 +872,7 @@ fn render(i: u8) void {
     if (b.last) |l| {
         nr = diffRects(cv.px, pixels(b, l), b.pw, b.ph, &rects);
         if (nr == 0) {
-            b.dirty = false; // ничего не изменилось — композитор не трогаем вообще
+            b.dirty = false; // nothing changed — don't touch the compositor at all
             return;
         }
     }
@@ -911,8 +899,8 @@ fn sameTags(a: []const mango.Tag, b: []const mango.Tag) bool {
     return true;
 }
 
-/// Теги из mango → панели. Перерисовка — только если у этой панели что-то изменилось:
-/// события IPC приходят и на то, что панель не показывает (например, смену фокуса).
+/// Tags from mango → bars. Redraw only if something changed for this bar:
+/// IPC events also arrive for things the bar doesn't show (e.g. a focus change).
 fn applyTags() void {
     for (&bars) |*b| {
         if (!b.used) continue;
@@ -935,7 +923,7 @@ fn markAllDirty() void {
     }
 }
 
-// ================================================================= раскладка и рисование
+// ================================================================= layout and drawing
 
 fn addHit(b: *Bar, item: cfg.Item, idx: u8, x: f32, y: f32, w: f32, h: f32) void {
     if (b.nhits >= b.hits.len) return;
@@ -1021,14 +1009,14 @@ fn paint(b: *const Bar, cv: *draw.Canvas) void {
             .tags => paintTag(b, cv, h, S),
             .clock => {
                 const tw = clockWidth(S);
-                var x = @round((h.x + (h.w - tw) / 2) * S);
+                const x = @round((h.x + (h.w - tw) / 2) * S);
                 const y = @round((H - cfg.clock_size) / 2 * S);
-                if (clock_date > 0) {
-                    // базовая линия даты — по низу цифр времени
-                    const end = ttf.drawText(cv, dateText(), x, y + cfg.clock_size * S, dateSize(S), c.clock, W * S);
-                    x = @round(end + date_gap * S);
+                if (ttf.font != null) {
+                    // baseline at the bottom of the digits, as with the vector font
+                    _ = ttf.drawText(cv, clockText(), x, y + cfg.clock_size * S, clockFontSize(S), c.clock, W * S);
+                } else {
+                    draw.text(cv, clockText(), x, y, cfg.clock_size * S, c.clock);
                 }
-                draw.text(cv, clockText(), x, y, cfg.clock_size * S, c.clock);
             },
             else => paintIcon(cv, h, S),
         }

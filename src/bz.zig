@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Клиент BlueZ поверх D-Bus: адаптер, устройства, подключение, сопряжение и свой агент
-//! сопряжения (подтверждение кода, ввод PIN). Радио и протоколы — у системного bluetoothd.
+//! BlueZ client over D-Bus: adapter, devices, connecting, pairing and our own pairing
+//! agent (passkey confirmation, PIN entry). The radio and protocols belong to the system bluetoothd.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -16,7 +16,7 @@ const DEVICE = "org.bluez.Device1";
 const BATTERY = "org.bluez.Battery1";
 const AGENT_MGR = "org.bluez.AgentManager1";
 const AGENT = "org.bluez.Agent1";
-pub const AGENT_PATH = "/org/zpanel/agent";
+pub const AGENT_PATH = "/org/netline/agent";
 
 pub const Path = struct {
     buf: [96]u8 = undefined,
@@ -24,7 +24,7 @@ pub const Path = struct {
 
     pub fn set(p: *Path, s: []const u8) void {
         const k = @min(s.len, p.buf.len);
-        std.mem.copyForwards(u8, p.buf[0..k], s[0..k]); // источник может быть этим же буфером
+        std.mem.copyForwards(u8, p.buf[0..k], s[0..k]); // the source may be this same buffer
         p.len = @intCast(k);
     }
     pub fn get(p: *const Path) []const u8 {
@@ -41,20 +41,20 @@ pub const Dev = struct {
     path: Path = .{},
     name_buf: [64]u8 = undefined,
     name_len: u8 = 0,
-    has_name: bool = false, // настоящее имя, а не адрес
+    has_name: bool = false, // a real name, not the address
     kind: Kind = .generic,
-    paired: bool = false, // Paired или Bonded
+    paired: bool = false, // Paired or Bonded
     p_paired: bool = false,
     p_bonded: bool = false,
     alias_seen: bool = false,
     trusted: bool = false,
     connected: bool = false,
-    battery: u8 = 255, // 255 — неизвестно
-    rssi: i16 = -32768, // нет данных
-    // для `zbt scan`
-    random: bool = false, // случайный BLE-адрес (телефоны, часы, метки)
-    classic: bool = false, // есть класс устройства — значит, найдено как классическое (BR/EDR)
-    maker: u16 = 0xffff, // производитель из рекламы BLE, 0xffff — нет
+    battery: u8 = 255, // 255 — unknown
+    rssi: i16 = -32768, // no data
+    // for `zbt scan`
+    random: bool = false, // random BLE address (phones, watches, tags)
+    classic: bool = false, // has a device class — so it was found as classic (BR/EDR)
+    maker: u16 = 0xffff, // manufacturer from the BLE advertisement, 0xffff — none
 
     pub fn name(d: *const Dev) []const u8 {
         return d.name_buf[0..d.name_len];
@@ -66,15 +66,15 @@ pub var adapter: Path = .{};
 pub var powered = false;
 pub var discovering = false;
 
-/// Устройства адаптера. Таблица загружается один раз (load) и дальше живёт сигналами
-/// bluetoothd (InterfacesAdded/Removed, PropertiesChanged): во время поиска не нужно
-/// раз за разом выкачивать все объекты — новое устройство появляется в момент сигнала.
+/// The adapter's devices. The table is loaded once (load) and then lives on bluetoothd
+/// signals (InterfacesAdded/Removed, PropertiesChanged): during discovery there is no need
+/// to fetch all objects again and again — a new device appears the moment the signal arrives.
 pub const MAX_DEVS = 255;
 pub var devs: [MAX_DEVS]Dev = undefined;
 pub var ndev: usize = 0;
-/// изменилось что-то видимое (устройство, имя, состояние, адаптер) — список стоит пересобрать
+/// something visible changed (device, name, state, adapter) — the list should be rebuilt
 pub var changed = false;
-/// изменился только уровень сигнала (RSSI) — хватит пересобрать при следующем такте
+/// only the signal level (RSSI) changed — rebuilding on the next tick is enough
 pub var rssi_changed = false;
 
 var owner_buf: [64]u8 = undefined;
@@ -97,8 +97,8 @@ fn setError(m: []const u8) void {
 fn call(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) ?dbus.Reply {
     const r = bus.call(BZ, path, iface, member, sig, body) catch |e| {
         setError(switch (e) {
-            error.Timeout => "bluetoothd не отвечает",
-            else => "ошибка связи с bluetoothd",
+            error.Timeout => "bluetoothd is not responding",
+            else => "error talking to bluetoothd",
         });
         return null;
     };
@@ -109,24 +109,24 @@ fn call(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8
     return r;
 }
 
-// ================================================================= запуск
+// ================================================================= startup
 
-/// Подключиться к системной шине и bluetoothd. /dev/rfkill открывается заранее —
-/// чтобы снимать программную блокировку без утилиты rfkill (и уже в песочнице).
+/// Connect to the system bus and bluetoothd. /dev/rfkill is opened up front —
+/// to lift the soft block without the rfkill utility (and already inside the sandbox).
 pub fn init() bool {
     rfkill_fd = sys.openRW("/dev/rfkill") catch -1;
     bus.connectSystem() catch {
-        setError("нет доступа к системной шине D-Bus");
+        setError("no access to the D-Bus system bus");
         return false;
     };
     var w = dbus.W{ .buf = &body_buf };
     w.str(BZ);
     const r = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", w.bytes()) catch {
-        setError("ошибка связи с D-Bus");
+        setError("error talking to D-Bus");
         return false;
     };
     if (!r.ok()) {
-        setError("Служба Bluetooth (bluetoothd) не запущена");
+        setError("The Bluetooth service (bluetoothd) is not running");
         return false;
     }
     var rr = r.reader();
@@ -174,7 +174,7 @@ fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []cons
                 if (!isDevPath(path)) return;
                 const d = find(path) orelse devFor(path) orelse return;
                 applyProps(&r, w, d);
-                // RSSI пропадает, когда поиск закончился
+                // RSSI disappears when discovery ends
                 const end = r.arrayEnd(4);
                 while (r.p < end and !r.bad) {
                     if (eql(u8, r.str(), "RSSI")) d.rssi = -32768;
@@ -186,7 +186,7 @@ fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []cons
     }
 }
 
-// ================================================================= таблица устройств
+// ================================================================= device table
 
 const Which = enum { other, device, adapter, battery };
 
@@ -198,13 +198,13 @@ fn whichOf(iface: []const u8) Which {
     return .other;
 }
 
-/// /org/bluez/hciN — без вложенных объектов
+/// /org/bluez/hciN — without nested objects
 fn isAdapterPath(p: []const u8) bool {
     const pre = "/org/bluez/hci";
     return std.mem.startsWith(u8, p, pre) and std.mem.indexOfScalar(u8, p[pre.len..], '/') == null;
 }
 
-/// Устройство нашего адаптера: /org/bluez/hci0/dev_XX_XX… (без вложенных объектов).
+/// A device of our adapter: /org/bluez/hci0/dev_XX_XX… (without nested objects).
 fn isDevPath(p: []const u8) bool {
     const a = adapter.get();
     return a.len > 0 and p.len > a.len + 1 and std.mem.startsWith(u8, p, a) and p[a.len] == '/' and
@@ -218,13 +218,13 @@ fn find(path: []const u8) ?*Dev {
     return null;
 }
 
-/// Видно ли устройство хоть в одном списке меню (иначе это BLE-шум).
+/// Whether the device shows up in at least one menu list (otherwise it's BLE noise).
 fn useful(d: *const Dev) bool {
     return d.paired or d.connected or d.has_name or d.kind != .generic;
 }
 
-/// Новая запись. Таблица полна — вытесняем самый слабый безымянный BLE-шум:
-/// десятки чужих телефонов и меток не должны вытеснить нужные устройства.
+/// A new entry. If the table is full, evict the weakest nameless BLE noise:
+/// dozens of strangers' phones and tags must not push out the devices you need.
 fn devFor(path: []const u8) ?*Dev {
     var slot: ?usize = null;
     if (ndev < devs.len) {
@@ -257,7 +257,7 @@ fn setLabel(d: *Dev, s: []const u8) void {
     @memcpy(d.name_buf[0..d.name_len], s[0..d.name_len]);
 }
 
-/// Один объект из GetManagedObjects или InterfacesAdded: a{sa{sv}}.
+/// One object from GetManagedObjects or InterfacesAdded: a{sa{sv}}.
 fn applyObject(r: *dbus.R, path: []const u8) void {
     const iend = r.arrayEnd(8);
     while (r.p < iend and !r.bad) {
@@ -268,7 +268,7 @@ fn applyObject(r: *dbus.R, path: []const u8) void {
                 if (find(path) orelse devFor(path)) |d| applyProps(r, w, d) else r.skip("a{sv}");
             },
             .adapter => {
-                // первый найденный адаптер — наш
+                // the first adapter found is ours
                 if (adapter.len == 0) adapter.set(path);
                 if (adapter.eql(path)) applyProps(r, .adapter, null) else r.skip("a{sv}");
             },
@@ -278,7 +278,7 @@ fn applyObject(r: *dbus.R, path: []const u8) void {
     r.p = @max(r.p, iend);
 }
 
-/// Словарь свойств a{sv} одного интерфейса → запись устройства (или адаптер).
+/// The a{sv} property dictionary of one interface → a device entry (or the adapter).
 fn applyProps(r: *dbus.R, w: Which, dev: ?*Dev) void {
     const eql = std.mem.eql;
     const pend = r.arrayEnd(8);
@@ -287,7 +287,7 @@ fn applyProps(r: *dbus.R, w: Which, dev: ?*Dev) void {
         const key = r.str();
         const vs = r.sig();
         const vt = if (vs.len == 1) vs[0] else 0;
-        var minor = false; // меняется только сигнал или реклама — список не пересобираем сразу
+        var minor = false; // only the signal or advertisement changes — don't rebuild the list right away
         if (w == .adapter) {
             if (vt == 'b' and eql(u8, key, "Powered")) {
                 powered = r.boolean();
@@ -349,7 +349,7 @@ fn applyProps(r: *dbus.R, w: Which, dev: ?*Dev) void {
     r.p = @max(r.p, pend);
 }
 
-/// Зарегистрировать наш агент сопряжения (только для сопряжений, которые начали мы).
+/// Register our pairing agent (only for pairings we started).
 pub fn registerAgent() bool {
     var w = dbus.W{ .buf = &body_buf };
     w.str(AGENT_PATH);
@@ -359,7 +359,7 @@ pub fn registerAgent() bool {
     return true;
 }
 
-// ================================================================= устройства
+// ================================================================= devices
 
 fn kindOf(icon: []const u8) Kind {
     const eql = std.mem.eql;
@@ -373,8 +373,8 @@ fn kindOf(icon: []const u8) Kind {
     return .generic;
 }
 
-/// Загрузить адаптер и все устройства (GetManagedObjects). Дальше таблицу ведут сигналы.
-/// Возвращает число устройств.
+/// Load the adapter and all devices (GetManagedObjects). After that signals maintain the table.
+/// Returns the number of devices.
 pub fn load() usize {
     const rep = call("/", OM, "GetManagedObjects", "", "") orelse return 0;
     ndev = 0;
@@ -390,16 +390,16 @@ pub fn load() usize {
     }
     changed = true;
     if (r.bad) {
-        setError("неверный ответ bluetoothd");
+        setError("invalid reply from bluetoothd");
         ndev = 0;
         return 0;
     }
     if (adapter.len == 0) {
-        setError("Адаптер Bluetooth не найден");
+        setError("Bluetooth adapter not found");
         ndev = 0;
         return 0;
     }
-    // только устройства нашего адаптера: /org/bluez/hci0/dev_...
+    // only devices of our adapter: /org/bluez/hci0/dev_...
     var k: usize = 0;
     for (devs[0..ndev]) |d| {
         if (isDevPath(d.path.get())) {
@@ -411,9 +411,9 @@ pub fn load() usize {
     return k;
 }
 
-// ================================================================= действия
+// ================================================================= actions
 
-/// Снять программную блокировку Bluetooth (как `rfkill unblock bluetooth`).
+/// Lift the Bluetooth soft block (like `rfkill unblock bluetooth`).
 fn rfkillUnblock() void {
     if (rfkill_fd < 0) return;
     // struct rfkill_event { u32 idx; u8 type; u8 op; u8 soft; u8 hard; }
@@ -433,12 +433,12 @@ fn setBool(path: []const u8, iface: []const u8, name: []const u8, v: bool) bool 
 
 pub fn setPowered(on: bool) bool {
     if (adapter.len == 0) {
-        setError("Адаптер Bluetooth не найден");
+        setError("Bluetooth adapter not found");
         return false;
     }
     if (on) rfkillUnblock();
-    // после снятия rfkill адаптеру нужно мгновение, чтобы стать доступным:
-    // пробуем часто (раз в 50 мс, до 2 с), чтобы не ждать лишнего
+    // after rfkill is lifted the adapter needs a moment to become available:
+    // retry often (every 50 ms, up to 2 s) so as not to wait longer than needed
     var attempt: u32 = 0;
     while (attempt < 40) : (attempt += 1) {
         if (setBool(adapter.get(), ADAPTER, "Powered", on)) {
@@ -452,10 +452,10 @@ pub fn setPowered(on: bool) bool {
     return false;
 }
 
-/// Начать поиск. «Уже идёт» — не ошибка; иначе false и текст в lastError.
+/// Start discovery. "Already in progress" is not an error; otherwise false and the text in lastError.
 pub fn startDiscovery() bool {
     const r = bus.call(BZ, adapter.get(), ADAPTER, "StartDiscovery", "", "") catch {
-        setError("ошибка связи с bluetoothd");
+        setError("error talking to bluetoothd");
         return false;
     };
     if (r.ok() or std.mem.endsWith(u8, r.err_name, "InProgress")) return true;
@@ -469,7 +469,7 @@ pub fn stopDiscovery() void {
 
 fn devCall(path: []const u8, member: []const u8) ?u32 {
     return bus.callAsync(BZ, path, DEVICE, member, "", "") catch {
-        setError("ошибка связи с bluetoothd");
+        setError("error talking to bluetoothd");
         return null;
     };
 }
@@ -501,7 +501,7 @@ pub fn remove(dev: []const u8) bool {
     return true;
 }
 
-/// Понятный текст по ошибке BlueZ.
+/// A readable message for a BlueZ error.
 pub fn friendly(name: []const u8, text: []const u8) []const u8 {
     const has = struct {
         fn f(s: []const u8, sub: []const u8) bool {
@@ -509,22 +509,22 @@ pub fn friendly(name: []const u8, text: []const u8) []const u8 {
         }
     }.f;
     if (has(text, "page-timeout") or has(text, "Page Timeout") or has(text, "Host is down") or has(text, "le-connection-abort"))
-        return "Устройство не отвечает — включите его и поднесите ближе";
-    if (has(name, "AuthenticationCanceled")) return "Сопряжение отменено";
-    if (has(name, "AuthenticationRejected") or has(name, "AuthenticationFailed")) return "Сопряжение отклонено — проверьте код";
-    if (has(name, "AuthenticationTimeout")) return "Время ожидания истекло";
-    if (has(name, "ConnectionAttemptFailed")) return "Не удалось подключиться";
-    if (has(name, "AlreadyExists")) return "Устройство уже сопряжено";
-    if (has(name, "InProgress")) return "Операция уже выполняется";
-    if (has(name, "NotReady")) return "Адаптер не готов";
-    if (has(name, "Blocked") or has(text, "rfkill")) return "Bluetooth заблокирован (rfkill)";
-    if (has(name, "NotAvailable") or has(text, "profile-unavailable")) return "Устройство не поддерживает нужный профиль";
-    if (has(name, "AccessDenied") or has(name, "NotAuthorized")) return "Нет прав — проверьте политику polkit/D-Bus";
+        return "The device is not responding — turn it on and bring it closer";
+    if (has(name, "AuthenticationCanceled")) return "Pairing canceled";
+    if (has(name, "AuthenticationRejected") or has(name, "AuthenticationFailed")) return "Pairing rejected — check the code";
+    if (has(name, "AuthenticationTimeout")) return "Timed out";
+    if (has(name, "ConnectionAttemptFailed")) return "Could not connect";
+    if (has(name, "AlreadyExists")) return "The device is already paired";
+    if (has(name, "InProgress")) return "The operation is already in progress";
+    if (has(name, "NotReady")) return "The adapter is not ready";
+    if (has(name, "Blocked") or has(text, "rfkill")) return "Bluetooth is blocked (rfkill)";
+    if (has(name, "NotAvailable") or has(text, "profile-unavailable")) return "The device doesn't support the required profile";
+    if (has(name, "AccessDenied") or has(name, "NotAuthorized")) return "Permission denied — check the polkit/D-Bus policy";
     if (text.len > 0) return text;
     return name;
 }
 
-// ================================================================= агент сопряжения
+// ================================================================= pairing agent
 
 pub const ReqKind = enum { none, confirm, authorize, ask_pin, ask_passkey, show_passkey, show_pin };
 
@@ -552,30 +552,30 @@ pub const Req = struct {
 };
 
 pub var req: Req = .{};
-/// агент получил запрос или отмену — экран нужно перерисовать
+/// the agent got a request or a cancel — the screen must be redrawn
 pub var req_changed = false;
 
 fn incoming(q: *const Req, sender: []const u8) dbus.Incoming {
     return .{ .serial = q.serial, .flags = q.flags, .sender = sender, .path = AGENT_PATH, .iface = AGENT, .member = "", .sig = "", .body = "" };
 }
 
-/// Отклонить отложенный запрос (если он есть).
+/// Reject the pending request (if any).
 pub fn rejectPending() void {
     if (!req.deferred()) {
         req.kind = .none;
         return;
     }
     const m = incoming(&req, req.sender_buf[0..req.sender_len]);
-    bus.replyError(&m, "org.bluez.Error.Rejected", "отклонено пользователем");
+    bus.replyError(&m, "org.bluez.Error.Rejected", "rejected by the user");
     req.kind = .none;
 }
 
-/// Ответ пользователя на запрос агента. Для ask_pin/ask_passkey — введённое значение.
+/// The user's answer to an agent request. For ask_pin/ask_passkey — the entered value.
 pub fn answer(accept: bool, value: []const u8) void {
     if (!req.deferred()) return;
     const m = incoming(&req, req.sender_buf[0..req.sender_len]);
     if (!accept) {
-        bus.replyError(&m, "org.bluez.Error.Rejected", "отклонено пользователем");
+        bus.replyError(&m, "org.bluez.Error.Rejected", "rejected by the user");
     } else switch (req.kind) {
         .ask_pin => {
             var w = dbus.W{ .buf = &body_buf };
@@ -597,11 +597,11 @@ pub fn answer(accept: bool, value: []const u8) void {
 fn onMethod(c: *dbus.Conn, m: *const dbus.Incoming) void {
     const eql = std.mem.eql;
     if (!eql(u8, m.path, AGENT_PATH) or !eql(u8, m.iface, AGENT)) {
-        return c.replyError(m, "org.freedesktop.DBus.Error.UnknownObject", "нет такого объекта");
+        return c.replyError(m, "org.freedesktop.DBus.Error.UnknownObject", "no such object");
     }
-    // отвечаем только самому bluetoothd
+    // reply only to bluetoothd itself
     if (!eql(u8, m.sender, owner_buf[0..owner_len])) {
-        return c.replyError(m, "org.freedesktop.DBus.Error.AccessDenied", "доступ запрещён");
+        return c.replyError(m, "org.freedesktop.DBus.Error.AccessDenied", "access denied");
     }
     var r = m.reader();
     const mem = m.member;
@@ -611,7 +611,7 @@ fn onMethod(c: *dbus.Conn, m: *const dbus.Incoming) void {
         req_changed = true;
         return c.reply(m, "", "");
     }
-    // новый запрос вытесняет старый (старый отклоняем)
+    // a new request replaces the old one (the old one is rejected)
     rejectPending();
     var q = Req{ .serial = m.serial, .flags = m.flags };
     q.sender_len = @min(m.sender.len, q.sender_buf.len);
@@ -643,11 +643,11 @@ fn onMethod(c: *dbus.Conn, m: *const dbus.Incoming) void {
         q.device.set(r.str());
         q.kind = .ask_passkey;
     } else {
-        return c.replyError(m, "org.bluez.Error.Rejected", "не поддерживается");
+        return c.replyError(m, "org.bluez.Error.Rejected", "not supported");
     }
     if (r.bad) {
         q.kind = .none;
-        return c.replyError(m, "org.bluez.Error.Rejected", "неверные аргументы");
+        return c.replyError(m, "org.bluez.Error.Rejected", "invalid arguments");
     }
     req = q;
     req_changed = true;

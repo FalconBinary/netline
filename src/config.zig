@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Настройки zpanel. Правите этот файл и пересобираете: `zig build -Doptimize=ReleaseSafe`.
-//! Цвета можно менять и без пересборки — через файл темы (см. `theme_file` ниже и README).
+//! netline settings. Edit this file and rebuild: `zig build -Doptimize=ReleaseSafe`.
+//! Colors can also be changed without rebuilding — through the theme file (see `theme_file` below and the README).
 
 const hex = @import("color.zig").hex;
 
@@ -10,96 +10,108 @@ pub const Position = enum { top, bottom };
 pub const TagStyle = enum { dots, numbers };
 pub const ClockFormat = enum { hm, hms, date_hm, full };
 
-/// Элементы панели. Часы всегда по центру.
+/// Panel items. The clock is always in the center.
 pub const Item = enum { launcher, tags, clock, wifi, bluetooth, wallpaper, power };
 
 pub const left = [_]Item{ .launcher, .tags };
 pub const right = [_]Item{ .wifi, .bluetooth, .wallpaper, .power };
 
-// ---------------------------------------------------------------- геометрия (логические пиксели)
+// ---------------------------------------------------------------- geometry (logical pixels)
 
 pub const position: Position = .top;
 pub const height: u32 = 34;
-pub const margin_edge: i32 = 6; // отступ от края экрана
-pub const margin_side: i32 = 10; // отступы слева и справа
-pub const radius: f32 = 12; // скругление панели (0 — прямые углы)
-pub const border_width: f32 = 0; // толщина рамки (0 — без рамки), цвет — theme.border
-pub const padding: f32 = 6; // внутренний отступ по краям
-pub const spacing: f32 = 2; // расстояние между кнопками
-pub const button: f32 = 26; // размер кнопки (область клика и подсветки)
+pub const margin_edge: i32 = 6; // gap from the screen edge
+pub const margin_side: i32 = 10; // gaps on the left and right
+pub const radius: f32 = 12; // panel corner rounding (0 — square corners)
+pub const border_width: f32 = 0; // border thickness (0 — no border), color — theme.border
+pub const padding: f32 = 6; // inner padding at the ends
+pub const spacing: f32 = 2; // space between buttons
+pub const button: f32 = 26; // button size (click and highlight area)
 pub const button_radius: f32 = 8;
-pub const icon: f32 = 16; // размер иконки
-pub const icon_stroke: f32 = 1.6; // толщина линий иконок
-pub const hover_effect = true; // подсвечивать кнопку под курсором
+pub const icon: f32 = 16; // icon size
+pub const icon_stroke: f32 = 1.6; // icon line thickness
+pub const hover_effect = true; // highlight the button under the pointer
 
-pub const clock_size: f32 = 12; // высота цифр часов
-/// .hm — 13:31, .hms — 13:31:05 (будит панель каждую секунду), .date_hm — 12.10  13:31,
-/// .full — Пн, 12 октября 2026  13:31
+pub const clock_size: f32 = 12; // height of the clock digits
+/// Font for the date and time — the first file found is used (TrueType .ttf with glyf outlines).
+/// Put your own path first. Monospaced digits keep the clock from shifting as minutes change:
+/// Noto Sans and DejaVu Sans already have them. If none is found, the clock is drawn with the
+/// panel's vector digits and the date in numbers.
+pub const clock_font_paths = [_][]const u8{
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf", // Arch
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", // Debian/Ubuntu
+    "/usr/share/fonts/google-noto/NotoSans-Regular.ttf", // Fedora
+    "/usr/share/fonts/TTF/DejaVuSans.ttf", // Arch
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // Debian/Ubuntu
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", // Fedora
+};
+/// .hm — 13:31, .hms — 13:31:05 (wakes the panel every second), .date_hm — 12.10  13:31,
+/// .full — Mon, 12 October 2026  13:31
 pub const clock_format: ClockFormat = .full;
 
 pub const tag_style: TagStyle = .dots;
-pub const hide_empty_tags = false; // прятать пустые неактивные теги
-pub const tag_dot_w: f32 = 16; // ширина ячейки тега (стиль dots)
-pub const tag_active_w: f32 = 30; // ширина активного тега (стиль dots)
-pub const tag_number_w: f32 = 24; // ширина ячейки тега (стиль numbers)
+pub const hide_empty_tags = false; // hide empty inactive tags
+pub const tag_dot_w: f32 = 16; // tag cell width (dots style)
+pub const tag_active_w: f32 = 30; // active tag width (dots style)
+pub const tag_number_w: f32 = 24; // tag cell width (numbers style)
 pub const tag_number_size: f32 = 10;
 
-// ---------------------------------------------------------------- нагрузка и безопасность
+// ---------------------------------------------------------------- load and security
 
-/// Wi‑Fi/Bluetooth обновляются по событиям ядра (netlink). Этот опрос — только запасной:
-/// уровень сигнала и включение адаптера через BlueZ событий ядра не дают.
+/// Wi‑Fi/Bluetooth are updated on kernel events (netlink). This poll is only a fallback:
+/// kernel events don't report signal level or adapter power through BlueZ.
 pub const status_poll_s: u32 = 30;
 
-/// Песочница: seccomp (запрет exec, сетевых сокетов, записи файлов) + Landlock (чтение только
-/// /sys, /proc, tzdata и папки темы). Внешние команды запускает отдельный процесс-брокер,
-/// и только из списка ниже. Выключать имеет смысл лишь для отладки.
+/// Sandbox: seccomp (no exec, network sockets or file writes) + Landlock (read-only access to
+/// /sys, /proc, tzdata and the theme folder). External commands are run by a separate broker process,
+/// and only from the list below. Turning it off only makes sense for debugging.
 pub const sandbox = true;
 
-/// Файл темы относительно $XDG_CONFIG_HOME (или ~/.config). Перечитывается при сохранении.
-pub const theme_file = "zpanel/theme";
+/// Theme file relative to $XDG_CONFIG_HOME (or ~/.config). Reread when saved.
+pub const theme_file = "netline/theme";
 
-// ---------------------------------------------------------------- цвета
-// Формат: "#RRGGBB" или "#RRGGBBAA" (AA — прозрачность, ff — непрозрачный).
-// Любое поле можно переопределить в файле темы строкой `имя = #цвет`.
+// ---------------------------------------------------------------- colors
+// Format: "#RRGGBB" or "#RRGGBBAA" (AA is opacity, ff — opaque).
+// Any field can be overridden in the theme file with a `name = #color` line.
 
 pub const Theme = struct {
-    // панель
+    // panel
     background: u32,
     border: u32,
     hover: u32,
-    // лаунчер
+    // launcher
     launcher: u32,
-    // теги
+    // tags
     tag_active: u32,
     tag_occupied: u32,
     tag_empty: u32,
     tag_urgent: u32,
-    tag_active_text: u32, // цифра на активном теге (стиль numbers)
-    // часы
+    tag_active_text: u32, // digit on the active tag (numbers style)
+    // clock
     clock: u32,
     // Wi‑Fi
-    wifi: u32, // горящие дуги и точка
-    wifi_inactive: u32, // негорящие дуги
-    wifi_off: u32, // перечёркивание при выключенном радио
+    wifi: u32, // lit arcs and dot
+    wifi_inactive: u32, // unlit arcs
+    wifi_off: u32, // strike-through when the radio is off
     // Bluetooth
     bluetooth_on: u32,
     bluetooth_connected: u32,
     bluetooth_off: u32,
-    // обои и питание
+    // wallpaper and power
     wallpaper: u32,
     power: u32,
-    // меню Wi‑Fi (zwifi)
+    // Wi‑Fi menu (zwifi)
     menu_background: u32,
-    menu_backdrop: u32, // затемнение экрана вокруг меню
+    menu_backdrop: u32, // screen dimming around the menu
     menu_text: u32,
     menu_muted: u32,
     menu_accent: u32,
-    menu_accent_text: u32, // текст на акцентной кнопке
-    menu_field: u32, // поля ввода и вторичные кнопки
+    menu_accent_text: u32, // text on the accent button
+    menu_field: u32, // input fields and secondary buttons
     menu_border: u32,
     menu_hover: u32,
     menu_error: u32,
-    // рабочий стол (zbg): цвет, пока обои не выбраны, и поля в режиме .fit
+    // desktop (zbg): color until a wallpaper is chosen, and the borders in .fit mode
     desktop: u32,
 };
 
@@ -135,10 +147,10 @@ pub const theme = Theme{
     .desktop = hex("#11111b"),
 };
 
-// ---------------------------------------------------------------- меню (zwifi, zbt, zwall, zpower, zcal)
+// ---------------------------------------------------------------- menus (zwifi, zbt, zwall, zpower, zcal)
 
-/// Шрифты TrueType (.ttf, контуры glyf) — берётся первый найденный.
-/// CFF/OTF не поддерживаются. Вставьте свой путь первой строкой.
+/// TrueType fonts (.ttf, glyf outlines) — the first one found is used.
+/// CFF/OTF are not supported. Put your own path first.
 pub const font_paths = [_][]const u8{
     "/usr/share/fonts/noto/NotoSans-Regular.ttf", // Arch
     "/usr/share/fonts/TTF/DejaVuSans.ttf", // Arch
@@ -148,44 +160,44 @@ pub const font_paths = [_][]const u8{
     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", // Fedora
     "/usr/share/fonts/TTF/Inter-Regular.ttf",
 };
-/// Размер карточек Wi‑Fi и Bluetooth (у питания, календаря и обоев — свой).
+/// Size of the Wi‑Fi and Bluetooth cards (power, calendar and wallpaper have their own).
 pub const menu_width: u32 = 400;
 pub const menu_height: u32 = 500;
 pub const menu_radius: f32 = 16;
 
-/// Питание: спрашивать подтверждение для выхода, перезагрузки и выключения.
+/// Power: ask for confirmation to log out, reboot and power off.
 pub const power_confirm = true;
-/// Перед сном блокировать экран командой lock_cmd.
+/// Lock the screen with lock_cmd before sleeping.
 pub const lock_before_suspend = true;
 
-/// Папка с обоями (~ — домашняя папка). Поддерживаются JPEG и PNG.
+/// Wallpaper folder (~ is the home folder). JPEG and PNG are supported.
 pub const wallpaper_dir = "~/Pictures/wallpapers";
-/// Как вписывать обои: .fill — заполнить экран с обрезкой краёв, .fit — целиком, с полями.
+/// How to fit the wallpaper: .fill — fill the screen cropping the edges, .fit — whole, with borders.
 pub const wallpaper_mode: enum { fill, fit } = .fill;
 
 pub const lock_cmd = "swaylock -f";
 
-// ---------------------------------------------------------------- лаунчер (zrun)
+// ---------------------------------------------------------------- launcher (zrun)
 
-/// Ширина карточки и сколько строк видно в списке.
+/// Card width and how many rows of the list are visible.
 pub const launcher_width: u32 = 520;
 pub const launcher_rows: u32 = 7;
-/// Иконки приложений (PNG из темы иконок). false — только плитки с буквой.
+/// Application icons (PNG from the icon theme). false — only letter tiles.
 pub const launcher_icons = true;
-/// Тема иконок; "" — как в GTK (gtk-icon-theme-name в ~/.config/gtk-3.0/settings.ini).
-/// Читаются только PNG: у тем из одних SVG (Papirus и т. п.) иконки берутся из hicolor,
-/// а если и там нет — рисуется плитка с буквой.
+/// Icon theme; "" — same as GTK (gtk-icon-theme-name in ~/.config/gtk-3.0/settings.ini).
+/// Only PNG is read: for SVG-only themes (Papirus etc.) icons come from hicolor,
+/// and if they aren't there either, a letter tile is drawn.
 pub const icon_theme = "";
-/// Терминал для приложений с Terminal=true и для Shift+Enter: команда дописывается в конец.
-/// foot, kitty — как есть; alacritty, xterm, ghostty — .{ "alacritty", "-e" }; wezterm — .{ "wezterm", "start", "--" }.
+/// Terminal for apps with Terminal=true and for Shift+Enter: the command is appended at the end.
+/// foot, kitty — as is; alacritty, xterm, ghostty — .{ "alacritty", "-e" }; wezterm — .{ "wezterm", "start", "--" }.
 pub const terminal = [_][:0]const u8{"foot"};
 
-// ---------------------------------------------------------------- действия
-// Команды выполняет процесс-брокер: простые («zwifi toggle») — сразу, без shell,
-// со спецсимволами (кавычки, |, ;, $, ~ …) — через /bin/sh -c. Сама панель запускать
-// программы не может — брокер исполняет только команды, вшитые сюда при сборке.
-// zrun, zwifi, zbt, zwall, zpower и zcal лежат рядом с zpanel — брокер находит их сам.
-// null — ничего не делать.
+// ---------------------------------------------------------------- actions
+// Commands are run by the broker process: simple ones ("zwifi toggle") directly, without a shell,
+// ones with special characters (quotes, |, ;, $, ~ …) via /bin/sh -c. The panel itself cannot
+// launch programs — the broker only runs commands built in here at compile time.
+// zrun, zwifi, zbt, zwall, zpower and zcal live next to netline — the broker finds them itself.
+// null — do nothing.
 
 pub const Action = struct {
     left: ?[*:0]const u8 = null,
@@ -194,8 +206,8 @@ pub const Action = struct {
 };
 
 pub const launcher = Action{
-    .left = "zrun", // приложения; rofi тоже можно: "rofi -show drun"
-    .right = "zrun run", // команды из PATH
+    .left = "zrun", // applications; rofi works too: "rofi -show drun"
+    .right = "zrun run", // commands from PATH
 };
 
 pub const clock = Action{ .left = "zcal" };

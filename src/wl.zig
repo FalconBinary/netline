@@ -1,17 +1,17 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Минимальная реализация wire-протокола Wayland поверх unix-сокета.
-//! Никакого libwayland: сами сериализуем запросы и разбираем события.
+//! Minimal implementation of the Wayland wire protocol over a unix socket.
+//! No libwayland: we serialize requests and parse events ourselves.
 
 const std = @import("std");
 const sys = @import("sys.zig");
 
 pub const MAX_IDS = 1024;
 
-/// Аргумент-дескриптор (передаётся через SCM_RIGHTS).
+/// File descriptor argument (passed via SCM_RIGHTS).
 pub const Fd = struct { fd: i32 };
-/// Строковый аргумент (null — пустая/NULL строка).
+/// String argument (null — empty/NULL string).
 pub const Str = struct { s: ?[]const u8 };
 pub fn str(s: []const u8) Str {
     return .{ .s = s };
@@ -23,7 +23,7 @@ pub const Event = struct {
     args: Args,
 };
 
-/// Последовательное чтение аргументов события.
+/// Sequential reading of event arguments.
 pub const Args = struct {
     d: []const u8,
     p: usize = 0,
@@ -44,22 +44,22 @@ pub const Args = struct {
     pub fn string(self: *Args) []const u8 {
         const len: usize = self.uint();
         if (len == 0) return "";
-        // считаем в usize и сравниваем с остатком — без переполнений на «злых» длинах
+        // compute in usize and compare with the remainder — no overflow on "evil" lengths
         const rest = self.d.len - self.p;
         if (len > rest) {
             self.p = self.d.len;
             return "";
         }
         const padded = @min((len + 3) & ~@as(usize, 3), rest);
-        const s = self.d[self.p .. self.p + len - 1]; // без завершающего нуля
+        const s = self.d[self.p .. self.p + len - 1]; // without the terminating zero
         self.p += padded;
         return s;
     }
 };
 
-// Буферы соединения — отдельные глобальные массивы: так они попадают в .bss (ни места
-// в файле, ни памяти, пока не тронуты). Внутри структуры с другими значениями по
-// умолчанию они уходили в .data целиком. Соединение с Wayland в процессе одно.
+// Connection buffers are separate global arrays: that way they land in .bss (no space
+// in the file, no memory until touched). Inside a struct with other default values
+// they went into .data whole. There is one Wayland connection per process.
 var out_buf: [16384]u8 = undefined;
 var in_buf: [65536]u8 = undefined;
 var free_buf: [MAX_IDS]u32 = undefined;
@@ -93,7 +93,7 @@ pub const Conn = struct {
 
     pub fn newId(self: *Conn) u32 {
         if (self.nfree > 0) {
-            // берём наименьший освобождённый id
+            // take the smallest freed id
             var best: usize = 0;
             for (self.free_ids[0..self.nfree], 0..) |id, i| {
                 if (id < self.free_ids[best]) best = i;
@@ -104,7 +104,7 @@ pub const Conn = struct {
             return id;
         }
         if (self.next_id >= MAX_IDS) {
-            sys.log("закончились id объектов", .{});
+            sys.log("ran out of object ids", .{});
             sys.exit(1);
         }
         const id = self.next_id;
@@ -112,15 +112,15 @@ pub const Conn = struct {
         return id;
     }
 
-    /// Вызывается на wl_display.delete_id — id можно переиспользовать.
+    /// Called on wl_display.delete_id — the id can be reused.
     pub fn releaseId(self: *Conn, id: u32) void {
         if (id == 0 or id >= MAX_IDS or self.nfree >= MAX_IDS) return;
         self.free_ids[self.nfree] = id;
         self.nfree += 1;
     }
 
-    /// Сериализует запрос. Аргументы — кортеж из u32 / i32 / Str / Fd
-    /// (целочисленные литералы считаются u32).
+    /// Serializes a request. Arguments are a tuple of u32 / i32 / Str / Fd
+    /// (integer literals count as u32).
     pub fn send(self: *Conn, obj: u32, op: u16, args: anytype) void {
         if (self.out.len - self.olen < 1024) self.flush() catch fatal();
         const start = self.olen;
@@ -140,7 +140,7 @@ pub const Conn = struct {
                 self.ofds[self.nofds] = a.fd;
                 self.nofds += 1;
             } else {
-                @compileError("неподдерживаемый тип аргумента: " ++ @typeName(T));
+                @compileError("unsupported argument type: " ++ @typeName(T));
             }
         }
         const size: u32 = @intCast(self.olen - start);
@@ -170,13 +170,13 @@ pub const Conn = struct {
         var off: usize = 0;
         while (off < self.olen) {
             const n = try sys.sendmsgFds(self.fd, self.out[off..self.olen], self.ofds[0..self.nofds]);
-            self.nofds = 0; // дескрипторы ушли с первой порцией
+            self.nofds = 0; // the descriptors went out with the first chunk
             off += n;
         }
         self.olen = 0;
     }
 
-    /// Дочитать данные из сокета. false — соединение закрыто.
+    /// Read more data from the socket. false — the connection is closed.
     pub fn fill(self: *Conn) !bool {
         if (self.ipos > 0) {
             const rest = self.ilen - self.ipos;
@@ -199,7 +199,7 @@ pub const Conn = struct {
         return true;
     }
 
-    /// Забрать дескриптор, пришедший с событием (например, wl_keyboard.keymap).
+    /// Take a descriptor that arrived with an event (e.g. wl_keyboard.keymap).
     pub fn takeFd(self: *Conn) ?i32 {
         if (self.nin_fds == 0) return null;
         const f = self.in_fds[0];
@@ -208,7 +208,7 @@ pub const Conn = struct {
         return f;
     }
 
-    /// Следующее полностью прочитанное событие (или null).
+    /// The next fully read event (or null).
     pub fn next(self: *Conn) ?Event {
         const avail = self.ilen - self.ipos;
         if (avail < 8) return null;
@@ -217,7 +217,7 @@ pub const Conn = struct {
         const hdr = std.mem.readInt(u32, p[4..8], .little);
         const size = hdr >> 16;
         if (size < 8) {
-            sys.log("битое сообщение от композитора", .{});
+            sys.log("malformed message from the compositor", .{});
             sys.exit(1);
         }
         if (avail < size) return null;
@@ -226,7 +226,7 @@ pub const Conn = struct {
     }
 
     fn fatal() noreturn {
-        sys.log("ошибка записи в сокет Wayland", .{});
+        sys.log("error writing to the Wayland socket", .{});
         sys.exit(1);
     }
 };

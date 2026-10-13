@@ -7,14 +7,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const release = optimize != .Debug;
-    // замеры (ZPANEL_TRACE=1) — только в сборке с -Dtrace=true, в обычной их кода нет
-    const trace = b.option(bool, "trace", "вкомпилировать замеры: ZPANEL_TRACE=1 печатает пробуждения и время кадров") orelse false;
+    // timing output (NETLINE_TRACE=1) only in a -Dtrace=true build; a normal build has none of that code
+    const trace = b.option(bool, "trace", "compile in timing output: NETLINE_TRACE=1 prints wakeups and frame times") orelse false;
     const opts = b.addOptions();
     opts.addOption(bool, "trace", trace);
 
-    // zpanel — сама панель; меню запускаются кликом по значкам; zbg — демон обоев
+    // netline is the panel itself; menus open on icon clicks; zbg is the wallpaper daemon
     const apps = [_]struct { name: []const u8, root: []const u8 }{
-        .{ .name = "zpanel", .root = "src/main.zig" },
+        .{ .name = "netline", .root = "src/main.zig" },
         .{ .name = "zwifi", .root = "src/wifi.zig" },
         .{ .name = "zbt", .root = "src/bt.zig" },
         .{ .name = "zwall", .root = "src/wall.zig" },
@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .link_libc = false,
                 .single_threaded = true,
-                // в релизе — без отладочной информации и таблиц раскрутки: бинарники меньше
+                // release builds carry no debug info or unwind tables: smaller binaries
                 .strip = if (release) true else null,
                 .unwind_tables = if (release) .none else null,
             }),

@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! zwall — выбор обоев для zpanel на чистом Zig.
+//! zwall — wallpaper picker for netline, in pure Zig.
 //!
-//! Сетка превью из папки обоев, клик — обои сразу меняются (меню остаётся открытым,
-//! можно перебрать несколько). Превью делаются своими декодерами и кэшируются в
-//! ~/.cache/zpanel/thumbs, поэтому повторное открытие мгновенное. Показ обоев — у zbg.
-//! `zwall random` — случайные обои без окна.
+//! A grid of thumbnails from the wallpaper folder; a click changes the wallpaper right away (the menu stays open,
+//! so you can try several). Thumbnails are made by our own decoders and cached in
+//! ~/.cache/netline/thumbs, so reopening is instant. Showing the wallpaper is zbg's job.
+//! `zwall random` — a random wallpaper without a window.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -28,12 +28,12 @@ const TILE_W: f32 = 152;
 const TILE_H: f32 = 95;
 const GAP: f32 = 12;
 const GRID_Y: f32 = 66;
-// превью хранятся в двойном размере — чётко и на HiDPI
+// thumbnails are stored at double size — sharp on HiDPI too
 const TW: u32 = 304;
 const TH: u32 = 190;
 const MAX_FILES = 512;
 
-const State = enum(u8) { pending, ok, failed, cached }; // cached — превью на диске, в памяти его нет
+const State = enum(u8) { pending, ok, failed, cached }; // cached — the thumbnail is on disk, not in memory
 
 var names_buf: [96 * 1024]u8 = undefined;
 var names_len: usize = 0;
@@ -52,16 +52,16 @@ var cache_ok = false;
 var zbg_fd: i32 = -1;
 var cur: ?usize = null;
 var sel: usize = 0;
-var scroll: usize = 0; // первая видимая строка
-// обои меняются асинхронно: меню не замирает, пока zbg декодирует картинку
-var pending: ?usize = null; // отправлено zbg, ждём ответа
-var queued: ?usize = null; // выбрали ещё, пока ждали, — отправим следом
+var scroll: usize = 0; // first visible row
+// the wallpaper changes asynchronously: the menu doesn't freeze while zbg decodes the image
+var pending: ?usize = null; // sent to zbg, waiting for the reply
+var queued: ?usize = null; // picked another one while waiting — send it next
 var in_buf: [320]u8 = undefined;
 var in_len: usize = 0;
 
 const Wid = enum(u8) { none, tile, random };
 
-// ================================================================= запуск
+// ================================================================= startup
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
@@ -88,14 +88,14 @@ pub fn main(init: std.process.Init.Minimal) void {
     }, .{ .read = &.{dir}, .write = write }, .{ .extra = &.{ .lseek, .getrandom }, .write_files = true });
 }
 
-/// До песочницы: папки, список файлов, связь с zbg.
+/// Before the sandbox: folders, file list, connection to zbg.
 fn prepare() void {
     dir = zbg.expandHome(&dir_buf, cfg.wallpaper_dir) orelse "";
     if (sys.getenv("HOME")) |home| {
         var b: [512]u8 = undefined;
         sys.mkdir(sys.joinZ(&b, &.{ home, "/.cache" }));
-        sys.mkdir(sys.joinZ(&b, &.{ home, "/.cache/zpanel" }));
-        cache = sys.joinZ(&cache_buf, &.{ home, "/.cache/zpanel/thumbs" });
+        sys.mkdir(sys.joinZ(&b, &.{ home, "/.cache/netline" }));
+        cache = sys.joinZ(&cache_buf, &.{ home, "/.cache/netline/thumbs" });
         sys.mkdir(cache);
         cache_ok = sys.exists(cache);
     }
@@ -157,14 +157,14 @@ fn listFiles() void {
 
 fn start() void {
     ensureVisible();
-    if (nfiles > 0) ui.setTimer(1, 0); // превью готовятся в фоне небольшими порциями
+    if (nfiles > 0) ui.setTimer(1, 0); // thumbnails are prepared in the background in small portions
 }
 
-// ================================================================= связь с zbg
+// ================================================================= talking to zbg
 
 var reply_buf: [320]u8 = undefined;
 
-/// Отправить команду и дождаться строки ответа (до 10 с).
+/// Send a command and wait for a reply line (up to 10 s).
 fn ask(cmd: []const u8) ?[]const u8 {
     if (zbg_fd < 0) return null;
     sys.sendAll(zbg_fd, cmd) catch return null;
@@ -181,7 +181,7 @@ fn ask(cmd: []const u8) ?[]const u8 {
     return null;
 }
 
-const NO_ZBG = "Демон обоев zbg не запущен — добавьте exec_once=zbg в конфиг mango";
+const NO_ZBG = "The zbg wallpaper daemon is not running — add exec_once=zbg to the mango config";
 
 fn zbgFd() i32 {
     return zbg_fd;
@@ -200,7 +200,7 @@ fn apply(i: usize) void {
     if (i >= nfiles) return;
     if (zbg_fd < 0) return ui.setMsg(NO_ZBG);
     if (pending != null) {
-        queued = i; // применим, когда zbg закончит с предыдущими
+        queued = i; // apply when zbg is done with the previous ones
         return;
     }
     var b: [300]u8 = undefined;
@@ -210,7 +210,7 @@ fn apply(i: usize) void {
     ui.redraw();
 }
 
-/// Ответ zbg на "set": "ok" или "err текст".
+/// zbg's reply to "set": "ok" or "err text".
 fn onZbg() void {
     const n = sys.read(zbg_fd, in_buf[in_len..]) catch 0;
     if (n == 0) return lostZbg();
@@ -242,11 +242,11 @@ fn randomCli() void {
     listFiles();
     connectZbg();
     if (zbg_fd < 0) {
-        sys.log("zbg не запущен", .{});
+        sys.log("zbg is not running", .{});
         sys.exit(1);
     }
     if (nfiles == 0) {
-        sys.log("в {s} нет изображений", .{dir});
+        sys.log("no images in {s}", .{dir});
         sys.exit(1);
     }
     if (ask("get\n")) |r| {
@@ -257,7 +257,7 @@ fn randomCli() void {
     var i: usize = @intCast(sys.random() % nfiles);
     if (cur != null and i == cur.? and nfiles > 1) i = (i + 1 + @as(usize, @intCast(sys.random() % (nfiles - 1)))) % nfiles;
     var b: [300]u8 = undefined;
-    const r = ask(sys.joinZ(&b, &.{ "set ", names[i], "\n" })) orelse "нет ответа";
+    const r = ask(sys.joinZ(&b, &.{ "set ", names[i], "\n" })) orelse "no reply";
     if (!std.mem.eql(u8, r, "ok")) {
         sys.log("{s}: {s}", .{ names[i], r });
         sys.exit(1);
@@ -265,7 +265,7 @@ fn randomCli() void {
     sys.exit(0);
 }
 
-// ================================================================= превью
+// ================================================================= thumbnails
 
 fn fnv(s: []const u8, h0: u64) u64 {
     var h = h0;
@@ -273,7 +273,7 @@ fn fnv(s: []const u8, h0: u64) u64 {
     return h;
 }
 
-/// Ключ превью: имя и размер файла (файл заменили — превью пересоздастся).
+/// Thumbnail key: file name and size (if the file is replaced, the thumbnail is remade).
 fn cacheKey(i: usize) u64 {
     var hb: [8]u8 = undefined;
     std.mem.writeInt(u64, &hb, sizes[i], .little);
@@ -286,7 +286,7 @@ fn cachePath(buf: []u8, i: usize) [:0]const u8 {
     return sys.joinZ(buf, &.{ cache, "/", n });
 }
 
-/// Удалить превью файлов, которых в папке больше нет (кэш не растёт бесконечно).
+/// Remove thumbnails of files no longer in the folder (so the cache doesn't grow forever).
 fn pruneCache() void {
     if (!cache_ok) return;
     var d = sys.Dir.open(cache) orelse return;
@@ -346,24 +346,24 @@ fn saveCached(i: usize, rgb: []const u8) void {
     sys.writeAll(fd, rgb) catch return;
 }
 
-var work: [TW * TH]u32 = undefined; // рабочий буфер превью (не на стеке)
+var work: [TW * TH]u32 = undefined; // thumbnail work buffer (not on the stack)
 
-/// Масштаб, под который готовы превью в памяти (0 — ещё не было кадра). На диске превью
-/// всегда 304×190; в памяти — сразу в размере плитки на экране: при 1× это 152×95
-/// (вчетверо меньше памяти), и кадр рисует их пиксель в пиксель, без усреднения.
+/// The scale the in-memory thumbnails are prepared for (0 — no frame yet). On disk thumbnails
+/// are always 304×190; in memory they are right at the on-screen tile size: at 1× that's 152×95
+/// (a quarter of the memory), and the frame draws them pixel for pixel, without averaging.
 var ts: u32 = 0;
 
 fn thumbSize() [2]u32 {
     return if (ts == 1) .{ TW / 2, TH / 2 } else .{ TW, TH };
 }
 
-/// Превью 304×190 → под масштаб ts (при 1× — усреднение 2×2, как делал бы кадр).
+/// Thumbnail 304×190 → for scale ts (at 1× — 2×2 averaging, as the frame would do).
 fn fitThumb(k: usize) void {
     if (ts != 1) return;
     const big = thumbs[k];
     const w = TW / 2;
     const h = TH / 2;
-    const small = sys.mmapAnon(w * h * 3) catch return; // не вышло — останется большое
+    const small = sys.mmapAnon(w * h * 3) catch return; // didn't work — the large one stays
     for (0..h) |y| {
         for (0..w) |x| {
             for (0..3) |c| {
@@ -377,7 +377,7 @@ fn fitThumb(k: usize) void {
     thumbs[k] = small[0 .. w * h * 3];
 }
 
-/// Масштаб экрана поменялся (или первый кадр): превью в памяти — заново под него.
+/// The screen scale changed (or the first frame): redo the in-memory thumbnails for it.
 fn rescale(s: u32) void {
     ts = s;
     for (0..nfiles) |i| {
@@ -388,9 +388,9 @@ fn rescale(s: u32) void {
     if (nfiles > 0) ui.setTimer(1, 0);
 }
 
-/// Превью в памяти — только для видимого экрана и экрана сверху и снизу (≤ 36 штук: ~1,5 МБ при 1×, ~6 МБ при 2×),
-/// остальные лежат в кэше на диске и подгружаются за миллисекунду. Раньше в памяти держались
-/// все: 100 обоев — 17 МБ, 512 — 88 МБ.
+/// Thumbnails in memory only for the visible screen and the screens above and below (≤ 36: ~1.5 MB at 1×, ~6 MB at 2×),
+/// the rest stay in the disk cache and load in a millisecond. Previously all of them were kept
+/// in memory: 100 wallpapers — 17 MB, 512 — 88 MB.
 fn window() [2]usize {
     const lo = (if (scroll > ROWS) scroll - ROWS else 0) * COLS;
     return .{ @min(lo, nfiles), @min(nfiles, (scroll + 2 * ROWS) * COLS) };
@@ -401,7 +401,7 @@ fn freeThumb(i: usize) void {
     thumbs[i] = &[_]u8{};
 }
 
-/// Превью вне окна — убрать из памяти (если кэш на диске есть).
+/// Drop a thumbnail outside the window from memory (if there is a disk cache).
 fn dropIfOutside(i: usize) void {
     if (!cache_ok or states[i] != .ok) return;
     const win = window();
@@ -410,15 +410,15 @@ fn dropIfOutside(i: usize) void {
     states[i] = .cached;
 }
 
-/// После прокрутки: лишнее — из памяти, недостающие видимые — подгрузить.
+/// After scrolling: the excess out of memory, the missing visible ones loaded.
 fn trimThumbs() void {
     for (0..nfiles) |i| dropIfOutside(i);
     if (nfiles > 0) ui.setTimer(1, 0);
 }
 
-/// Сделать одно превью: сначала видимые.
+/// Make one thumbnail: visible ones first.
 fn makeOne() bool {
-    if (ts == 0) return false; // масштаб узнаем с первым кадром
+    if (ts == 0) return false; // we learn the scale with the first frame
     var pick: ?usize = null;
     const first = scroll * COLS;
     var i = first;
@@ -465,12 +465,12 @@ fn makeOne() bool {
     states[k] = .ok;
     saveCached(k, thumbs[k]);
     fitThumb(k);
-    dropIfOutside(k); // невидимое превью сделано заранее — в кэш на диск, из памяти долой
+    dropIfOutside(k); // an invisible thumbnail made ahead of time — to the disk cache, out of memory
     return true;
 }
 
-/// Превью из кэша грузятся пачкой, новые декодируются по одному — около 15 мс за такт,
-/// чтобы меню отвечало сразу.
+/// Cached thumbnails load in a batch, new ones are decoded one at a time — about 15 ms per tick,
+/// so the menu responds right away.
 fn onTick() void {
     const t0 = sys.monoMs();
     var any = false;
@@ -484,7 +484,7 @@ fn onTick() void {
     }
 }
 
-// ================================================================= навигация
+// ================================================================= navigation
 
 fn ensureVisible() void {
     const row = sel / COLS;
@@ -550,7 +550,7 @@ fn activate(w: ui.Widget, right: bool) void {
     }
 }
 
-// ================================================================= раскладка и рисование
+// ================================================================= layout and drawing
 
 fn tilePos(i: usize) [2]f32 {
     const r = i / COLS - scroll;
@@ -574,11 +574,11 @@ fn paint(cv: *draw.Canvas) void {
     const H = ui.H();
     var sb: [48]u8 = undefined;
     const sub = if (nfiles == 0) "" else std.fmt.bufPrint(&sb, "{d} {s}", .{ nfiles, plural(nfiles) }) catch "";
-    ui.header(cv, "Обои", sub, false);
+    ui.header(cv, "Wallpaper", sub, false);
     if (nfiles == 0) {
-        ui.centered(cv, "Здесь пока пусто", W / 2, H / 2 - 10, 15, t.menu_text);
+        ui.centered(cv, "Nothing here yet", W / 2, H / 2 - 10, 15, t.menu_text);
         var b: [600]u8 = undefined;
-        const hint = sys.joinZ(&b, &.{ "Положите .jpg или .png в ", cfg.wallpaper_dir });
+        const hint = sys.joinZ(&b, &.{ "Put .jpg or .png files in ", cfg.wallpaper_dir });
         ui.centered(cv, hint, W / 2, H / 2 + 14, 12, t.menu_muted);
     }
     const S = ui.S;
@@ -587,14 +587,14 @@ fn paint(cv: *draw.Canvas) void {
     const tsz = thumbSize();
     for (ui.widgets[0..ui.nwid]) |w| {
         switch (@as(Wid, @enumFromInt(w.id))) {
-            .random => ui.button(cv, w, "Случайные", .secondary),
+            .random => ui.button(cv, w, "Random", .secondary),
             .tile => {
                 const i = w.idx;
                 if (states[i] == .ok) {
                     cv.image(thumbs[i], tsz[0], tsz[1], w.x * S, w.y * S, w.w * S, w.h * S, 10 * S);
                 } else {
                     ui.rrect(cv, w.x, w.y, w.w, w.h, 10, t.menu_field);
-                    if (states[i] == .failed) ui.centered(cv, "не открывается", w.x + w.w / 2, ui.mid(w.y, w.h, 11), 11, t.menu_muted);
+                    if (states[i] == .failed) ui.centered(cv, "can't open", w.x + w.w / 2, ui.mid(w.y, w.h, 11), 11, t.menu_muted);
                 }
                 const is_cur = cur != null and cur.? == i;
                 const waiting = (pending != null and pending.? == i) or (queued != null and queued.? == i);
@@ -606,15 +606,15 @@ fn paint(cv: *draw.Canvas) void {
                 } else if (lit) {
                     ui.outline(cv, w.x - 1, w.y - 1, w.w + 2, w.h + 2, 11, t.menu_text, 2);
                 }
-                if (waiting) { // применяется — затемняем и пишем
+                if (waiting) { // being applied — dim it and say so
                     ui.rrect(cv, w.x, w.y, w.w, w.h, 10, 0x99000000);
-                    ui.centered(cv, "применяю…", w.x + w.w / 2, ui.mid(w.y, w.h, 12), 12, 0xffffffff);
+                    ui.centered(cv, "applying…", w.x + w.w / 2, ui.mid(w.y, w.h, 12), 12, 0xffffffff);
                 }
             },
             .none => {},
         }
     }
-    // подпись: файл под курсором или выбранный стрелками
+    // caption: the file under the pointer or selected with the arrows
     var show: ?usize = if (ui.kbd_nav) sel else null;
     if (!ui.kbd_nav and ui.hover.id == @intFromEnum(Wid.tile)) show = ui.hover.idx;
     if (show == null and cur != null) show = cur;
@@ -623,7 +623,7 @@ fn paint(cv: *draw.Canvas) void {
     } else if (show) |i| {
         _ = ui.text(cv, names[i], PAD, H - 22, 12, t.menu_muted, W - PAD);
     }
-    // полоса прокрутки
+    // scroll bar
     const rows = (nfiles + COLS - 1) / COLS;
     if (rows > ROWS) {
         const track = ROWS * TILE_H + (ROWS - 1) * GAP;
@@ -634,9 +634,5 @@ fn paint(cv: *draw.Canvas) void {
 }
 
 fn plural(n: usize) []const u8 {
-    const m10 = n % 10;
-    const m100 = n % 100;
-    if (m10 == 1 and m100 != 11) return "изображение";
-    if (m10 >= 2 and m10 <= 4 and (m100 < 12 or m100 > 14)) return "изображения";
-    return "изображений";
+    return if (n == 1) "image" else "images";
 }

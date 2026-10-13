@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Тонкие обёртки над системными вызовами Linux. Без libc, без std.posix —
-//! только сырые syscall'ы, чтобы код не зависел от изменений std между версиями Zig.
+//! Thin wrappers over Linux system calls. No libc, no std.posix —
+//! only raw syscalls, so the code doesn't depend on std changes between Zig versions.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -36,26 +36,26 @@ const SOCK_CLOEXEC: usize = 0o2000000;
 pub const MSG_NOSIGNAL: usize = 0x4000;
 pub const ECANCELED: usize = 125;
 
-// ---------------------------------------------------------------- файлы
+// ---------------------------------------------------------------- files
 
 pub fn openRead(path: [*:0]const u8) Error!i32 {
     const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), O_CLOEXEC, 0));
     return @intCast(rc);
 }
 
-/// Открыть или создать файл (O_RDWR|O_CREAT, 0600).
+/// Open or create a file (O_RDWR|O_CREAT, 0600).
 pub fn openCreate(path: [*:0]const u8) Error!i32 {
     const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), 2 | 0o100 | O_CLOEXEC, 0o600));
     return @intCast(rc);
 }
 
-/// Создать файл заново (O_WRONLY|O_CREAT|O_TRUNC, 0600).
+/// Create a file anew (O_WRONLY|O_CREAT|O_TRUNC, 0600).
 pub fn createFile(path: [*:0]const u8) Error!i32 {
     const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), 1 | 0o100 | 0o1000 | O_CLOEXEC, 0o600));
     return @intCast(rc);
 }
 
-/// mkdir 0700 (если уже есть — не ошибка).
+/// mkdir 0700 (already existing is not an error).
 pub fn mkdir(path: [*:0]const u8) void {
     _ = linux.syscall3(.mkdirat, ufd(AT_FDCWD), @intFromPtr(path), 0o700);
 }
@@ -64,7 +64,7 @@ pub fn lseek(fd: i32, off: usize) Error!usize {
     return check(linux.syscall3(.lseek, ufd(fd), off, 0)); // SEEK_SET
 }
 
-/// accept4 без адреса; null — ошибка.
+/// accept4 without an address; null — error.
 pub fn accept(fd: i32) ?i32 {
     const c = check(linux.syscall4(.accept4, ufd(fd), 0, 0, SOCK_CLOEXEC)) catch return null;
     return @intCast(c);
@@ -75,7 +75,7 @@ pub fn openRW(path: [*:0]const u8) Error!i32 {
     return @intCast(rc);
 }
 
-/// O_PATH-дескриптор (для правил Landlock).
+/// An O_PATH descriptor (for Landlock rules).
 pub fn openPath(path: [*:0]const u8) Error!i32 {
     const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), O_PATH | O_CLOEXEC, 0));
     return @intCast(rc);
@@ -94,7 +94,7 @@ pub fn write(fd: i32, data: []const u8) Error!usize {
     return check(linux.syscall3(.write, ufd(fd), @intFromPtr(data.ptr), data.len));
 }
 
-/// Записать всё (в файл; для сокетов — sendAll).
+/// Write everything (to a file; for sockets — sendAll).
 pub fn writeAll(fd: i32, data: []const u8) Error!void {
     var off: usize = 0;
     while (off < data.len) {
@@ -115,7 +115,7 @@ pub fn close(fd: i32) void {
     if (fd >= 0) _ = linux.syscall1(.close, ufd(fd));
 }
 
-/// Читает файл целиком (или сколько влезет в buf). null — если не открылся.
+/// Reads a whole file (or as much as fits in buf). null — if it didn't open.
 pub fn readFile(path: [*:0]const u8, buf: []u8) ?[]u8 {
     const fd = openRead(path) catch return null;
     defer close(fd);
@@ -134,17 +134,17 @@ pub fn exists(path: [*:0]const u8) bool {
     return true;
 }
 
-/// Есть ли что-то по пути (файл, папка, сокет) — без открытия (faccessat F_OK).
+/// Whether anything exists at the path (file, folder, socket) — without opening it (faccessat F_OK).
 pub fn pathExists(path: [*:0]const u8) bool {
     return linux.syscall4(.faccessat, ufd(AT_FDCWD), @intFromPtr(path), 0, 0) == 0;
 }
 
-/// «Отпечаток» файла или папки: время изменения (нс), размер и inode (заменённый файл —
-/// новый inode, даже если время у него то же, как у Flatpak/OSTree). Нули — пути нет.
+/// "Fingerprint" of a file or folder: modification time (ns), size and inode (a replaced file has
+/// a new inode even if its time is the same, as with Flatpak/OSTree). Zeros — no such path.
 pub const Stamp = extern struct { mtime: u64 = 0, size: u64 = 0, ino: u64 = 0 };
 
 pub fn stamp(path: [*:0]const u8) Stamp {
-    // statx(AT_FDCWD, path, 0, STATX_INO | STATX_MTIME | STATX_SIZE) — одна структура на всех архитектурах
+    // statx(AT_FDCWD, path, 0, STATX_INO | STATX_MTIME | STATX_SIZE) — one struct on all architectures
     var b: [256]u8 align(8) = undefined;
     const rc = linux.syscall5(.statx, ufd(AT_FDCWD), @intFromPtr(path), 0, 0x100 | 0x40 | 0x200, @intFromPtr(&b));
     if (rc != 0) return .{};
@@ -161,7 +161,7 @@ pub fn getdents(fd: i32, buf: []u8) Error!usize {
     return check(linux.syscall3(.getdents64, ufd(fd), @intFromPtr(buf.ptr), buf.len));
 }
 
-/// Итератор по именам в директории (через getdents64).
+/// Iterator over the names in a directory (via getdents64).
 pub const Dir = struct {
     fd: i32,
     buf: [4096]u8 align(8) = undefined,
@@ -198,7 +198,7 @@ pub const Dir = struct {
     }
 };
 
-// ---------------------------------------------------------------- сокеты
+// ---------------------------------------------------------------- sockets
 
 pub fn socket(domain: usize, kind: usize, proto: usize) Error!i32 {
     const rc = try check(linux.syscall3(.socket, domain, kind | SOCK_CLOEXEC, proto));
@@ -218,14 +218,14 @@ pub fn connectUnix(path: []const u8) Error!i32 {
     return fd;
 }
 
-/// Пара связанных сокетов AF_UNIX/SOCK_SEQPACKET (границы сообщений сохраняются).
+/// A pair of connected AF_UNIX/SOCK_SEQPACKET sockets (message boundaries are preserved).
 pub fn socketpair() Error![2]i32 {
     var fds: [2]i32 = .{ -1, -1 };
     _ = try check(linux.syscall4(.socketpair, 1, 5 | SOCK_CLOEXEC, 0, @intFromPtr(&fds)));
     return fds;
 }
 
-/// Netlink-сокет, подписанный на multicast-группы `groups` (только чтение событий ядра).
+/// A netlink socket subscribed to multicast groups `groups` (read-only kernel events).
 pub fn netlink(proto: usize, groups: u32) Error!i32 {
     const fd = try socket(16, 3 | O_NONBLOCK, proto); // AF_NETLINK, SOCK_RAW
     const Addr = extern struct { family: u16 = 16, pad: u16 = 0, pid: u32 = 0, groups: u32 };
@@ -237,7 +237,7 @@ pub fn netlink(proto: usize, groups: u32) Error!i32 {
     return fd;
 }
 
-/// Отправка без SIGPIPE.
+/// Send without SIGPIPE.
 pub fn sendAll(fd: i32, data: []const u8) Error!void {
     var off: usize = 0;
     while (off < data.len) {
@@ -261,7 +261,7 @@ const Msghdr = extern struct {
 };
 const CMSG_HDR = 2 * @sizeOf(usize); // cmsg_len (size_t) + level + type
 
-/// sendmsg с передачей файловых дескрипторов (SCM_RIGHTS). Возвращает число отправленных байт.
+/// sendmsg passing file descriptors (SCM_RIGHTS). Returns the number of bytes sent.
 pub fn sendmsgFds(fd: i32, data: []const u8, fds: []const i32) Error!usize {
     const iov = [1]Iovec{.{ .base = data.ptr, .len = data.len }};
     var cbuf: [CMSG_HDR + 8 * 4 + 8]u8 align(8) = undefined;
@@ -286,7 +286,7 @@ pub fn sendmsgFds(fd: i32, data: []const u8, fds: []const i32) Error!usize {
     }
 }
 
-/// recvmsg, принимающий не более одного дескриптора. `out_fd` = -1, если его не было.
+/// recvmsg that accepts at most one descriptor. `out_fd` = -1 if there was none.
 pub fn recvmsgFd(fd: i32, buf: []u8, out_fd: *i32) Error!usize {
     out_fd.* = -1;
     const iov = [1]Iovec{.{ .base = buf.ptr, .len = buf.len }};
@@ -300,7 +300,7 @@ pub fn recvmsgFd(fd: i32, buf: []u8, out_fd: *i32) Error!usize {
         const len = std.mem.readInt(usize, cbuf[0..@sizeOf(usize)], .little);
         if (level == 1 and kind == 1 and len >= CMSG_HDR + 4) {
             out_fd.* = std.mem.readInt(i32, cbuf[CMSG_HDR..][0..4], .little);
-            // лишние дескрипторы (если их прислали) закрываем
+            // close extra descriptors (if any were sent)
             var off: usize = CMSG_HDR + 4;
             while (off + 4 <= len and off + 4 <= cbuf.len) : (off += 4) close(std.mem.readInt(i32, cbuf[off..][0..4], .little));
         }
@@ -308,7 +308,7 @@ pub fn recvmsgFd(fd: i32, buf: []u8, out_fd: *i32) Error!usize {
     return n;
 }
 
-/// recvmsg, собирающий до out_fds.len дескрипторов (лишние закрываются).
+/// recvmsg collecting up to out_fds.len descriptors (extra ones are closed).
 pub fn recvmsgFds(fd: i32, buf: []u8, out_fds: []i32, nfds: *usize) Error!usize {
     nfds.* = 0;
     const iov = [1]Iovec{.{ .base = buf.ptr, .len = buf.len }};
@@ -348,11 +348,11 @@ const SockaddrAbs = extern struct { family: u16, path: [108]u8 };
 fn abstractAddr(name: []const u8, out: *SockaddrAbs) usize {
     out.* = .{ .family = 1, .path = [_]u8{0} ** 108 };
     const k = @min(name.len, 100);
-    @memcpy(out.path[1 .. 1 + k], name[0..k]); // path[0] = 0 — абстрактное имя
+    @memcpy(out.path[1 .. 1 + k], name[0..k]); // path[0] = 0 — an abstract name
     return 2 + 1 + k;
 }
 
-/// Слушающий сокет в абстрактном пространстве имён (без файла на диске).
+/// A listening socket in the abstract namespace (no file on disk).
 pub fn listenAbstract(name: []const u8) Error!i32 {
     var addr: SockaddrAbs = undefined;
     const len = abstractAddr(name, &addr);
@@ -369,7 +369,7 @@ pub fn connectAbstract(name: []const u8) bool {
     return true;
 }
 
-/// Подключение к абстрактному unix-сокету; возвращает дескриптор.
+/// Connect to an abstract unix socket; returns the descriptor.
 pub fn connectAbstractFd(name: []const u8) Error!i32 {
     var addr: SockaddrAbs = undefined;
     const len = abstractAddr(name, &addr);
@@ -379,18 +379,18 @@ pub fn connectAbstractFd(name: []const u8) Error!i32 {
     return fd;
 }
 
-/// Инструкция классического BPF (фильтры сокетов и seccomp).
+/// A classic BPF instruction (socket filters and seccomp).
 pub const SockFilter = extern struct { code: u16, jt: u8 = 0, jf: u8 = 0, k: u32 };
 pub const SockFprog = extern struct { len: u16, filter: [*]const SockFilter };
 
-/// Фильтр на сокет (SO_ATTACH_FILTER): ненужные сообщения отбрасывает ядро —
-/// процесс из-за них даже не просыпается.
+/// A socket filter (SO_ATTACH_FILTER): the kernel drops unneeded messages —
+/// the process doesn't even wake up for them.
 pub fn attachFilter(fd: i32, prog: []const SockFilter) Error!void {
     const fp = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
     _ = try check(linux.syscall5(.setsockopt, ufd(fd), 1, 26, @intFromPtr(&fp), @sizeOf(SockFprog))); // SOL_SOCKET, SO_ATTACH_FILTER
 }
 
-/// bind произвольного адреса (сокеты Bluetooth и т. п.).
+/// bind to an arbitrary address (Bluetooth sockets etc.).
 pub fn bindRaw(fd: i32, addr: []const u8) Error!void {
     _ = try check(linux.syscall3(.bind, ufd(fd), @intFromPtr(addr.ptr), addr.len));
 }
@@ -399,7 +399,7 @@ pub fn ioctl(fd: i32, req: usize, arg: usize) Error!usize {
     return check(linux.syscall3(.ioctl, ufd(fd), req, arg));
 }
 
-// ---------------------------------------------------------------- память
+// ---------------------------------------------------------------- memory
 
 pub fn memfd(name: [*:0]const u8) Error!i32 {
     const rc = try check(linux.syscall2(.memfd_create, @intFromPtr(name), 1)); // MFD_CLOEXEC
@@ -416,13 +416,13 @@ pub fn mmap(len: usize, fd: i32) Error![*]u8 {
     return @ptrFromInt(rc);
 }
 
-/// Анонимная память (PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS).
+/// Anonymous memory (PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS).
 pub fn mmapAnon(len: usize) Error![*]u8 {
     const rc = try check(linux.syscall6(.mmap, 0, len, 3, 0x22, ufd(-1), 0));
     return @ptrFromInt(rc);
 }
 
-/// Только чтение, MAP_PRIVATE (шрифты, keymap от композитора).
+/// Read only, MAP_PRIVATE (fonts, the keymap from the compositor).
 pub fn mmapRead(len: usize, fd: i32) Error![*]const u8 {
     const rc = try check(linux.syscall6(.mmap, 0, len, 1, 2, ufd(fd), 0));
     return @ptrFromInt(rc);
@@ -436,7 +436,7 @@ pub fn munmap(ptr: [*]u8, len: usize) void {
     _ = linux.syscall2(.munmap, @intFromPtr(ptr), len);
 }
 
-// ---------------------------------------------------------------- время, таймеры, poll
+// ---------------------------------------------------------------- time, timers, poll
 
 pub const Timespec = extern struct { sec: isize, nsec: isize };
 
@@ -450,7 +450,7 @@ pub fn realtime() i64 {
     return clockTs(0).sec; // CLOCK_REALTIME
 }
 
-/// Монотонное время в миллисекундах.
+/// Monotonic time in milliseconds.
 pub fn monoMs() u64 {
     const ts = clockTs(1); // CLOCK_MONOTONIC
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1000000;
@@ -474,7 +474,7 @@ pub fn timerfdCreate(clock: usize) Error!i32 {
     return @intCast(try check(linux.syscall2(.timerfd_create, clock, O_CLOEXEC | O_NONBLOCK)));
 }
 
-/// Взвести таймер: первое срабатывание через/в `value_s`, затем каждые `interval_s` секунд.
+/// Arm a timer: first expiry after/at `value_s`, then every `interval_s` seconds.
 pub fn timerfdArm(fd: i32, flags: usize, value_s: i64, interval_s: u32) Error!void {
     const Its = extern struct { interval: Timespec, value: Timespec };
     const its = Its{
@@ -484,7 +484,7 @@ pub fn timerfdArm(fd: i32, flags: usize, value_s: i64, interval_s: u32) Error!vo
     _ = try check(linux.syscall4(.timerfd_settime, ufd(fd), flags, @intFromPtr(&its), 0));
 }
 
-/// Взвести монотонный таймер: первое срабатывание через first_ms, затем каждые every_ms (0 — один раз).
+/// Arm a monotonic timer: first expiry after first_ms, then every every_ms (0 — once).
 pub fn timerfdArmMs(fd: i32, first_ms: u32, every_ms: u32) void {
     const Its = extern struct { interval: Timespec, value: Timespec };
     const its = Its{
@@ -504,7 +504,7 @@ pub fn inotifyWatch(fd: i32, path: [*:0]const u8, mask: u32) Error!void {
     _ = try check(linux.syscall3(.inotify_add_watch, ufd(fd), @intFromPtr(path), mask));
 }
 
-// ---------------------------------------------------------------- процессы и права
+// ---------------------------------------------------------------- processes and privileges
 
 pub fn exit(code: u8) noreturn {
     _ = linux.syscall1(.exit_group, code);
@@ -512,17 +512,17 @@ pub fn exit(code: u8) noreturn {
 }
 
 pub fn fork() Error!usize {
-    // clone(SIGCHLD, 0, ...) == fork(); работает и на x86_64, и на aarch64
+    // clone(SIGCHLD, 0, ...) == fork(); works on both x86_64 and aarch64
     return check(linux.syscall5(.clone, 17, 0, 0, 0, 0));
 }
 
-/// Закрыть все дескрипторы, кроме 0–2 и `fd` (он переносится на номер 3). Возвращает 3.
+/// Close all descriptors except 0–2 and `fd` (which is moved to number 3). Returns 3.
 pub fn keepOnlyFd(fd: i32) i32 {
     if (fd != 3) {
         _ = linux.syscall3(.dup3, ufd(fd), 3, O_CLOEXEC);
         close(fd);
     }
-    // close_range(4, ~0, 0); на старых ядрах — по одному
+    // close_range(4, ~0, 0); on old kernels — one by one
     const rc = linux.syscall3(.close_range, 4, std.math.maxInt(u32), 0);
     if (rc > std.math.maxInt(usize) - 4096) {
         var i: i32 = 4;
@@ -531,7 +531,7 @@ pub fn keepOnlyFd(fd: i32) i32 {
     return 3;
 }
 
-/// Случайное число от ядра (getrandom); при ошибке — от часов.
+/// A random number from the kernel (getrandom); on error — from the clock.
 pub fn random() u64 {
     var v: u64 = 0;
     const rc = linux.syscall3(.getrandom, @intFromPtr(&v), 8, 0);
@@ -551,8 +551,8 @@ pub fn raw(comptime nr: linux.SYS, a1: usize, a2: usize, a3: usize) Error!usize 
     return check(linux.syscall3(nr, a1, a2, a3));
 }
 
-/// Запускает `/bin/sh -c cmd` полностью отвязанным (double fork + setsid),
-/// поэтому зомби не остаются и SIGCHLD обрабатывать не нужно.
+/// Runs `/bin/sh -c cmd` fully detached (double fork + setsid),
+/// so no zombies remain and SIGCHLD needs no handling.
 pub fn spawnShell(cmd: [*:0]const u8) void {
     const pid = fork() catch return;
     if (pid == 0) {
@@ -569,8 +569,8 @@ pub fn spawnShell(cmd: [*:0]const u8) void {
     _ = linux.syscall4(.wait4, pid, @intFromPtr(&status), 0, 0);
 }
 
-/// Запускает программу без shell, тоже отвязанной. argv[0] без '/' ищется в PATH;
-/// dir — рабочая папка (null — не менять).
+/// Runs a program without a shell, also detached. argv[0] without '/' is looked up in PATH;
+/// dir — working directory (null — don't change).
 pub fn spawnArgv(av: [*:null]const ?[*:0]const u8, dir: ?[*:0]const u8) void {
     const pid = fork() catch return;
     if (pid == 0) {
@@ -594,7 +594,7 @@ fn execvp(av: [*:null]const ?[*:0]const u8) void {
         return;
     }
     var buf: [1024]u8 = undefined;
-    // PATH — из окружения запуска: у брокера в нём первой стоит папка zpanel
+    // PATH comes from the launch environment: for the broker the netline folder comes first in it
     var it = std.mem.tokenizeScalar(u8, envpGet("PATH") orelse "/usr/local/bin:/usr/bin:/bin", ':');
     while (it.next()) |d| {
         const z = joinZ(&buf, &.{ d, "/", a0 });
@@ -602,30 +602,30 @@ fn execvp(av: [*:null]const ?[*:0]const u8) void {
     }
 }
 
-/// Переименовать (атомарная замена файла).
+/// Rename (atomic file replacement).
 pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
     _ = try check(linux.syscall4(.renameat, ufd(AT_FDCWD), @intFromPtr(from), ufd(AT_FDCWD), @intFromPtr(to)));
 }
 
-// ---------------------------------------------------------------- окружение и аргументы
-// В Zig 0.16 стартовый код отдаёт argv и envp прямо в main (std.process.Init.Minimal) —
-// это те же строки, что ядро положило на стек: ничего не копируется и не читается из /proc.
+// ---------------------------------------------------------------- environment and arguments
+// In Zig 0.16 the startup code hands argv and envp straight to main (std.process.Init.Minimal) —
+// the same strings the kernel put on the stack: nothing is copied or read from /proc.
 
 var argv: []const [*:0]const u8 = &.{};
 var environ: [:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
 
-/// Вызывается первой строкой main: `pub fn main(init: std.process.Init.Minimal) void`.
+/// Called as the first line of main: `pub fn main(init: std.process.Init.Minimal) void`.
 pub fn init(m: std.process.Init.Minimal) void {
     argv = m.args.vector;
     environ = m.environ.block.slice;
     if (trace_built) {
-        if (getenv("ZPANEL_TRACE")) |v| trace = v.len > 0 and !std.mem.eql(u8, v, "0");
-        tracef("запуск", .{});
+        if (getenv("NETLINE_TRACE")) |v| trace = v.len > 0 and !std.mem.eql(u8, v, "0");
+        tracef("start", .{});
     }
 }
 
-/// Окружение для execve с PATH, в начале которого папка исполняемого файла
-/// (меню и zbg рядом с zpanel найдутся без настройки PATH). Нужно только брокеру.
+/// Environment for execve with PATH starting with the executable's folder
+/// (menus and zbg next to netline are found without PATH setup). Only the broker needs it.
 var env_ptrs: [1024:null]?[*:0]const u8 = undefined;
 var env_ready = false;
 var path_env: [4096]u8 = undefined;
@@ -668,7 +668,7 @@ pub fn getenv(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Переменная из окружения, которое получат запускаемые программы (envp()).
+/// A variable from the environment the launched programs will get (envp()).
 fn envpGet(name: []const u8) ?[]const u8 {
     const e = envp();
     var i: usize = 0;
@@ -683,13 +683,13 @@ fn envMatch(s: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-// ---------------------------------------------------------------- трассировка
-// Сборка с -Dtrace=true и ZPANEL_TRACE=1 — программы пишут в stderr, когда и почему
-// просыпаются, сколько заняли кадр и запуск. Метка — монотонное время в мс: его можно
-// сравнивать между процессами (клик в панели → первый кадр меню).
+// ---------------------------------------------------------------- tracing
+// With a -Dtrace=true build and NETLINE_TRACE=1 the programs write to stderr when and why
+// they wake up and how long a frame and startup took. The stamp is monotonic time in ms: it can
+// be compared across processes (click in the panel → first frame of the menu).
 
-/// Замеры вкомпилированы (zig build -Dtrace=true). Иначе весь код трассировки выбрасывается
-/// при сборке: tracing() — константа false.
+/// Timing is compiled in (zig build -Dtrace=true). Otherwise all tracing code is dropped
+/// at compile time: tracing() is the constant false.
 const trace_built = @import("build_options").trace;
 var trace = false;
 
@@ -702,12 +702,12 @@ fn monoUs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
 }
 
-/// Метка времени для замеров (мкс), 0 — трассировка выключена.
+/// Time stamp for measurements (µs), 0 — tracing is off.
 pub fn traceStart() u64 {
     return if (tracing()) monoUs() else 0;
 }
 
-/// Сколько мкс прошло с метки traceStart().
+/// How many µs have passed since the traceStart() stamp.
 pub fn traceSince(t0: u64) u64 {
     return if (tracing()) monoUs() -% t0 else 0;
 }
@@ -715,14 +715,14 @@ pub fn traceSince(t0: u64) u64 {
 pub fn tracef(comptime fmt: []const u8, args: anytype) void {
     if (!tracing()) return;
     const now = monoUs();
-    const a0 = if (argv.len > 0) std.mem.span(argv[0]) else "zpanel";
+    const a0 = if (argv.len > 0) std.mem.span(argv[0]) else "netline";
     const name = a0[if (std.mem.lastIndexOfScalar(u8, a0, '/')) |i| i + 1 else 0..];
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{s} [{d}.{d:0>3}] " ++ fmt ++ "\n", .{ name, now / 1000, now % 1000 } ++ args) catch return;
     _ = write(2, s) catch {};
 }
 
-// ---------------------------------------------------------------- аргументы и секреты
+// ---------------------------------------------------------------- arguments and secrets
 
 /// argv[i] == s ?
 pub fn argIs(i: usize, s: []const u8) bool {
@@ -735,13 +735,13 @@ pub fn argAt(i: usize) ?[]const u8 {
     return std.mem.span(argv[i]);
 }
 
-/// Затереть память так, чтобы компилятор не выбросил запись.
+/// Wipe memory so that the compiler can't drop the write.
 pub fn secureZero(b: []u8) void {
     const v: []volatile u8 = b;
     for (v) |*c| c.* = 0;
 }
 
-/// Принять соединение и вернуть uid собеседника (SO_PEERCRED). Соединение сразу закрывается.
+/// Accept a connection and return the peer's uid (SO_PEERCRED). The connection is closed right away.
 pub fn acceptPeerUid(fd: i32) ?u32 {
     const c = check(linux.syscall4(.accept4, ufd(fd), 0, 0, SOCK_CLOEXEC)) catch return null;
     const cfd: i32 = @intCast(c);
@@ -749,7 +749,7 @@ pub fn acceptPeerUid(fd: i32) ?u32 {
     return peerUid(cfd);
 }
 
-/// uid процесса на другом конце unix-сокета.
+/// uid of the process at the other end of a unix socket.
 pub fn peerUid(fd: i32) ?u32 {
     var cred: [3]u32 = undefined; // pid, uid, gid
     var len: u32 = @sizeOf([3]u32);
@@ -757,15 +757,15 @@ pub fn peerUid(fd: i32) ?u32 {
     return cred[1];
 }
 
-// ---------------------------------------------------------------- вывод
+// ---------------------------------------------------------------- output
 
 pub fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "zpanel: " ++ fmt ++ "\n", args) catch return;
+    const s = std.fmt.bufPrint(&buf, "netline: " ++ fmt ++ "\n", args) catch return;
     _ = write(2, s) catch {};
 }
 
-/// Склейка кусков в буфер с завершающим нулём (лишнее обрезается).
+/// Join pieces into a zero-terminated buffer (excess is truncated).
 pub fn joinZ(buf: []u8, parts: []const []const u8) [:0]const u8 {
     var n: usize = 0;
     for (parts) |p| {

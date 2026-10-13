@@ -1,16 +1,16 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! zbg — демон обоев для zpanel на чистом Zig (вместо swaybg).
+//! zbg — wallpaper daemon for netline, in pure Zig (instead of swaybg).
 //!
-//! Рисует обои на каждом мониторе (слой background), поддерживает горячее подключение
-//! мониторов, целый и дробный масштаб. Картинка декодируется своими декодерами JPEG/PNG,
-//! вписывается фильтром высокого качества, после чего память отдаётся системе: в простое
-//! zbg спит в ppoll и почти не занимает память — пиксели живут в буфере композитора.
+//! Draws the wallpaper on every monitor (background layer), supports monitor hotplug,
+//! integer and fractional scale. The image is decoded by our own JPEG/PNG decoders,
+//! scaled with a high-quality filter, and then the memory is returned to the system: when idle
+//! zbg sleeps in ppoll and takes almost no memory — the pixels live in the compositor's buffer.
 //!
-//! Управление — через сокет `zbg-<uid>` (только от того же пользователя):
-//!   "set ИМЯ\n" — показать файл из папки обоев,  "get\n" — какое сейчас.
-//! Выбор запоминается в ~/.cache/zpanel/wallpaper.
+//! Control goes through the `zbg-<uid>` socket (same user only):
+//!   "set NAME\n" — show a file from the wallpaper folder,  "get\n" — which one is current.
+//! The choice is remembered in ~/.cache/netline/wallpaper.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -39,8 +39,8 @@ const Out = struct {
     frac: u32 = 0,
     w: u32 = 0,
     h: u32 = 0,
-    scale: u32 = 1, // целый масштаб
-    scale120: u32 = 0, // дробный масштаб × 120 (0 — нет)
+    scale: u32 = 1, // integer scale
+    scale120: u32 = 0, // fractional scale × 120 (0 — none)
     configured: bool = false,
     dirty: bool = false,
     buffer: u32 = 0,
@@ -75,7 +75,7 @@ var state_fd: i32 = -1;
 var listen_fd: i32 = -1;
 var my_uid: u32 = 0;
 
-/// Клиенты сокета управления (меню zwall держит связь, пока открыто).
+/// Control socket clients (the zwall menu stays connected while open).
 const MAX_CLIENTS = 4;
 const Client = struct {
     fd: i32 = -1,
@@ -88,28 +88,28 @@ pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     my_uid = @intCast(sys.getuid());
     if (my_uid == 0) {
-        sys.log("запуск от root запрещён", .{});
+        sys.log("running as root is not allowed", .{});
         sys.exit(1);
     }
     var lock_buf: [48]u8 = undefined;
     const lock = std.fmt.bufPrint(&lock_buf, "zbg-{d}", .{my_uid}) catch "zbg";
     if (sys.connectAbstract(lock)) {
-        sys.log("zbg уже запущен", .{});
+        sys.log("zbg is already running", .{});
         sys.exit(0);
     }
     listen_fd = sys.listenAbstract(lock) catch {
-        sys.log("не удалось открыть сокет управления", .{});
+        sys.log("could not open the control socket", .{});
         sys.exit(1);
     };
     dir = expandHome(&dir_buf, cfg.wallpaper_dir) orelse {
-        sys.log("не задан $HOME", .{});
+        sys.log("$HOME is not set", .{});
         sys.exit(1);
     };
     openState();
     theme.init();
 
     conn.connect() catch {
-        sys.log("не удалось подключиться к Wayland", .{});
+        sys.log("could not connect to Wayland", .{});
         sys.exit(1);
     };
     kinds[1] = .display;
@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     conn.send(1, 1, .{registry});
     roundtrip();
     if (compositor == 0 or shm == 0 or layer_shell == 0) {
-        sys.log("композитор не поддерживает wlr-layer-shell", .{});
+        sys.log("the compositor does not support wlr-layer-shell", .{});
         sys.exit(1);
     }
     roundtrip();
@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (fds[0].revents != 0) readWayland();
         if (fds[1].revents != 0) acceptClient();
         if (fds[2].revents != 0 and theme.inotify_fd >= 0) {
-            if (theme.onInotify()) markAll(); // поменялся цвет рабочего стола
+            if (theme.onInotify()) markAll(); // the desktop color changed
         }
         for (&clients, 0..) |*c, i| {
             if (fds[3 + i].revents != 0 and c.fd >= 0) readClient(c);
@@ -152,11 +152,11 @@ pub fn main(init: std.process.Init.Minimal) void {
 }
 
 fn fatal() noreturn {
-    sys.log("ошибка связи с композитором", .{});
+    sys.log("lost connection to the compositor", .{});
     sys.exit(1);
 }
 
-/// "~/…" или "$HOME/…" → полный путь.
+/// "~/…" or "$HOME/…" → full path.
 pub fn expandHome(buf: []u8, p: []const u8) ?[:0]const u8 {
     if (std.mem.startsWith(u8, p, "~/") or std.mem.startsWith(u8, p, "$HOME/")) {
         const home = sys.getenv("HOME") orelse return null;
@@ -166,14 +166,14 @@ pub fn expandHome(buf: []u8, p: []const u8) ?[:0]const u8 {
     return sys.joinZ(buf, &.{p});
 }
 
-// ================================================================= состояние
+// ================================================================= state
 
 fn openState() void {
     const home = sys.getenv("HOME") orelse return;
     var b: [512]u8 = undefined;
     sys.mkdir(sys.joinZ(&b, &.{ home, "/.cache" }));
-    sys.mkdir(sys.joinZ(&b, &.{ home, "/.cache/zpanel" }));
-    state_fd = sys.openCreate(sys.joinZ(&b, &.{ home, "/.cache/zpanel/wallpaper" })) catch -1;
+    sys.mkdir(sys.joinZ(&b, &.{ home, "/.cache/netline" }));
+    state_fd = sys.openCreate(sys.joinZ(&b, &.{ home, "/.cache/netline/wallpaper" })) catch -1;
     if (state_fd < 0) return;
     const n = sys.read(state_fd, &cur_buf) catch 0;
     const name = std.mem.trim(u8, cur_buf[0..n], " \n\r");
@@ -190,7 +190,7 @@ fn saveState() void {
     sys.ftruncate(state_fd, cur_len) catch {};
 }
 
-/// Только имя файла в папке обоев: без «/», не скрытый, без управляющих символов.
+/// Only a file name in the wallpaper folder: no "/", not hidden, no control characters.
 pub fn validName(n: []const u8) bool {
     if (n.len == 0 or n.len > 255 or n[0] == '.') return false;
     for (n) |c| {
@@ -199,11 +199,11 @@ pub fn validName(n: []const u8) bool {
     return true;
 }
 
-// ================================================================= управление
+// ================================================================= control
 
 fn acceptClient() void {
     const fd = sys.accept(listen_fd) orelse return;
-    // только от того же пользователя
+    // same user only
     if ((sys.peerUid(fd) orelse 0xffffffff) != my_uid) return sys.close(fd);
     for (&clients) |*c| {
         if (c.fd < 0) {
@@ -211,7 +211,7 @@ fn acceptClient() void {
             return;
         }
     }
-    sys.close(fd); // все места заняты
+    sys.close(fd); // all slots are taken
 }
 
 fn dropClient(c: *Client) void {
@@ -229,7 +229,7 @@ fn readClient(c: *Client) void {
         std.mem.copyForwards(u8, c.buf[0 .. c.len - nl - 1], c.buf[nl + 1 .. c.len]);
         c.len -= nl + 1;
     }
-    if (c.len == c.buf.len) dropClient(c); // строка без конца — выгоняем
+    if (c.len == c.buf.len) dropClient(c); // a line with no end — kick the client
 }
 
 var reply_buf: [300]u8 = undefined;
@@ -240,9 +240,9 @@ fn command(line: []const u8) []const u8 {
     }
     if (std.mem.startsWith(u8, line, "set ")) {
         const name = line[4..];
-        if (!validName(name)) return "err неверное имя файла\n";
-        // сначала раскодировать (под размер мониторов) и только потом менять обои:
-        // битый файл не испортит текущие, а картинка декодируется один раз
+        if (!validName(name)) return "err invalid file name\n";
+        // decode first (for the monitor size) and only then switch the wallpaper:
+        // a broken file won't spoil the current one, and the image is decoded once
         var pb: [800]u8 = undefined;
         const path = sys.joinZ(&pb, &.{ dir, "/", name });
         const need = needSize();
@@ -257,16 +257,16 @@ fn command(line: []const u8) []const u8 {
         conn.flush() catch fatal();
         return "ok\n";
     }
-    return "err неизвестная команда\n";
+    return "err unknown command\n";
 }
 
 fn errText(e: img.Error) []const u8 {
     return switch (e) {
-        error.Unsupported => "err формат не поддерживается (нужен JPEG или PNG)\n",
-        error.TooLarge => "err слишком большое изображение\n",
-        error.NoMem => "err не хватило памяти\n",
-        error.Io => "err файл не открывается\n",
-        error.Invalid => "err файл повреждён\n",
+        error.Unsupported => "err unsupported format (JPEG or PNG required)\n",
+        error.TooLarge => "err image is too large\n",
+        error.NoMem => "err out of memory\n",
+        error.Io => "err cannot open the file\n",
+        error.Invalid => "err the file is corrupted\n",
     };
 }
 
@@ -313,7 +313,7 @@ fn dispatch(ev: wl.Event) void {
             0 => {
                 const obj = a.uint();
                 const code = a.uint();
-                sys.log("ошибка протокола (объект {d}, код {d}): {s}", .{ obj, code, a.string() });
+                sys.log("protocol error (object {d}, code {d}): {s}", .{ obj, code, a.string() });
                 sys.exit(1);
             },
             1 => {
@@ -369,12 +369,12 @@ fn dispatch(ev: wl.Event) void {
             else => {},
         },
         .buffer => if (ev.op == 0) { // release
-            // После release буфер можно уничтожить — картинка на экране останется
-            // (wl_surface.attach). Композитор с GPU-рендером (wlroots) может отпустить
-            // shm-буфер сразу после загрузки в текстуру: раньше текущий буфер здесь
-            // не трогали, и при следующей смене обоев он уже не получал release —
-            // смена оставляла в композиторе полноэкранный буфер. Теперь память
-            // обоев возвращается системе, как только композитору она не нужна.
+            // After release the buffer can be destroyed — the image stays on screen
+            // (wl_surface.attach). A compositor with GPU rendering (wlroots) may release
+            // the shm buffer right after uploading it to a texture: previously the current buffer
+            // was left alone here, and on the next wallpaper change it no longer got a release —
+            // the change left a full-screen buffer in the compositor. Now the wallpaper memory
+            // goes back to the system as soon as the compositor no longer needs it.
             conn.send(ev.obj, 0, .{});
             kinds[ev.obj] = .none;
             if (outs[own].buffer == ev.obj) outs[own].buffer = 0;
@@ -428,7 +428,7 @@ fn setup(i: u8) void {
         }
     }
     o.layer = create(.layer_surface, i);
-    // слой background (0), пространство имён "wallpaper"
+    // background layer (0), namespace "wallpaper"
     conn.send(layer_shell, 0, .{ o.layer, o.surface, o.output, @as(u32, 0), wl.str("wallpaper") });
     conn.send(o.layer, 0, .{ @as(u32, 0), @as(u32, 0) });
     conn.send(o.layer, 1, .{@as(u32, 1 | 2 | 4 | 8)});
@@ -460,9 +460,9 @@ fn markAll() void {
     }
 }
 
-// ================================================================= рисование
+// ================================================================= drawing
 
-/// Наибольший размер в пикселях среди настроенных мониторов.
+/// The largest size in pixels among the configured monitors.
 fn needSize() [2]u32 {
     var w: u32 = 0;
     var h: u32 = 0;
@@ -487,13 +487,13 @@ fn renderDirty() void {
         any = true;
     }
     if (!any) return;
-    // одна раскодированная картинка на все мониторы, потом память сразу освобождается
+    // one decoded image for all monitors, then the memory is freed right away
     var pic: ?img.Image = null;
     if (cur_len > 0) {
         var pb: [800]u8 = undefined;
         const path = sys.joinZ(&pb, &.{ dir, "/", cur_buf[0..cur_len] });
         pic = img.load(path, need_w, need_h) catch |e| blk: {
-            sys.log("обои {s}: {s}", .{ cur_buf[0..cur_len], @errorName(e) });
+            sys.log("wallpaper {s}: {s}", .{ cur_buf[0..cur_len], @errorName(e) });
             break :blk null;
         };
     }
@@ -519,7 +519,7 @@ fn paint(i: u8, pic: ?*const img.Image) void {
     if (pic) |p| {
         img.render(p, px[0 .. size / 4], pw, ph, if (cfg.wallpaper_mode == .fill) .fill else .fit, bg) catch @memset(px[0 .. size / 4], 0xff000000 | bg);
     } else @memset(px[0 .. size / 4], 0xff000000 | bg);
-    // пиксели уже в разделяемой памяти — своё отображение сразу убираем
+    // the pixels are already in shared memory — drop our own mapping right away
     sys.munmap(mem, size);
 
     const pool = create(.pool, i);
@@ -543,6 +543,6 @@ fn paint(i: u8, pic: ?*const img.Image) void {
         conn.send(o.surface, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(o.w)), @as(i32, @intCast(o.h)) });
     }
     conn.send(o.surface, 6, .{});
-    // и прошлый, и этот буфер уничтожаются, когда композитор их отпустит (событие release)
+    // both the previous and this buffer are destroyed when the compositor releases them (release event)
     o.buffer = buf;
 }

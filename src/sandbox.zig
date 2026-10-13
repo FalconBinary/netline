@@ -1,34 +1,34 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Песочница процесса панели (вызывается один раз, когда всё нужное уже открыто).
+//! The panel process sandbox (applied once, when everything needed is already open).
 //!
-//! 1. PR_SET_NO_NEW_PRIVS и PR_SET_DUMPABLE=0.
-//! 2. Landlock: файловая система только на чтение и только в перечисленных местах,
-//!    TCP запрещён, сигналы и абстрактные unix-сокеты — только внутри песочницы.
-//! 3. seccomp-bpf: белый список системных вызовов. Нет exec, fork, socket, connect,
-//!    ptrace, mprotect; mmap без PROT_EXEC; openat только на чтение; ioctl — только
-//!    явно разрешённый запрос. Всё остальное — немедленное завершение процесса.
+//! 1. PR_SET_NO_NEW_PRIVS and PR_SET_DUMPABLE=0.
+//! 2. Landlock: the file system is read-only and only in the listed places,
+//!    TCP is forbidden, signals and abstract unix sockets only within the sandbox.
+//! 3. seccomp-bpf: a system call allowlist. No exec, fork, socket, connect,
+//!    ptrace, mprotect; mmap without PROT_EXEC; openat read-only; ioctl only
+//!    an explicitly allowed request. Everything else kills the process immediately.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
 
-/// Что ещё разрешить процессу (у панели и меню Wi‑Fi немного разные нужды).
+/// What else to allow the process (the panel and the Wi‑Fi menu need slightly different things).
 pub const Opts = struct {
-    /// единственный разрешённый ioctl (null — никаких)
+    /// the only allowed ioctl (null — none)
     ioctl: ?u32 = null,
-    /// дополнительные системные вызовы без проверки аргументов
+    /// extra system calls without argument checks
     extra: []const linux.SYS = &.{},
-    /// разрешить openat на запись/создание (куда именно — решает Landlock: write_paths)
+    /// allow openat for writing/creating (where exactly is up to Landlock: write_paths)
     write_files: bool = false,
 };
 
-/// read_paths — только чтение; write_paths — чтение и запись/создание/удаление файлов внутри.
+/// read_paths — read only; write_paths — read and write/create/delete files inside.
 pub fn apply(read_paths: []const [:0]const u8, write_paths: []const [:0]const u8, comptime opts: Opts) void {
-    _ = sys.prctl(38, 1, 0) catch sys.log("PR_SET_NO_NEW_PRIVS не удался", .{}); // PR_SET_NO_NEW_PRIVS
-    _ = sys.prctl(4, 0, 0) catch {}; // PR_SET_DUMPABLE = 0: нельзя подключиться ptrace'ом и снять дамп
+    _ = sys.prctl(38, 1, 0) catch sys.log("PR_SET_NO_NEW_PRIVS failed", .{}); // PR_SET_NO_NEW_PRIVS
+    _ = sys.prctl(4, 0, 0) catch {}; // PR_SET_DUMPABLE = 0: no ptrace attach and no core dump
     landlock(read_paths, write_paths);
     seccomp(opts);
 }
@@ -44,7 +44,7 @@ const FS_TRUNCATE: u64 = 1 << 14;
 
 fn landlock(read_paths: []const [:0]const u8, write_paths: []const [:0]const u8) void {
     const abi_rc = sys.raw(.landlock_create_ruleset, 0, 0, 1) catch { // LANDLOCK_CREATE_RULESET_VERSION
-        sys.log("Landlock недоступен в ядре — только seccomp", .{});
+        sys.log("Landlock is not available in the kernel — seccomp only", .{});
         return;
     };
     const abi: u32 = @intCast(abi_rc);
@@ -56,12 +56,12 @@ fn landlock(read_paths: []const [:0]const u8, write_paths: []const [:0]const u8)
     const Attr = extern struct { fs: u64, net: u64, scoped: u64 };
     const attr = Attr{
         .fs = fs,
-        .net = 3, // BIND_TCP | CONNECT_TCP (без правил — запрещено всё)
+        .net = 3, // BIND_TCP | CONNECT_TCP (with no rules everything is forbidden)
         .scoped = 3, // ABSTRACT_UNIX_SOCKET | SIGNAL
     };
     const size: usize = if (abi < 4) 8 else if (abi < 6) 16 else 24;
     const rs_rc = sys.raw(.landlock_create_ruleset, @intFromPtr(&attr), size, 0) catch {
-        sys.log("Landlock: не удалось создать набор правил", .{});
+        sys.log("Landlock: could not create a ruleset", .{});
         return;
     };
     const rs: i32 = @intCast(rs_rc);
@@ -70,7 +70,7 @@ fn landlock(read_paths: []const [:0]const u8, write_paths: []const [:0]const u8)
     for (read_paths) |p| {
         const fd = sys.openPath(p) catch continue;
         defer sys.close(fd);
-        // для каталога — чтение файлов и списка, для файла — только чтение
+        // for a directory — reading files and listing, for a file — reading only
         if (!addRule(rs, fd, FS_READ_FILE | FS_READ_DIR)) _ = addRule(rs, fd, FS_READ_FILE);
     }
     for (write_paths) |p| {
@@ -81,7 +81,7 @@ fn landlock(read_paths: []const [:0]const u8, write_paths: []const [:0]const u8)
         _ = addRule(rs, fd, acc);
     }
     _ = sys.raw(.landlock_restrict_self, @intCast(rs), 0, 0) catch {
-        sys.log("Landlock: не удалось применить правила", .{});
+        sys.log("Landlock: could not apply the rules", .{});
     };
 }
 
@@ -124,14 +124,14 @@ fn nr(comptime name: linux.SYS) u32 {
     return @intCast(@intFromEnum(name));
 }
 
-/// Простые разрешённые вызовы (без проверки аргументов).
+/// Simple allowed calls (no argument checks).
 const simple = [_]linux.SYS{
     .read,            .write,         .close,           .getdents64,
     .ppoll,           .clock_gettime, .timerfd_settime, .sendto,
     .sendmsg,         .recvmsg,       .memfd_create,    .ftruncate,
     .munmap,          .exit,          .exit_group,      .rt_sigreturn,
     .restart_syscall,
-    // обработчик паники Zig сбрасывает сигналы перед выводом сообщения
+    // Zig's panic handler resets signals before printing the message
     .rt_sigaction,  .rt_sigprocmask,
 };
 
@@ -140,15 +140,15 @@ const PROT_EXEC: u32 = 4;
 const OPEN_WRITE_MASK: u32 = 1 | 2 | 0o100 | 0o1000 | 0o2000 | 0o20000000;
 
 fn arg(i: u32) u32 {
-    return 16 + 8 * i; // seccomp_data.args[i], младшие 32 бита (little-endian)
+    return 16 + 8 * i; // seccomp_data.args[i], low 32 bits (little-endian)
 }
 
 fn seccomp(comptime opts: Opts) void {
     const arch = audit_arch orelse {
-        sys.log("seccomp: архитектура не поддерживается фильтром", .{});
+        sys.log("seccomp: architecture not supported by the filter", .{});
         return;
     };
-    // Метки: KILL, ALLOW и проверки аргументов. Переходы считаются после сборки.
+    // Labels: KILL, ALLOW and argument checks. Jumps are computed after assembly.
     const L = enum { none, kill, allow, mmap, ioctl, openat };
     const Ins = struct { code: u16, k: u32, t: L = .none, f: L = .none };
     var p: [64]Ins = undefined;
@@ -175,11 +175,11 @@ fn seccomp(comptime opts: Opts) void {
     n += 1;
     p[n] = .{ .code = JEQ, .k = nr(.openat), .t = .openat };
     n += 1;
-    p[n] = .{ .code = RET, .k = RET_KILL_PROCESS }; // всё, чего нет в списке
+    p[n] = .{ .code = RET, .k = RET_KILL_PROCESS }; // everything not in the list
     n += 1;
 
-    // В BPF переходы только вперёд, поэтому проверки аргументов идут до общих RET.
-    // mmap: prot не содержит PROT_EXEC и старшие 32 бита пусты
+    // BPF only jumps forward, so argument checks come before the shared RETs.
+    // mmap: prot has no PROT_EXEC and the upper 32 bits are empty
     at.set(.mmap, n);
     p[n] = .{ .code = LD_W_ABS, .k = arg(2) };
     n += 1;
@@ -190,18 +190,18 @@ fn seccomp(comptime opts: Opts) void {
     p[n] = .{ .code = JEQ, .k = 0, .t = .allow, .f = .kill };
     n += 1;
 
-    // ioctl: только один разрешённый запрос (у панели — HCIGETDEVINFO для Bluetooth)
+    // ioctl: only one allowed request (for the panel — HCIGETDEVINFO for Bluetooth)
     at.set(.ioctl, n);
     p[n] = .{ .code = LD_W_ABS, .k = arg(1) };
     n += 1;
     p[n] = .{ .code = JEQ, .k = opts.ioctl orelse 0xffffffff, .t = .allow, .f = .kill };
     n += 1;
 
-    // openat: только на чтение (или и на запись — тогда куда, решает Landlock)
+    // openat: read only (or also write — then Landlock decides where)
     at.set(.openat, n);
     p[n] = .{ .code = LD_W_ABS, .k = arg(2) };
     n += 1;
-    p[n] = .{ .code = JSET, .k = if (opts.write_files) 0o20000000 else OPEN_WRITE_MASK, .t = .kill, .f = .allow }; // __O_TMPFILE запрещён всегда
+    p[n] = .{ .code = JSET, .k = if (opts.write_files) 0o20000000 else OPEN_WRITE_MASK, .t = .kill, .f = .allow }; // __O_TMPFILE is always forbidden
     n += 1;
 
     at.set(.kill, n);
@@ -217,7 +217,7 @@ fn seccomp(comptime opts: Opts) void {
     }
     const fprog = SockFprog{ .len = @intCast(n), .filter = &prog };
     _ = sys.prctl(22, 2, @intFromPtr(&fprog)) catch { // PR_SET_SECCOMP, SECCOMP_MODE_FILTER
-        sys.log("seccomp: фильтр не установлен", .{});
+        sys.log("seccomp: filter not installed", .{});
     };
 }
 

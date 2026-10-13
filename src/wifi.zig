@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! zwifi — меню Wi‑Fi для zpanel на чистом Zig.
+//! zwifi — Wi‑Fi menu for netline, in pure Zig.
 //!
-//! Список сетей, подключение к открытым, WPA/WPA2/WPA3 Personal и корпоративным
-//! (802.1X: PEAP, TTLS, EAP-TLS) сетям через NetworkManager по D-Bus.
-//! `zwifi toggle` — включить/выключить Wi‑Fi без окна.
-//! Клавиатура: Tab/Shift+Tab, ↑/↓, Enter, Esc, Ctrl+V — вставка, Ctrl+U — очистить поле.
+//! Network list, connecting to open, WPA/WPA2/WPA3 Personal and enterprise
+//! (802.1X: PEAP, TTLS, EAP-TLS) networks through NetworkManager over D-Bus.
+//! `zwifi toggle` turns Wi‑Fi on/off without a window.
+//! Keyboard: Tab/Shift+Tab, ↑/↓, Enter, Esc, Ctrl+V — paste, Ctrl+U — clear the field.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -29,15 +29,15 @@ const STEP: f32 = 42;
 
 const View = enum { list, password, enterprise, hidden, actions, connecting, done };
 var view: View = .list;
-var form_view: View = .password; // куда вернуться при неудаче
+var form_view: View = .password; // where to go back on failure
 
 var nets: [48]nm.Net = undefined;
 var list: ui.List = .{};
 var target: nm.Net = .{};
 var target_hidden = false;
-var reenter = false; // сохранённый профиль не подошёл — при отправке старый удаляется
+var reenter = false; // the saved profile didn't work — the old one is removed on submit
 var nm_ok = false;
-var loaded = false; // список ещё не загружен: окно показывается сразу, данные — следующим тактом
+var loaded = false; // the list isn't loaded yet: the window shows right away, the data on the next tick
 var ticks: u32 = 0;
 
 const F = enum(u8) { ssid, password, identity, anon, ca, domain, cert, key, keypass };
@@ -45,14 +45,14 @@ var fields: [9]ui.Field = [_]ui.Field{.{}} ** 9;
 var reveal = false;
 var method: nm.Eap = .peap;
 var phase2: u8 = 0;
-var hsec: u8 = 1; // скрытая сеть: 0 открытая, 1 personal, 2 enterprise
+var hsec: u8 = 1; // hidden network: 0 open, 1 personal, 2 enterprise
 
 const peap_p2 = [_][]const u8{ "mschapv2", "gtc", "md5" };
 const peap_p2_label = [_][]const u8{ "MSCHAPv2", "GTC", "MD5" };
 const ttls_p2 = [_][]const u8{ "pap", "mschapv2", "mschap", "chap" };
 const ttls_p2_label = [_][]const u8{ "PAP", "MSCHAPv2", "MSCHAP", "CHAP" };
-const method_label = [_][]const u8{ "PEAP", "TTLS", "TLS (сертификат)" };
-const hsec_label = [_][]const u8{ "Открытая", "WPA/WPA2/WPA3 Personal", "Корпоративная 802.1X" };
+const method_label = [_][]const u8{ "PEAP", "TTLS", "TLS (certificate)" };
+const hsec_label = [_][]const u8{ "Open", "WPA/WPA2/WPA3 Personal", "Enterprise 802.1X" };
 
 const Wid = enum(u8) { none, row, more, toggle, back, other, field, select, eye, primary, secondary, act_connect, act_disconnect, act_forget };
 
@@ -60,12 +60,12 @@ fn wid(w: ui.Widget) Wid {
     return @enumFromInt(w.id);
 }
 
-// ================================================================= запуск
+// ================================================================= startup
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     if (sys.argIs(1, "toggle")) {
-        // без окна: переключить радио и выйти
+        // no window: toggle the radio and exit
         if (!nm.init()) {
             sys.log("{s}", .{nm.lastError()});
             sys.exit(1);
@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
 fn start() void {
     list.visible = @intFromFloat((ui.H() - LIST_Y - 64) / ROW_H);
-    // меню появляется сразу («Поиск сетей…»), список подгружается первым тактом таймера
+    // the menu appears right away ("Searching for networks…"), the list loads on the first timer tick
     if (nm_ok) ui.setTimer(1, SCAN_MS) else armTimer();
 }
 
@@ -110,15 +110,15 @@ fn busFd() i32 {
     return if (nm_ok) nm.bus.fd else -1;
 }
 
-/// Сигналы NetworkManager: новые сети показываем, как только NM их нашёл,
-/// а результат подключения — как только устройство сменило состояние.
+/// NetworkManager signals: new networks are shown as soon as NM finds them,
+/// and the connection result as soon as the device changes state.
 fn onBus() void {
-    // второй круг: синхронные вызовы из handleSignals могли дочитать сигналы в буфер
+    // second pass: synchronous calls from handleSignals may have read signals into the buffer
     for (0..2) |_| {
         if (!nm_ok) return;
         nm.bus.pump() catch {
             nm_ok = false;
-            ui.setMsg("связь с NetworkManager потеряна");
+            ui.setMsg("lost connection to NetworkManager");
             return;
         };
         handleSignals();
@@ -127,8 +127,8 @@ fn onBus() void {
 
 fn handleSignals() void {
     if (nm.nets_changed and view == .list and loaded and !refresh_pending) {
-        // NM шлёт изменения пачкой (точки, LastScan) — перечитываем один раз, чуть погодя;
-        // следующий поиск — через полный интервал после свежих результатов
+        // NM sends changes in a batch (access points, LastScan) — reread once, a little later;
+        // the next scan comes a full interval after fresh results
         refresh_pending = true;
         ui.setTimer(SETTLE_MS, SCAN_MS);
     }
@@ -147,29 +147,29 @@ fn fieldAt(idx: u16) ?*ui.Field {
     return if (idx < fields.len) &fields[idx] else null;
 }
 
-// ================================================================= логика
+// ================================================================= logic
 
-/// Перечитать список сетей. Включено ли радио, сообщает сигнал — отдельно не спрашиваем.
+/// Reread the network list. Whether the radio is on is reported by a signal — we don't ask separately.
 fn refresh() void {
-    nm.nets_changed = false; // и при выключенном радио: иначе сигнал перепланировал бы обновление снова и снова
+    nm.nets_changed = false; // even with the radio off: otherwise the signal would reschedule the update again and again
     list.setCount(if (nm.wifi_enabled) nm.networks(&nets) else 0);
     ui.redraw();
 }
 
-/// Как часто просить NM искать сети, пока открыт список. Сам список обновляется по сигналам.
+/// How often to ask NM to scan while the list is open. The list itself is updated from signals.
 const SCAN_MS = 10_000;
-/// Сколько подождать после первого сигнала об изменении списка, чтобы собрать всю пачку.
+/// How long to wait after the first list-change signal to collect the whole batch.
 const SETTLE_MS = 40;
 var refresh_pending = false;
 
-/// Таймер: в списке — повторный поиск сетей; при подключении — анимация точек
-/// (результат приходит сигналом, опрос — только запасной).
+/// Timer: in the list — repeated network scans; while connecting — the dots animation
+/// (the result comes as a signal, polling is only a fallback).
 fn armTimer() void {
     switch (view) {
         .connecting => ui.setTimer(500, 500),
         .done => ui.setTimer(900, 0),
         .list => ui.setTimer(SCAN_MS, SCAN_MS),
-        else => ui.setTimer(0, 0), // в формах ничего не опрашиваем
+        else => ui.setTimer(0, 0), // nothing is polled in forms
     }
 }
 
@@ -186,7 +186,7 @@ fn onTick() void {
         .list => {
             if (!nm_ok) return;
             if (!loaded) {
-                // сначала то, что NM уже знает (список виден сразу), потом новый поиск
+                // first what NM already knows (the list shows right away), then a new scan
                 loaded = true;
                 nm.loadSaved();
                 refresh();
@@ -194,11 +194,11 @@ fn onTick() void {
             } else if (refresh_pending) {
                 refresh_pending = false;
                 refresh();
-            } else nm.scan(); // результаты придут сигналами (AccessPointAdded, LastScan)
+            } else nm.scan(); // the results arrive as signals (AccessPointAdded, LastScan)
         },
         .connecting => {
-            ui.redrawText(ui.H() / 2 + 14, 14); // анимация точек — только её строка
-            if (ticks > 90 * 1000 / 500) return fail("Превышено время ожидания");
+            ui.redrawText(ui.H() / 2 + 14, 14); // dots animation — only its row
+            if (ticks > 90 * 1000 / 500) return fail("Timed out");
             checkProgress();
         },
         .done => ui.quit(),
@@ -220,7 +220,7 @@ fn checkProgress() void {
 
 fn fail(why: []const u8) void {
     nm.dropCreated();
-    // сохранённый профиль не подошёл — предлагаем ввести данные заново
+    // the saved profile didn't work — offer to enter the credentials again
     if (form_view == .list) {
         reenter = true;
         form_view = switch (target.sec) {
@@ -281,7 +281,7 @@ fn chooseNet(i: usize, right: bool) void {
             phase2 = 0;
             setView(.enterprise);
         },
-        .wep => ui.setMsg("WEP устарел и небезопасен — не поддерживается"),
+        .wep => ui.setMsg("WEP is outdated and insecure — not supported"),
     }
 }
 
@@ -295,11 +295,11 @@ fn onKey(k: ui.Key) bool {
     if (view != .list) return false;
     switch (k.code) {
         ui.K_UP, ui.K_DOWN => {
-            ui.focus = .{}; // стрелки — снова по списку, а не по кнопке
+            ui.focus = .{}; // arrows move through the list again, not the button
             list.move(if (k.code == ui.K_UP) -1 else 1);
         },
         ui.K_ENTER, ui.K_KPENTER => {
-            if (ui.focus.id != 0) return false; // в фокусе кнопка — её и нажимаем
+            if (ui.focus.id != 0) return false; // a button has focus — press it
             if (list.n > 0) chooseNet(list.sel, false);
         },
         else => return false,
@@ -380,18 +380,18 @@ fn submit() void {
     switch (view) {
         .password => {
             const pw = val(.password);
-            if (target.sec == .psk and (pw.len < 8 or pw.len > 63)) return ui.setMsg("Пароль WPA — от 8 до 63 символов");
-            if (pw.len == 0) return ui.setMsg("Введите пароль");
+            if (target.sec == .psk and (pw.len < 8 or pw.len > 63)) return ui.setMsg("A WPA password is 8 to 63 characters");
+            if (pw.len == 0) return ui.setMsg("Enter the password");
             if (reenter and target.known) _ = nm.forget(target.conn.get());
             if (nm.addAndActivate(.{ .ssid = target.ssid(), .hidden = target_hidden, .sec = target.sec, .psk = pw }, target.ap.get())) {
                 startConnecting(.password);
             } else ui.setMsg(nm.lastError());
         },
         .enterprise => {
-            if (val(.identity).len == 0) return ui.setMsg("Введите логин");
+            if (val(.identity).len == 0) return ui.setMsg("Enter the login");
             if (method == .tls) {
-                if (val(.cert).len == 0) return ui.setMsg("Укажите файл сертификата");
-            } else if (val(.password).len == 0) return ui.setMsg("Введите пароль");
+                if (val(.cert).len == 0) return ui.setMsg("Specify the certificate file");
+            } else if (val(.password).len == 0) return ui.setMsg("Enter the password");
             if (reenter and target.known) _ = nm.forget(target.conn.get());
             const spec = nm.Spec{
                 .ssid = target.ssid(),
@@ -412,7 +412,7 @@ fn submit() void {
         },
         .hidden => {
             const ssid = val(.ssid);
-            if (ssid.len == 0 or ssid.len > 32) return ui.setMsg("Имя сети — от 1 до 32 байт");
+            if (ssid.len == 0 or ssid.len > 32) return ui.setMsg("The network name is 1 to 32 bytes");
             target = .{};
             @memcpy(target.ssid_buf[0..ssid.len], ssid);
             target.ssid_len = @intCast(ssid.len);
@@ -425,7 +425,7 @@ fn submit() void {
                 1 => {
                     target.sec = .psk;
                     const pw = val(.password);
-                    if (pw.len < 8 or pw.len > 63) return ui.setMsg("Пароль WPA — от 8 до 63 символов");
+                    if (pw.len < 8 or pw.len > 63) return ui.setMsg("A WPA password is 8 to 63 characters");
                     if (nm.addAndActivate(.{ .ssid = ssid, .hidden = true, .sec = .psk, .psk = pw }, "")) startConnecting(.hidden) else ui.setMsg(nm.lastError());
                 },
                 else => {
@@ -440,49 +440,49 @@ fn submit() void {
     }
 }
 
-// ================================================================= раскладка
+// ================================================================= layout
 
-/// Строки формы 802.1X: (поле/селектор, индекс, подпись).
+/// Rows of the 802.1X form: (field/selector, index, caption).
 const FormRow = struct { id: Wid, idx: u8, label: []const u8 };
 
 fn enterpriseRows(out: *[8]FormRow) usize {
     var n: usize = 0;
-    out[n] = .{ .id = .select, .idx = 0, .label = "Метод" };
+    out[n] = .{ .id = .select, .idx = 0, .label = "Method" };
     n += 1;
     if (method != .tls) {
-        out[n] = .{ .id = .select, .idx = 1, .label = "Фаза 2" };
+        out[n] = .{ .id = .select, .idx = 1, .label = "Phase 2" };
         n += 1;
     }
-    out[n] = .{ .id = .field, .idx = @intFromEnum(F.identity), .label = "Логин" };
+    out[n] = .{ .id = .field, .idx = @intFromEnum(F.identity), .label = "Login" };
     n += 1;
     if (method == .tls) {
-        out[n] = .{ .id = .field, .idx = @intFromEnum(F.cert), .label = "Сертификат" };
+        out[n] = .{ .id = .field, .idx = @intFromEnum(F.cert), .label = "Certificate" };
         n += 1;
-        out[n] = .{ .id = .field, .idx = @intFromEnum(F.key), .label = "Ключ" };
+        out[n] = .{ .id = .field, .idx = @intFromEnum(F.key), .label = "Key" };
         n += 1;
-        out[n] = .{ .id = .field, .idx = @intFromEnum(F.keypass), .label = "Пароль ключа" };
+        out[n] = .{ .id = .field, .idx = @intFromEnum(F.keypass), .label = "Key password" };
         n += 1;
     } else {
-        out[n] = .{ .id = .field, .idx = @intFromEnum(F.password), .label = "Пароль" };
+        out[n] = .{ .id = .field, .idx = @intFromEnum(F.password), .label = "Password" };
         n += 1;
-        out[n] = .{ .id = .field, .idx = @intFromEnum(F.anon), .label = "Анон. логин" };
+        out[n] = .{ .id = .field, .idx = @intFromEnum(F.anon), .label = "Anon. login" };
         n += 1;
     }
-    out[n] = .{ .id = .field, .idx = @intFromEnum(F.ca), .label = "CA-сертификат" };
+    out[n] = .{ .id = .field, .idx = @intFromEnum(F.ca), .label = "CA certificate" };
     n += 1;
-    out[n] = .{ .id = .field, .idx = @intFromEnum(F.domain), .label = "Домен сервера" };
+    out[n] = .{ .id = .field, .idx = @intFromEnum(F.domain), .label = "Server domain" };
     n += 1;
     return n;
 }
 
 fn hiddenRows(out: *[8]FormRow) usize {
     var n: usize = 0;
-    out[n] = .{ .id = .field, .idx = @intFromEnum(F.ssid), .label = "Имя сети" };
+    out[n] = .{ .id = .field, .idx = @intFromEnum(F.ssid), .label = "Network name" };
     n += 1;
-    out[n] = .{ .id = .select, .idx = 2, .label = "Защита" };
+    out[n] = .{ .id = .select, .idx = 2, .label = "Security" };
     n += 1;
     if (hsec == 1) {
-        out[n] = .{ .id = .field, .idx = @intFromEnum(F.password), .label = "Пароль" };
+        out[n] = .{ .id = .field, .idx = @intFromEnum(F.password), .label = "Password" };
         n += 1;
     }
     return n;
@@ -547,7 +547,7 @@ fn layout() void {
     }
 }
 
-// ================================================================= рисование
+// ================================================================= drawing
 
 fn signal(cv: *draw.Canvas, x: f32, y: f32, strength: u8, on: u32, off: u32) void {
     const lvl: u8 = if (strength > 75) 4 else if (strength > 50) 3 else if (strength > 25) 2 else 1;
@@ -561,12 +561,12 @@ fn signal(cv: *draw.Canvas, x: f32, y: f32, strength: u8, on: u32, off: u32) voi
 
 fn secLabel(s: nm.Security) []const u8 {
     return switch (s) {
-        .open => "Открытая сеть",
-        .owe => "Открытая (OWE, шифрование)",
+        .open => "Open network",
+        .owe => "Open (OWE, encrypted)",
         .psk => "WPA/WPA2 Personal",
         .sae => "WPA3 Personal",
-        .eap => "Корпоративная 802.1X",
-        .wep => "WEP — не поддерживается",
+        .eap => "Enterprise 802.1X",
+        .wep => "WEP — not supported",
     };
 }
 
@@ -578,12 +578,12 @@ fn paint(cv: *draw.Canvas) void {
         .list => paintList(cv),
         .password => {
             ui.header(cv, target.ssid(), secLabel(target.sec), true);
-            _ = ui.text(cv, "Пароль", PAD, 102, 13, t.menu_muted, W);
+            _ = ui.text(cv, "Password", PAD, 102, 13, t.menu_muted, W);
             paintWidgets(cv);
             ui.paintMsg(cv, 168);
         },
         .enterprise, .hidden => {
-            ui.header(cv, if (view == .hidden) "Другая сеть" else target.ssid(), if (view == .hidden) "" else secLabel(.eap), true);
+            ui.header(cv, if (view == .hidden) "Other network" else target.ssid(), if (view == .hidden) "" else secLabel(.eap), true);
             var rows: [8]FormRow = undefined;
             const n = if (view == .enterprise) enterpriseRows(&rows) else hiddenRows(&rows);
             var y: f32 = 64;
@@ -595,21 +595,21 @@ fn paint(cv: *draw.Canvas) void {
             if (ui.msg().len > 0) {
                 ui.paintMsg(cv, y + 16);
             } else if (view == .enterprise and val(.ca).len == 0 and val(.domain).len == 0) {
-                _ = ui.text(cv, "Без CA и домена сервер не проверяется", PAD, y + 16, 12, t.menu_muted, W - PAD);
+                _ = ui.text(cv, "Without a CA and domain the server is not verified", PAD, y + 16, 12, t.menu_muted, W - PAD);
             }
         },
         .actions => {
-            ui.header(cv, target.ssid(), if (target.active) "Подключено" else "Сохранённая сеть", true);
+            ui.header(cv, target.ssid(), if (target.active) "Connected" else "Saved network", true);
             paintWidgets(cv);
             ui.paintMsg(cv, 230);
         },
         .connecting => {
             ui.centered(cv, target.ssid(), W / 2, H / 2 - 18, 18, t.menu_text);
             var b: [40]u8 = undefined;
-            _ = ui.text(cv, ui.dots("Подключение", ticks, &b), W / 2 - ui.textW("Подключение...", 14) / 2, H / 2 + 14, 14, t.menu_muted, W);
+            _ = ui.text(cv, ui.dots("Connecting", ticks, &b), W / 2 - ui.textW("Connecting...", 14) / 2, H / 2 + 14, 14, t.menu_muted, W);
             paintWidgets(cv);
         },
-        .done => ui.paintDone(cv, "Подключено"),
+        .done => ui.paintDone(cv, "Connected"),
     }
 }
 
@@ -619,14 +619,14 @@ fn paintList(cv: *draw.Canvas) void {
     const H = ui.H();
     ui.header(cv, "Wi‑Fi", "", false);
     if (!nm_ok) {
-        ui.centered(cv, "NetworkManager недоступен", W / 2, H / 2 - 8, 15, t.menu_text);
+        ui.centered(cv, "NetworkManager is unavailable", W / 2, H / 2 - 8, 15, t.menu_text);
         ui.centered(cv, ui.msg(), W / 2, H / 2 + 16, 12, t.menu_muted);
         return;
     }
     if (!nm.wifi_enabled) {
-        ui.centered(cv, "Wi‑Fi выключен", W / 2, H / 2, 15, t.menu_muted);
+        ui.centered(cv, "Wi‑Fi is off", W / 2, H / 2, 15, t.menu_muted);
     } else if (list.n == 0) {
-        ui.centered(cv, "Поиск сетей…", W / 2, H / 2, 15, t.menu_muted);
+        ui.centered(cv, "Searching for networks…", W / 2, H / 2, 15, t.menu_muted);
     }
     paintWidgets(cv);
     ui.paintMsg(cv, H - PAD - 52);
@@ -667,12 +667,12 @@ fn paintWidgets(cv: *draw.Canvas) void {
             },
             .toggle => ui.toggle(cv, w, nm.wifi_enabled),
             .back => ui.paintBack(cv, w),
-            .other => ui.button(cv, w, "Другая сеть…", .secondary),
-            .primary => ui.button(cv, w, if (view == .hidden and hsec == 2) "Далее" else "Подключить", .primary),
-            .secondary => ui.button(cv, w, "Отмена", .secondary),
-            .act_connect => ui.button(cv, w, "Подключиться", .primary),
-            .act_disconnect => ui.button(cv, w, "Отключиться", .secondary),
-            .act_forget => ui.button(cv, w, "Забыть сеть", .danger),
+            .other => ui.button(cv, w, "Other network…", .secondary),
+            .primary => ui.button(cv, w, if (view == .hidden and hsec == 2) "Next" else "Connect", .primary),
+            .secondary => ui.button(cv, w, "Cancel", .secondary),
+            .act_connect => ui.button(cv, w, "Connect", .primary),
+            .act_disconnect => ui.button(cv, w, "Disconnect", .secondary),
+            .act_forget => ui.button(cv, w, "Forget network", .danger),
             .field => {
                 const fi: F = @enumFromInt(w.idx);
                 const secret = fi == .password or fi == .keypass;
@@ -695,14 +695,14 @@ fn paintWidgets(cv: *draw.Canvas) void {
 
 fn placeholder(f: F) []const u8 {
     return switch (f) {
-        .ssid => "имя скрытой сети",
+        .ssid => "hidden network name",
         .password => "",
         .identity => "user@example.com",
-        .anon => "необязательно",
-        .ca => "/путь/к/ca.pem — необязательно",
+        .anon => "optional",
+        .ca => "/path/to/ca.pem — optional",
         .domain => "radius.example.com",
-        .cert => "/путь/к/client.p12",
-        .key => "для .p12 не нужен",
+        .cert => "/path/to/client.p12",
+        .key => "not needed for .p12",
         .keypass => "",
     };
 }

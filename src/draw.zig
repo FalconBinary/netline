@@ -1,13 +1,13 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Программная отрисовка в ARGB8888 (premultiplied): заливки, скруглённые прямоугольники
-//! и векторные примитивы с антиалиасингом через функции расстояния (SDF).
-//! Цифры и иконки — свои, векторные, поэтому масштабируются без потерь.
+//! Software rendering into ARGB8888 (premultiplied): fills, rounded rectangles
+//! and vector primitives antialiased via signed distance functions (SDF).
+//! Digits and icons are our own vector shapes, so they scale without loss.
 //!
-//! Скорость: смешивание целочисленное, по два канала за раз в одном 32-битном слове;
-//! у скруглённых прямоугольников (фон панели и меню, кнопки, рамки) функция расстояния
-//! считается только у краёв, середина строки заливается подряд.
+//! Speed: blending is integer, two channels at a time in one 32-bit word;
+//! for rounded rectangles (panel and menu background, buttons, frames) the distance function
+//! is evaluated only near the edges, the middle of a row is filled in one run.
 
 const std = @import("std");
 
@@ -15,12 +15,12 @@ pub const Canvas = struct {
     px: []u32,
     w: i32,
     h: i32,
-    /// Рисовать только строки [top, bot): частичная перерисовка (анимация, подсветка строки).
-    /// Всё, что ниже или выше, примитивы пропускают, не считая.
+    /// Draw only rows [top, bot): partial redraw (animation, row highlight).
+    /// Primitives skip everything below or above without computing it.
     top: i32 = 0,
     bot: i32 = std.math.maxInt(i32),
 
-    /// Первая и последняя+1 строка для рисунка в [y0, y1) с учётом полосы.
+    /// First and last+1 row for a drawing in [y0, y1), clipped to the band.
     inline fn rows(self: *const Canvas, y0: i32, y1: i32) [2]i32 {
         return .{ @max(y0, @max(0, self.top)), @min(y1, @min(self.h, self.bot)) };
     }
@@ -32,7 +32,7 @@ pub const Canvas = struct {
         @memset(self.px[@as(usize, @intCast(r[0])) * w .. @as(usize, @intCast(r[1])) * w], premul(color));
     }
 
-    /// Наложить цвет (ARGB без предумножения) с покрытием cov (0..1).
+    /// Blend a color (non-premultiplied ARGB) with coverage cov (0..1).
     pub inline fn blend(self: *Canvas, x: i32, y: i32, color: u32, cov: f32) void {
         if (cov <= 0.0 or y < self.top or y >= self.bot) return;
         const i: usize = @intCast(y * self.w + x);
@@ -44,7 +44,7 @@ pub const Canvas = struct {
         return self.px[@as(usize, @intCast(y)) * w ..][0..w];
     }
 
-    /// Наложить 8-битную маску покрытия (глиф шрифта) цветом `color`.
+    /// Blend an 8-bit coverage mask (a font glyph) with `color`.
     pub fn blit(self: *Canvas, bmp: []const u8, w: u16, h: u16, x: i32, y: i32, color: u32) void {
         const alpha = color >> 24;
         const c0: i32 = @max(0, -x);
@@ -63,7 +63,7 @@ pub const Canvas = struct {
         }
     }
 
-    /// Картинка с предумноженной альфой (0xAARRGGBB, w×h) один к одному в точку (x, y) устройства.
+    /// A premultiplied-alpha image (0xAARRGGBB, w×h) one to one at device point (x, y).
     pub fn argb(self: *Canvas, src: []const u32, w: u32, h: u32, x: i32, y: i32) void {
         if (src.len < @as(usize, w) * h) return;
         const iw: i32 = @intCast(w);
@@ -85,8 +85,8 @@ pub const Canvas = struct {
         }
     }
 
-    /// Картинка RGB (3 байта на пиксель, sw×sh) в прямоугольник (x, y, w, h) устройства:
-    /// при уменьшении — усреднение, углы скруглены радиусом r.
+    /// An RGB image (3 bytes per pixel, sw×sh) into the device rectangle (x, y, w, h):
+    /// averaged when downscaling, corners rounded with radius r.
     pub fn image(self: *Canvas, rgb: []const u8, sw: u32, sh: u32, x: f32, y: f32, w: f32, h: f32, r: f32) void {
         if (w < 1 or h < 1 or sw == 0 or sh == 0 or rgb.len < @as(usize, sw) * sh * 3) return;
         const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x))));
@@ -99,7 +99,7 @@ pub const Canvas = struct {
         const fy: f32 = @as(f32, @floatFromInt(sh)) / h;
         const b = Box{ .cx = x + w / 2, .cy = y + h / 2, .hw = w / 2, .hh = h / 2, .r = @min(r, @min(w, h) / 2) };
         if (fx == 1 and fy == 1 and x == @floor(x) and y == @floor(y)) return self.image1(rgb, sw, b, x0, y0, x1, y1, x, y);
-        // столбцы исходника для каждого столбца назначения — один раз на картинку
+        // source columns for every destination column — once per image
         var cols: [4096][2]u32 = undefined;
         const ncols: usize = @intCast(x1 - x0);
         if (ncols > cols.len) return;
@@ -142,8 +142,8 @@ pub const Canvas = struct {
         }
     }
 
-    /// Картинка уже в размере экрана (превью, подготовленные под масштаб): пиксель в пиксель,
-    /// середина строки — простым копированием, по функции расстояния — только скруглённые края.
+    /// An image already at screen size (thumbnails prepared for the scale): pixel for pixel,
+    /// the middle of a row by plain copying, only the rounded edges via the distance function.
     fn image1(self: *Canvas, rgb: []const u8, sw: u32, b: Box, x0: i32, y0: i32, x1: i32, y1: i32, x: f32, y: f32) void {
         const ix: i32 = @intFromFloat(x);
         const iy: i32 = @intFromFloat(y);
@@ -166,7 +166,7 @@ pub const Canvas = struct {
         }
     }
 
-    /// Обходит пиксели прямоугольника и красит с покрытием clamp(0.5 - dist).
+    /// Walks the pixels of a rectangle and paints with coverage clamp(0.5 - dist).
     fn paint(self: *Canvas, x0f: f32, y0f: f32, x1f: f32, y1f: f32, color: u32, ctx: anytype, comptime dist: fn (@TypeOf(ctx), f32, f32) f32) void {
         const x0: i32 = @max(0, @as(i32, @intFromFloat(@floor(x0f))));
         const x1: i32 = @min(self.w, @as(i32, @intFromFloat(@ceil(x1f))));
@@ -186,8 +186,8 @@ pub const Canvas = struct {
         }
     }
 
-    /// Пиксели строки y в [xa, xb) — с покрытием по функции расстояния прямоугольника b
-    /// (заливка или контур с полутолщиной hw).
+    /// Pixels of row y in [xa, xb) — with coverage from the distance function of rectangle b
+    /// (fill, or outline with half-thickness hw).
     fn boxEdges(self: *Canvas, b: Box, y: i32, xa: i32, xb: i32, color: u32, comptime outline: bool, hw: f32) void {
         const dst = self.row(y);
         const fy = @as(f32, @floatFromInt(y)) + 0.5;
@@ -211,7 +211,7 @@ pub const Canvas = struct {
         if (x0 >= x1) return;
         var py = y0;
         while (py < y1) : (py += 1) {
-            // полностью покрытая середина строки — подряд, края — по функции расстояния
+            // the fully covered middle of the row in one run, the edges via the distance function
             const s = b.fullSpan(py, x0, x1, 0.5);
             self.boxEdges(b, py, x0, s[0], color, false, 0);
             fillSpan(self.row(py)[@intCast(s[0])..@intCast(s[1])], color);
@@ -219,7 +219,7 @@ pub const Canvas = struct {
         }
     }
 
-    /// Контур скруглённого прямоугольника толщиной `stroke` (по центру линии — границе b).
+    /// Outline of a rounded rectangle `stroke` thick (centered on the line — the edge of b).
     fn strokeBox(self: *Canvas, b: Box, stroke: f32, color: u32) void {
         const hw = stroke / 2;
         const pad = hw + 1;
@@ -231,17 +231,17 @@ pub const Canvas = struct {
         if (x0 >= x1) return;
         var py = y0;
         while (py < y1) : (py += 1) {
-            // внутри «дырки» (дальше полутолщины + 0,5 от линии) покрытие нулевое — пропускаем
+            // inside the "hole" (farther than half-thickness + 0.5 from the line) coverage is zero — skip
             const s = b.fullSpan(py, x0, x1, hw + 0.5);
             self.boxEdges(b, py, x0, s[0], color, true, hw);
             self.boxEdges(b, py, s[1], x1, color, true, hw);
         }
     }
 
-    /// Рисует набор примитивов. Координаты примитивов в «единицах»,
-    /// пиксель = (ox, oy) + единица * s. stroke — толщина линий в пикселях.
+    /// Draws a set of primitives. Primitive coordinates are in "units",
+    /// pixel = (ox, oy) + unit * s. stroke is the line thickness in pixels.
     pub fn prims(self: *Canvas, list: []const Prim, ox: f32, oy: f32, s: f32, stroke: f32, color: u32) void {
-        // одиночный контур прямоугольника (рамка меню, фокус) — середину не обходим
+        // a single rectangle outline (menu frame, focus) — don't walk the middle
         if (list.len == 1 and list[0] == .box) {
             const v = list[0].box;
             const w = v.w * s;
@@ -269,9 +269,9 @@ pub const Canvas = struct {
         self.paint(bx0 - pad, by0 - pad, bx1 + pad, by1 + pad, color, ctx, Group.sdf);
     }
 
-    /// То же, что prims, но маска покрытия считается один раз и дальше берётся из кэша:
-    /// иконки и цифры в каждом кадре одни и те же, и перерисовка — просто наложение цветом.
-    /// Позиция учитывается с точностью до 1/4 пикселя (целые позиции — пиксель в пиксель как prims).
+    /// Same as prims, but the coverage mask is computed once and then taken from the cache:
+    /// icons and digits are the same every frame, and redrawing is just blending with a color.
+    /// Position is honored to 1/4 pixel (integer positions are pixel for pixel like prims).
     pub fn icon(self: *Canvas, list: []const Prim, ox: f32, oy: f32, s: f32, stroke: f32, color: u32) void {
         if (list.len == 0 or list.len > 24 or !(@abs(ox) < 1e6 and @abs(oy) < 1e6))
             return self.prims(list, ox, oy, s, stroke, color);
@@ -286,7 +286,7 @@ pub const Canvas = struct {
     }
 };
 
-// ---------------------------------------------------------------- кэш масок иконок
+// ---------------------------------------------------------------- icon mask cache
 
 const MaskSlot = struct { key: u64 = 0, x0: i32 = 0, y0: i32 = 0, w: u16 = 0, h: u16 = 0, off: u32 = 0, used: u32 = 0 };
 const MASK_SLOTS = 128;
@@ -295,7 +295,7 @@ var mask_pool: [128 * 1024]u8 = undefined;
 var mask_used: usize = 0;
 var mask_tick: u32 = 0;
 
-/// Ключ набора примитивов — по значениям полей (не по адресу и не по байтам с выравниванием).
+/// Key of a primitive set — by field values (not by address, not by bytes with padding).
 fn maskKey(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) u64 {
     var h: u64 = 0xcbf29ce484222325;
     const mix = struct {
@@ -322,10 +322,10 @@ fn maskKey(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) u64 {
     return if (h == 0) 1 else h;
 }
 
-/// Маска покрытия (0..255) набора примитивов с началом в (fx, fy) внутри пикселя.
+/// Coverage mask (0..255) of a primitive set with its origin at (fx, fy) inside the pixel.
 fn maskFor(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) ?*const MaskSlot {
     const key = maskKey(list, fx, fy, s, stroke);
-    // две ячейки-кандидата: иконки одного кадра не вытесняют друг друга по кругу
+    // two candidate slots: icons of one frame don't evict each other in a cycle
     const sa = &mask_slots[key % MASK_SLOTS];
     const sb = &mask_slots[(key >> 32) % MASK_SLOTS];
     mask_tick +%= 1;
@@ -353,7 +353,7 @@ fn maskFor(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) ?*const Ma
         bx1 = @max(bx1, b[2]);
         by1 = @max(by1, b[3]);
     }
-    // та же область, что обходит prims: рамка примитивов плюс полутолщина и пиксель запаса
+    // the same area prims walks: the primitives' bounding box plus half-thickness and a spare pixel
     const pad = stroke / 2 + 1;
     const x0f = @floor(bx0 - pad);
     const y0f = @floor(by0 - pad);
@@ -362,7 +362,7 @@ fn maskFor(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) ?*const Ma
     if (!(wf >= 1 and hf >= 1 and wf <= 256 and hf <= 256 and @abs(x0f) < 4096 and @abs(y0f) < 4096)) return null;
     const w: usize = @intFromFloat(wf);
     const h: usize = @intFromFloat(hf);
-    if (mask_used + w * h > mask_pool.len) { // пул кончился — начинаем заново
+    if (mask_used + w * h > mask_pool.len) { // the pool ran out — start over
         mask_used = 0;
         for (&mask_slots) |*m| m.* = .{};
     }
@@ -371,7 +371,7 @@ fn maskFor(list: []const Prim, fx: f32, fy: f32, s: f32, stroke: f32) ?*const Ma
     for (0..h) |j| {
         const py = y0f + @as(f32, @floatFromInt(j)) + 0.5;
         for (out[j * w ..][0..w], 0..) |*o, i| {
-            // покрытие — как в paint/coverAlpha: clamp(0,5 − d), округление до 1/255
+            // coverage as in paint/coverAlpha: clamp(0.5 − d), rounded to 1/255
             const cov = 0.5 - g.sdf(x0f + @as(f32, @floatFromInt(i)) + 0.5, py);
             o.* = if (cov <= 0) 0 else if (cov >= 1) 255 else @intFromFloat(cov * 255 + 0.5);
         }
@@ -391,26 +391,26 @@ pub fn premul(c: u32) u32 {
     return out;
 }
 
-/// Все четыре канала × k / 255 (два канала на 16-битную половину слова).
+/// All four channels × k / 255 (two channels per 16-bit half of the word).
 inline fn scalePx(c: u32, k: u32) u32 {
     const rb = (c & 0x00ff00ff) * k + 0x00800080;
     const ag = ((c >> 8) & 0x00ff00ff) * k + 0x00800080;
     return (((rb + ((rb >> 8) & 0x00ff00ff)) >> 8) & 0x00ff00ff) | ((ag + ((ag >> 8) & 0x00ff00ff)) & 0xff00ff00);
 }
 
-/// x / 255 с округлением, точно для 0..65535.
+/// x / 255 with rounding, exact for 0..65535.
 inline fn div255(x: u32) u32 {
     return (x + 128 + ((x + 128) >> 8)) >> 8;
 }
 
-/// Непрозрачность 0..255: альфа цвета × покрытие.
+/// Opacity 0..255: color alpha × coverage.
 inline fn coverAlpha(alpha: u32, cov: f32) u32 {
     if (cov >= 1) return alpha;
     return div255(alpha * @as(u32, @intFromFloat(cov * 255 + 0.5)));
 }
 
-/// d = c·a + d·(1 − a) во всех четырёх каналах сразу (c — без предумножения,
-/// в канал альфы идёт 255): два канала на 16-битную половину слова.
+/// d = c·a + d·(1 − a) in all four channels at once (c is non-premultiplied,
+/// the alpha channel gets 255): two channels per 16-bit half of the word.
 inline fn blendPx(d: *u32, color: u32, a: u32) void {
     if (a == 0) return;
     if (a >= 255) {
@@ -425,8 +425,8 @@ inline fn blendPx(d: *u32, color: u32, a: u32) void {
     d.* = (((rb + ((rb >> 8) & 0x00ff00ff)) >> 8) & 0x00ff00ff) | ((ag + ((ag >> 8) & 0x00ff00ff)) & 0xff00ff00);
 }
 
-/// Залить строку цветом с полным покрытием. Подряд идущие одинаковые пиксели фона
-/// (а после clear — вся строка) смешиваются один раз.
+/// Fill a row with a color at full coverage. Runs of identical background pixels
+/// (and after clear — the whole row) are blended once.
 fn fillSpan(dst: []u32, color: u32) void {
     const a = color >> 24;
     if (a >= 255) return @memset(dst, color | 0xff000000);
@@ -454,10 +454,10 @@ const Box = struct {
         return sdBox(x - b.cx, y - b.cy, b.hw, b.hh, b.r);
     }
 
-    /// Пиксели строки y из [x0, x1), у которых расстояние до края ≤ −t (для t = 0,5 — полностью
-    /// покрытые). Возвращает [начало, конец) — пустой отрезок, если таких нет.
+    /// Pixels of row y in [x0, x1) whose distance to the edge is ≤ −t (for t = 0.5 — fully
+    /// covered). Returns [start, end) — an empty range if there are none.
     fn fullSpan(b: Box, y: i32, x0: i32, x1: i32, t: f32) [2]i32 {
-        // радиус больше половины стороны — формула ниже неверна, считаем всё по расстоянию
+        // radius larger than half the side — the formula below is wrong, compute everything by distance
         if (b.r > @min(b.hw, b.hh)) return .{ x1, x1 };
         const dy = @abs(@as(f32, @floatFromInt(y)) + 0.5 - b.cy);
         var ih: f32 = undefined;
@@ -472,9 +472,9 @@ const Box = struct {
         } else if (dy <= b.hh - t) {
             ih = b.hw - t;
         } else return .{ x1, x1 };
-        ih -= 1e-3; // запас на погрешность: пограничные пиксели посчитает функция расстояния
+        ih -= 1e-3; // margin for rounding error: the distance function handles the border pixels
         if (ih < 0) return .{ x1, x1 };
-        // центр пикселя x + 0,5 в [cx − ih, cx + ih]
+        // pixel center x + 0.5 in [cx − ih, cx + ih]
         const lo = std.math.clamp(@ceil(b.cx - ih - 0.5), @as(f32, @floatFromInt(x0)), @as(f32, @floatFromInt(x1)));
         const hi = std.math.clamp(@floor(b.cx + ih - 0.5) + 1, lo, @as(f32, @floatFromInt(x1)));
         return .{ @intFromFloat(lo), @intFromFloat(hi) };
@@ -500,7 +500,7 @@ fn segDist(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) f32 {
     return @sqrt(ex * ex + ey * ey);
 }
 
-/// Быстрый atan2 (погрешность ~1e-5 рад) — чтобы не зависеть от сигнатуры std.math.atan2.
+/// Fast atan2 (error ~1e-5 rad) — so we don't depend on the std.math.atan2 signature.
 fn atan2(y: f32, x: f32) f32 {
     const ax = @abs(x);
     const ay = @abs(y);
@@ -517,15 +517,15 @@ fn atan2(y: f32, x: f32) f32 {
 
 const TAU: f32 = 6.28318531;
 
-/// Векторный примитив. Углы дуг — в градусах, 0° = вправо, 90° = вниз,
-/// дуга идёт по часовой стрелке от a0 к a1.
+/// A vector primitive. Arc angles are in degrees, 0° = right, 90° = down,
+/// the arc goes clockwise from a0 to a1.
 pub const Prim = union(enum) {
     seg: struct { x0: f32, y0: f32, x1: f32, y1: f32 },
-    arc: struct { cx: f32, cy: f32, r: f32, a0: f32, a1: f32, ends: [4]f32 = .{ 0, 0, 0, 0 } }, // ends — концы, считаются в transform
+    arc: struct { cx: f32, cy: f32, r: f32, a0: f32, a1: f32, ends: [4]f32 = .{ 0, 0, 0, 0 } }, // ends — end points, computed in transform
     ring: struct { cx: f32, cy: f32, r: f32 },
-    dot: struct { cx: f32, cy: f32, r: f32 }, // заливка
-    box: struct { x: f32, y: f32, w: f32, h: f32, r: f32 }, // контур
-    fbox: struct { x: f32, y: f32, w: f32, h: f32, r: f32 }, // заливка
+    dot: struct { cx: f32, cy: f32, r: f32 }, // fill
+    box: struct { x: f32, y: f32, w: f32, h: f32, r: f32 }, // outline
+    fbox: struct { x: f32, y: f32, w: f32, h: f32, r: f32 }, // fill
 
     fn transform(p: Prim, ox: f32, oy: f32, s: f32) Prim {
         return switch (p) {
@@ -556,7 +556,7 @@ pub const Prim = union(enum) {
         };
     }
 
-    /// Расстояние до примитива с учётом полутолщины линии hw.
+    /// Distance to the primitive, accounting for the line half-thickness hw.
     fn dist(p: Prim, x: f32, y: f32, hw: f32) f32 {
         switch (p) {
             .seg => |v| return segDist(x, y, v.x0, v.y0, v.x1, v.y1) - hw,
@@ -598,8 +598,8 @@ const Group = struct {
     }
 };
 
-// ---------------------------------------------------------------- шрифт
-// Цифры спроектированы в сетке 6×10 единиц, линия — STROKE единиц.
+// ---------------------------------------------------------------- font
+// Digits are designed on a 6×10 unit grid, the line is STROKE units.
 
 pub const STROKE: f32 = 1.45;
 
@@ -619,7 +619,7 @@ fn box(x: f32, y: f32, w: f32, h: f32, r: f32) Prim {
     return .{ .box = .{ .x = x, .y = y, .w = w, .h = h, .r = r } };
 }
 
-/// Точка на дуге (для стыковки отрезков с дугами).
+/// A point on an arc (to join segments with arcs).
 fn ap(cx: f32, cy: f32, r: f32, deg: f32) [2]f32 {
     const a = deg * TAU / 360.0;
     return .{ cx + r * @cos(a), cy + r * @sin(a) };
@@ -670,12 +670,12 @@ fn advance(c: u8) f32 {
     };
 }
 
-/// Ширина текста в пикселях при высоте цифр `size`.
+/// Text width in pixels at digit height `size`.
 pub fn textWidth(str: []const u8, size: f32) f32 {
     const s = size / 10.0;
     var w: f32 = 0;
     for (str) |ch| w += advance(ch) * s;
-    // у последнего символа не учитываем межбуквенный промежуток
+    // the last character gets no letter spacing
     if (str.len > 0) w -= (advance(str[str.len - 1]) - glyphWidth(str[str.len - 1])) * s;
     return w;
 }
@@ -688,7 +688,7 @@ fn glyphWidth(c: u8) f32 {
     };
 }
 
-/// Рисует строку из цифр, ':' , '.' и пробелов. (x, y) — левый верхний угол цифр.
+/// Draws a string of digits, ':', '.' and spaces. (x, y) is the top-left corner of the digits.
 pub fn text(c: *Canvas, str: []const u8, x: f32, y: f32, size: f32, color: u32) void {
     const s = size / 10.0;
     var cx = x;
@@ -698,7 +698,7 @@ pub fn text(c: *Canvas, str: []const u8, x: f32, y: f32, size: f32, color: u32) 
     }
 }
 
-// ---------------------------------------------------------------- иконки (сетка 16×16)
+// ---------------------------------------------------------------- icons (16×16 grid)
 
 pub const icon_wifi_dot = [_]Prim{dot(8, 13, 1.5)};
 pub const icon_wifi_arcs = [_][1]Prim{

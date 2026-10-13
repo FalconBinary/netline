@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Состояние Wi‑Fi и Bluetooth — напрямую из ядра (sysfs/procfs/ioctl), без NetworkManager/BlueZ/D-Bus.
-//! Обновления приходят событиями netlink, поэтому панель не опрашивает систему впустую.
+//! Wi‑Fi and Bluetooth state straight from the kernel (sysfs/procfs/ioctl), without NetworkManager/BlueZ/D-Bus.
+//! Updates arrive as netlink events, so the panel does not poll the system for nothing.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -13,16 +13,16 @@ pub const Wifi = struct { state: WifiState = .none, level: u8 = 0 }; // level 1.
 
 pub const Bt = enum(u8) { none, off, on, connected };
 
-/// Сокеты событий (или -1): изменения сетевых интерфейсов, uevent'ы устройств
-/// и события управления Bluetooth (включение/выключение адаптера).
+/// Event sockets (or -1): network interface changes, device uevents
+/// and Bluetooth management events (adapter power on/off).
 pub var route_fd: i32 = -1;
 pub var uevent_fd: i32 = -1;
 pub var mgmt_fd: i32 = -1;
 var hci_sock: i32 = -1;
 
-/// Открыть всё нужное заранее — после включения песочницы создавать сокеты нельзя.
-/// На сокеты ставятся фильтры BPF: ядро будит панель только событиями, которые меняют
-/// значки, а не каждым процентом заряда батареи, USB-устройством или сканированием Wi‑Fi.
+/// Open everything needed up front — sockets cannot be created once the sandbox is on.
+/// BPF filters are attached to the sockets: the kernel wakes the panel only for events that change
+/// the icons, not for every percent of battery charge, USB device or Wi‑Fi scan.
 pub fn init() void {
     route_fd = sys.netlink(0, 1) catch -1; // NETLINK_ROUTE, RTMGRP_LINK
     if (route_fd >= 0) sys.attachFilter(route_fd, &route_filter) catch {};
@@ -31,7 +31,7 @@ pub fn init() void {
     mgmt_fd = openMgmt();
 }
 
-// ---------------------------------------------------------------- фильтры
+// ---------------------------------------------------------------- filters
 
 const LD_W_ABS: u16 = 0x20;
 const LD_B_ABS: u16 = 0x30;
@@ -47,39 +47,39 @@ const JGE_X: u16 = 0x3d;
 const RET: u16 = 0x06;
 const KEEP: u32 = 0xffffffff;
 
-// Числа в netlink — в порядке байт процессора: где младший и старший байт u16.
+// Numbers in netlink are in CPU byte order: where the low and high bytes of a u16 are.
 const lo: u32 = if (builtin.cpu.arch.endian() == .little) 0 else 1;
 const hi: u32 = 1 - lo;
 
-/// RTM_NEWLINK с атрибутом IFLA_WIRELESS — беспроводные события (конец сканирования и т. п.,
-/// NetworkManager сканирует каждые несколько минут). Значок они не меняют: подключение и
-/// отключение приходят отдельным RTM_NEWLINK о состоянии интерфейса.
-/// У такого события атрибуты — IFLA_IFNAME и сразу IFLA_WIRELESS; фильтр смотрит тип второго
-/// атрибута. (Поиск атрибута в ядре, SKF_AD_NLATTR, на рассылках rtnetlink не срабатывает.)
-/// Короткие сообщения не трогаем: чтение за концом в BPF означает «отбросить».
+/// RTM_NEWLINK with the IFLA_WIRELESS attribute — wireless events (end of a scan etc.,
+/// NetworkManager scans every few minutes). They don't change the icon: connecting and
+/// disconnecting arrive as a separate RTM_NEWLINK about the interface state.
+/// Such an event has the attributes IFLA_IFNAME followed directly by IFLA_WIRELESS; the filter checks the type
+/// of the second attribute. (The in-kernel attribute lookup, SKF_AD_NLATTR, doesn't work on rtnetlink broadcasts.)
+/// Short messages are left alone: reading past the end in BPF means "drop".
 const route_filter = [_]sys.SockFilter{
-    .{ .code = LD_B_ABS, .k = 32 + hi }, // 0: старший байт длины первого атрибута (IFNAME — короче 256)
-    .{ .code = JEQ, .k = 0, .jt = 0, .jf = 15 }, // 1: иначе — пропустить
-    .{ .code = LD_B_ABS, .k = 32 + lo }, // 2: длина первого атрибута
-    .{ .code = ADD, .k = 3 }, // 3–4: с выравниванием до 4
+    .{ .code = LD_B_ABS, .k = 32 + hi }, // 0: high byte of the first attribute's length (IFNAME is shorter than 256)
+    .{ .code = JEQ, .k = 0, .jt = 0, .jf = 15 }, // 1: otherwise — pass
+    .{ .code = LD_B_ABS, .k = 32 + lo }, // 2: length of the first attribute
+    .{ .code = ADD, .k = 3 }, // 3–4: aligned to 4
     .{ .code = AND, .k = 0xfc },
-    .{ .code = ADD, .k = 32 + 4 }, // 5: конец заголовка второго атрибута
+    .{ .code = ADD, .k = 32 + 4 }, // 5: end of the second attribute's header
     .{ .code = TAX, .k = 0 }, // 6
     .{ .code = LD_LEN, .k = 0 }, // 7
-    .{ .code = JGE_X, .k = 0, .jt = 0, .jf = 8 }, // 8: сообщение короче — пропустить
+    .{ .code = JGE_X, .k = 0, .jt = 0, .jf = 8 }, // 8: message is shorter — pass
     .{ .code = TXA, .k = 0 }, // 9
     .{ .code = SUB, .k = 4 }, // 10
-    .{ .code = TAX, .k = 0 }, // 11: X — начало второго атрибута
-    .{ .code = LD_B_IND, .k = 2 + lo }, // 12: тип, младший байт
+    .{ .code = TAX, .k = 0 }, // 11: X — start of the second attribute
+    .{ .code = LD_B_IND, .k = 2 + lo }, // 12: type, low byte
     .{ .code = JEQ, .k = 11, .jt = 0, .jf = 3 }, // 13: IFLA_WIRELESS?
-    .{ .code = LD_B_IND, .k = 2 + hi }, // 14: старший байт (без флагов NLA_F_*)
+    .{ .code = LD_B_IND, .k = 2 + hi }, // 14: high byte (without NLA_F_* flags)
     .{ .code = AND, .k = 0x3f },
-    .{ .code = JEQ, .k = 0, .jt = 1, .jf = 0 }, // 16: да — отбросить
+    .{ .code = JEQ, .k = 0, .jt = 1, .jf = 0 }, // 16: yes — drop
     .{ .code = RET, .k = KEEP }, // 17
     .{ .code = RET, .k = 0 }, // 18
 };
 
-/// MurmurHash2 — им udevd подписывает подсистему в заголовке рассылки (как в libudev).
+/// MurmurHash2 — udevd signs the subsystem in the broadcast header with it (as in libudev).
 fn murmur2(comptime s: []const u8) u32 {
     const m: u32 = 0x5bd1e995;
     var h: u32 = @as(u32, s.len);
@@ -105,8 +105,8 @@ fn murmur2(comptime s: []const u8) u32 {
     return h;
 }
 
-/// Рассылка udevd: «libudev\0», магия 0xfeedcafe (смещение 8), хеш подсистемы (24) —
-/// всё в сетевом порядке байт, как и читает BPF. Пропускаем только rfkill и bluetooth.
+/// A udevd broadcast: "libudev\0", magic 0xfeedcafe (offset 8), subsystem hash (24) —
+/// all in network byte order, which is how BPF reads it. Only rfkill and bluetooth pass.
 const udev_filter = [_]sys.SockFilter{
     .{ .code = LD_W_ABS, .k = 8 },
     .{ .code = JEQ, .k = 0xfeedcafe, .jt = 0, .jf = 4 },
@@ -117,20 +117,20 @@ const udev_filter = [_]sys.SockFilter{
     .{ .code = RET, .k = 0 },
 };
 
-/// События устройств. Если работает udevd — его рассылка (группа 2) с фильтром по
-/// подсистеме прямо в ядре. Без udevd — все события ядра (группа 1), их разбирает drainEvents.
+/// Device events. If udevd is running — its broadcast (group 2) filtered by
+/// subsystem right in the kernel. Without udevd — all kernel events (group 1), parsed by drainEvents.
 fn openUevents() i32 {
     if (sys.pathExists("/run/udev/control")) {
         if (sys.netlink(15, 2)) |fd| {
             if (sys.attachFilter(fd, &udev_filter)) |_| return fd else |_| sys.close(fd);
         } else |_| {}
     }
-    return sys.netlink(15, 1) catch -1; // NETLINK_KOBJECT_UEVENT, события ядра
+    return sys.netlink(15, 1) catch -1; // NETLINK_KOBJECT_UEVENT, kernel events
 }
 
-/// Канал управления Bluetooth (mgmt): событие New Settings приходит при включении и
-/// выключении адаптера — без него это пришлось бы опрашивать. Права root не нужны:
-/// непривилегированный сокет получает события настроек, но не может ничего менять.
+/// Bluetooth management channel (mgmt): a New Settings event arrives when the adapter is
+/// powered on and off — without it this would have to be polled. No root needed:
+/// an unprivileged socket receives settings events but cannot change anything.
 fn openMgmt() i32 {
     const fd = sys.socket(31, 3 | sys.O_NONBLOCK, 1) catch return -1; // AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI
     // struct sockaddr_hci { u16 family; u16 dev = HCI_DEV_NONE; u16 channel = HCI_CHANNEL_CONTROL; }
@@ -142,13 +142,13 @@ fn openMgmt() i32 {
     return fd;
 }
 
-/// Есть ли события питания Bluetooth (иначе включение адаптера узнаётся опросом).
+/// Whether Bluetooth power events are available (otherwise adapter power is learned by polling).
 pub fn btEvents() bool {
     return mgmt_fd >= 0;
 }
 
-/// Вычитать события mgmt. true — что-то изменилось у адаптеров (питание, появление, удаление)
-/// или канал пропал (тогда питание снова узнаётся опросом).
+/// Drain mgmt events. true — something changed with the adapters (power, added, removed)
+/// or the channel is gone (then power is learned by polling again).
 pub fn drainMgmt() bool {
     var buf: [512]u8 = undefined;
     var any = false;
@@ -160,7 +160,7 @@ pub fn drainMgmt() bool {
         if (n == 0) break;
         any = true;
     }
-    // ошибка или конец потока: закрываем, иначе poll будил бы панель без остановки
+    // error or end of stream: close it, otherwise poll would wake the panel endlessly
     sys.close(mgmt_fd);
     mgmt_fd = -1;
     return true;
@@ -168,7 +168,7 @@ pub fn drainMgmt() bool {
 
 pub const Changed = struct { wifi: bool = false, bt: bool = false };
 
-/// Вычитать все события из готовых сокетов и сказать, что нужно перечитать.
+/// Drain all events from the ready sockets and report what needs rereading.
 pub fn drainEvents(route_ready: bool, uevent_ready: bool) Changed {
     var ch = Changed{};
     var buf: [8192]u8 align(4) = undefined;
@@ -176,7 +176,7 @@ pub fn drainEvents(route_ready: bool, uevent_ready: bool) Changed {
         while (true) {
             const n = sys.read(route_fd, &buf) catch |e| {
                 if (e == error.WouldBlock) break;
-                ch.wifi = true; // ENOBUFS и т.п. — на всякий случай перечитаем
+                ch.wifi = true; // ENOBUFS and the like — reread just in case
                 break;
             };
             if (n == 0) break;
@@ -193,7 +193,7 @@ pub fn drainEvents(route_ready: bool, uevent_ready: bool) Changed {
                 break;
             };
             if (n == 0) break;
-            // "ACTION@DEVPATH\0KEY=VALUE\0..." — нужна только подсистема
+            // "ACTION@DEVPATH\0KEY=VALUE\0..." — only the subsystem is needed
             var it = std.mem.splitScalar(u8, buf[0..n], 0);
             while (it.next()) |kv| {
                 if (std.mem.eql(u8, kv, "SUBSYSTEM=bluetooth")) ch.bt = true;
@@ -237,7 +237,7 @@ fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
 
-/// true/false — заблокирован ли rfkill данного типа ("wlan", "bluetooth"); null — устройств нет.
+/// true/false — whether rfkill of this type ("wlan", "bluetooth") is blocked; null — no devices.
 fn rfkillBlocked(kind: []const u8) ?bool {
     var dir = sys.Dir.open("/sys/class/rfkill") orelse return null;
     defer dir.deinit();
@@ -263,7 +263,7 @@ pub fn wifi() Wifi {
 
     if (rfkillBlocked("wlan") orelse false) return .{ .state = .off };
 
-    // IFF_UP в /sys/class/net/<if>/flags
+    // IFF_UP in /sys/class/net/<if>/flags
     const flags_s = sys.readFile(sys.joinZ(&path, &.{ "/sys/class/net/", iface(), "/flags" }), &buf) orelse return .{ .state = .off };
     const flags_t = trim(flags_s);
     const flags = std.fmt.parseInt(u32, if (std.mem.startsWith(u8, flags_t, "0x")) flags_t[2..] else flags_t, 16) catch 0;
@@ -275,7 +275,7 @@ pub fn wifi() Wifi {
     return .{ .state = .connected, .level = signalLevel() };
 }
 
-/// Уровень сигнала 1..3 по link quality из /proc/net/wireless (обычно из 70).
+/// Signal level 1..3 from link quality in /proc/net/wireless (usually out of 70).
 fn signalLevel() u8 {
     var buf: [2048]u8 = undefined;
     const d = sys.readFile("/proc/net/wireless", &buf) orelse return 3;
@@ -301,7 +301,7 @@ pub fn bluetooth() Bt {
     while (dir.next()) |name| {
         if (!std.mem.startsWith(u8, name, "hci")) continue;
         if (std.mem.indexOfScalar(u8, name, ':')) |_| {
-            conns += 1; // hciN:<handle> — активное соединение
+            conns += 1; // hciN:<handle> — an active connection
         } else if (dev == null) {
             dev = std.fmt.parseInt(u16, name[3..], 10) catch null;
         }
@@ -312,7 +312,7 @@ pub fn bluetooth() Bt {
     return if (conns > 0) .connected else .on;
 }
 
-/// Флаг HCI_UP через ioctl(HCIGETDEVINFO) — права root не нужны.
+/// The HCI_UP flag via ioctl(HCIGETDEVINFO) — no root needed.
 fn hciUp(id: u16) ?bool {
     if (hci_sock < 0) return null;
     // struct hci_dev_info: u16 dev_id; char name[8]; bdaddr[6]; u32 flags; ...

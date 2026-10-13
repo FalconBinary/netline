@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Всё «бумажное» для лаунчера zrun: разбор .desktop-файлов (freedesktop Desktop Entry),
-//! строка Exec → argv, поиск без учёта регистра с нечётким совпадением и подсветкой,
-//! исправление запроса, набранного не в той раскладке. Без системных вызовов — только std,
-//! поэтому проверяется тестами на любой машине: `zig test src/desktop.zig`.
+//! Everything "paperwork" for the zrun launcher: parsing .desktop files (freedesktop Desktop Entry),
+//! the Exec line → argv, case-insensitive fuzzy search with highlighting,
+//! fixing a query typed in the wrong layout. No system calls — std only,
+//! so it is tested on any machine: `zig test src/desktop.zig`.
 
 const std = @import("std");
 const eql = std.mem.eql;
@@ -16,7 +16,7 @@ pub const Locale = struct {
     lang: []const u8 = "", // ru
 };
 
-/// Язык из значения LC_ALL / LC_MESSAGES / LANG: "ru_RU.UTF-8" → ru_RU и ru.
+/// Language from LC_ALL / LC_MESSAGES / LANG: "ru_RU.UTF-8" → ru_RU and ru.
 pub fn locale(v: []const u8) Locale {
     var s = v;
     if (std.mem.indexOfAny(u8, s, ".@")) |i| s = s[0..i];
@@ -25,10 +25,10 @@ pub fn locale(v: []const u8) Locale {
     return .{ .full = s, .lang = s[0..us] };
 }
 
-/// Поля группы [Desktop Entry]. Значения — как в файле, с экранированием (см. unescape).
+/// Fields of the [Desktop Entry] group. Values are as in the file, escaped (see unescape).
 pub const Entry = struct {
     name: []const u8 = "",
-    name_c: []const u8 = "", // без перевода — чтобы «files» находило и «Файлы»
+    name_c: []const u8 = "", // untranslated — so that "files" also finds a localized name
     generic: []const u8 = "",
     comment: []const u8 = "",
     keywords: []const u8 = "",
@@ -46,14 +46,14 @@ pub const Entry = struct {
 
 pub fn parse(data: []const u8, loc: Locale) Entry {
     var e = Entry{};
-    var rank = [_]u8{0} ** 4; // Name, GenericName, Comment, Keywords: 1 — без языка, 2 — ru, 3 — ru_RU
+    var rank = [_]u8{0} ** 4; // Name, GenericName, Comment, Keywords: 1 — no language, 2 — ru, 3 — ru_RU
     var in_group = false;
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
         if (line[0] == '[') {
-            if (in_group) break; // [Desktop Entry] — первая группа, дальше действия и прочее
+            if (in_group) break; // [Desktop Entry] is the first group, actions and the rest follow
             in_group = eql(u8, line, "[Desktop Entry]");
             continue;
         }
@@ -116,8 +116,8 @@ fn isTrue(v: []const u8) bool {
     return eql(u8, v, "true") or eql(u8, v, "1");
 }
 
-/// Раскрыть экранирование строки: \s \n \t \r \\ \; (перевод строки и табуляция → пробел).
-/// dst не короче src. Возвращает заполненную часть dst.
+/// Unescape a string: \s \n \t \r \\ \; (newline and tab → space).
+/// dst is no shorter than src. Returns the filled part of dst.
 pub fn unescape(src: []const u8, dst: []u8) []u8 {
     var n: usize = 0;
     var i: usize = 0;
@@ -141,7 +141,7 @@ pub fn unescape(src: []const u8, dst: []u8) []u8 {
     return dst[0..n];
 }
 
-/// Показывать ли в текущем окружении: OnlyShowIn / NotShowIn против XDG_CURRENT_DESKTOP.
+/// Whether to show in the current desktop: OnlyShowIn / NotShowIn against XDG_CURRENT_DESKTOP.
 pub fn shownIn(only: []const u8, not: []const u8, desktops: []const u8) bool {
     if (only.len > 0 and !anyCommon(only, desktops)) return false;
     if (not.len > 0 and anyCommon(not, desktops)) return false;
@@ -161,13 +161,13 @@ fn anyCommon(list: []const u8, desktops: []const u8) bool {
 
 // ================================================================= Exec → argv
 
-/// Аргументы в одном буфере, каждый с завершающим нулём (готовы для execve).
+/// Arguments in one buffer, each zero-terminated (ready for execve).
 pub const Argv = struct {
     buf: [4096]u8 = undefined,
     n: usize = 0,
     start: [64]u16 = undefined,
     argc: usize = 0,
-    cur: usize = 0, // начало аргумента, который сейчас собирается
+    cur: usize = 0, // start of the argument being built
     overflow: bool = false,
 
     fn put(a: *Argv, c: u8) void {
@@ -191,7 +191,7 @@ pub const Argv = struct {
         a.argc += 1;
         a.cur = a.n;
     }
-    /// Добавить готовый аргумент целиком.
+    /// Add a complete argument.
     pub fn add(a: *Argv, s: []const u8) void {
         a.putAll(s);
         a.end();
@@ -205,10 +205,10 @@ pub const Argv = struct {
 
 pub const Info = struct { name: []const u8 = "", icon: []const u8 = "", file: []const u8 = "" };
 
-/// Строка Exec (уже после unescape) → аргументы по спецификации: двойные кавычки,
-/// экранирование \" \` \$ \\ внутри них, коды %i %c %k %%. Файлов лаунчер не передаёт,
-/// поэтому %f %F %u %U (и устаревшие %d %D %n %N %v %m) просто убираются.
-/// false — Exec пустой или неверный (незакрытая кавычка, слишком длинный).
+/// Exec line (already unescaped) → arguments per the spec: double quotes,
+/// escapes \" \` \$ \\ inside them, codes %i %c %k %%. The launcher passes no files,
+/// so %f %F %u %U (and the deprecated %d %D %n %N %v %m) are just removed.
+/// false — Exec is empty or invalid (unclosed quote, too long).
 pub fn execArgv(exec: []const u8, info: Info, a: *Argv) bool {
     var i: usize = 0;
     while (true) {
@@ -249,14 +249,14 @@ pub fn execArgv(exec: []const u8, info: Info, a: *Argv) bool {
             i += 1;
         }
         if (quoted) return false;
-        // аргумент только из %U и т. п. исчезает целиком, а "" остаётся пустым аргументом
+        // an argument made only of %U etc. disappears entirely, while "" stays an empty argument
         if (a.n > a.cur or had_quotes) a.end();
     }
     return a.argc > 0 and !a.overflow;
 }
 
-/// Имя программы из Exec для поиска: «env FOO=1 /usr/bin/app %U» → «app».
-/// Результат лежит в out.
+/// Program name from Exec for searching: "env FOO=1 /usr/bin/app %U" → "app".
+/// The result is stored in out.
 pub fn execName(exec: []const u8, out: []u8) []const u8 {
     var a = Argv{};
     if (!execArgv(exec, .{}, &a)) return "";
@@ -271,10 +271,10 @@ pub fn execName(exec: []const u8, out: []u8) []const u8 {
     return "";
 }
 
-// ================================================================= регистр и раскладка
+// ================================================================= case and layout
 
-/// Нижний регистр для латиницы, Latin-1 и кириллицы. Длина символа в UTF-8 не меняется —
-/// поэтому позиции совпадений в сложенной строке годятся и для исходной (подсветка).
+/// Lowercase for Latin, Latin-1 and Cyrillic. The UTF-8 length of a character doesn't change —
+/// so match positions in the folded string are valid for the original too (highlighting).
 pub fn fold(cp: u21) u21 {
     const f: u21 = switch (cp) {
         'A'...'Z' => cp + 32,
@@ -283,10 +283,10 @@ pub fn fold(cp: u21) u21 {
         0x400...0x40F => cp + 80,
         else => cp,
     };
-    return if (f == 0x451) 0x435 else f; // ё ищется как е
+    return if (f == 0x451) 0x435 else f; // Cyrillic yo is matched as ye
 }
 
-/// Для буквы на плитке-заглушке: первая буква прописной.
+/// For the letter on a placeholder tile: the first letter in uppercase.
 pub fn upper(cp: u21) u21 {
     return switch (cp) {
         'a'...'z' => cp - 32,
@@ -297,7 +297,7 @@ pub fn upper(cp: u21) u21 {
     };
 }
 
-/// Сложить регистр строки. dst не короче src; неверные байты UTF-8 копируются как есть.
+/// Fold the case of a string. dst is no shorter than src; invalid UTF-8 bytes are copied as is.
 pub fn foldStr(src: []const u8, dst: []u8) []u8 {
     var i: usize = 0;
     while (i < src.len) {
@@ -322,8 +322,8 @@ pub fn foldStr(src: []const u8, dst: []u8) []u8 {
 const lay_en = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
 const lay_ru = [_]u21{ 'й', 'ц', 'у', 'к', 'е', 'н', 'г', 'ш', 'щ', 'з', 'х', 'ъ', 'ф', 'ы', 'в', 'а', 'п', 'р', 'о', 'л', 'д', 'ж', 'э', 'я', 'ч', 'с', 'м', 'и', 'т', 'ь', 'б', 'ю', 'ё' };
 
-/// Запрос, набранный не в той раскладке: «ашкуащч» → «firefox», «ntktuhfv» → «телеграм».
-/// null — менять нечего.
+/// A query typed in the wrong layout (Russian ЙЦУКЕН vs QWERTY): "ашкуащч" → "firefox", "ntktuhfv" → "телеграм".
+/// null — nothing to change.
 pub fn swapLayout(src: []const u8, dst: []u8) ?[]u8 {
     var n: usize = 0;
     var changed = false;
@@ -346,9 +346,9 @@ pub fn swapLayout(src: []const u8, dst: []u8) ?[]u8 {
     return if (changed) dst[0..n] else null;
 }
 
-// ================================================================= поиск
+// ================================================================= search
 
-/// Подсвеченные байты (первые байты совпавших символов) — первые 256 байт строки.
+/// Highlighted bytes (first bytes of matched characters) — the first 256 bytes of the string.
 pub const Hl = [4]u64;
 
 fn mark(hl: *Hl, i: usize) void {
@@ -374,9 +374,9 @@ fn cpLen(c: u8) usize {
     return if (c < 0x80) 1 else if (c >> 5 == 6) 2 else if (c >> 4 == 14) 3 else if (c >> 3 == 30) 4 else 1;
 }
 
-/// Оценка совпадения слова запроса w с полем h (оба уже в нижнем регистре); 0 — не найдено.
-/// Подстрока (лучше всего — с начала строки или слова) всегда выше нечёткого совпадения
-/// (буквы по порядку, с пропусками: «gte» → «GNOME Text Editor»).
+/// Match score of query word w against field h (both already lowercase); 0 — not found.
+/// A substring (best of all at the start of the string or of a word) always beats a fuzzy match
+/// (letters in order, with gaps: "gte" → "GNOME Text Editor").
 pub fn scoreWord(h: []const u8, w: []const u8, fuzzy: bool, hl: ?*Hl) u32 {
     if (w.len == 0) return 1;
     if (std.mem.indexOf(u8, h, w)) |first| {
@@ -429,8 +429,8 @@ pub fn scoreWord(h: []const u8, w: []const u8, fuzzy: bool, hl: ?*Hl) u32 {
 
 pub const Field = struct { text: []const u8, weight: u32, fuzzy: bool = false };
 
-/// Каждое слово запроса должно найтись хоть в одном поле; итог — сумма лучших оценок
-/// (с весом поля). 0 — запись не подходит.
+/// Every query word must be found in at least one field; the result is the sum of the best scores
+/// (weighted by field). 0 — the entry doesn't match.
 pub fn scoreFields(fields: []const Field, words: []const []const u8) u32 {
     var total: u32 = 0;
     for (words) |w| {
@@ -445,7 +445,7 @@ pub fn scoreFields(fields: []const Field, words: []const []const u8) u32 {
     return total;
 }
 
-/// Разбить запрос на слова (по пробелам).
+/// Split a query into words (by spaces).
 pub fn splitWords(q: []const u8, out: [][]const u8) usize {
     var n: usize = 0;
     var it = std.mem.tokenizeScalar(u8, q, ' ');
@@ -457,20 +457,20 @@ pub fn splitWords(q: []const u8, out: [][]const u8) usize {
     return n;
 }
 
-/// Какие байты названия подсветить для этих слов запроса.
+/// Which bytes of the name to highlight for these query words.
 pub fn highlight(h: []const u8, words: []const []const u8) Hl {
     var hl: Hl = .{ 0, 0, 0, 0 };
     for (words) |w| _ = scoreWord(h, w, true, &hl);
     return hl;
 }
 
-// ================================================================= тесты
+// ================================================================= tests
 
 const tt = std.testing;
 
-test "разбор .desktop с переводами" {
+test "parsing .desktop with translations" {
     const data =
-        \\# комментарий
+        \\# comment
         \\[Desktop Entry]
         \\Type=Application
         \\Name=Files
@@ -498,7 +498,7 @@ test "разбор .desktop с переводами" {
     try tt.expect(e.no_display and !e.terminal and !e.hidden);
 }
 
-test "язык из LANG" {
+test "language from LANG" {
     const l = locale("ru_RU.UTF-8@euro");
     try tt.expectEqualStrings("ru_RU", l.full);
     try tt.expectEqualStrings("ru", l.lang);
@@ -515,7 +515,7 @@ fn argvOf(exec: []const u8, info: Info, a: *Argv) !void {
     try tt.expect(execArgv(unescape(exec, &b), info, a));
 }
 
-test "Exec: коды, кавычки, экранирование" {
+test "Exec: codes, quotes, escaping" {
     var a = Argv{};
     try argvOf("firefox %u", .{}, &a);
     try tt.expectEqual(1, a.argc);
@@ -530,7 +530,7 @@ test "Exec: коды, кавычки, экранирование" {
     try tt.expectEqualStrings("--title=My App", a.arg(4));
     try tt.expectEqualStrings("100%", a.arg(5));
 
-    // в файле \\ — после unescape \, внутри кавычек \" и \$ — буквальные символы
+    // in the file \\ — after unescape \, inside quotes \" and \$ are literal characters
     a = .{};
     try argvOf("sh -c \"echo \\\\\"hi\\\\\" \\\\$HOME\" \"\"", .{}, &a);
     try tt.expectEqual(4, a.argc);
@@ -543,7 +543,7 @@ test "Exec: коды, кавычки, экранирование" {
     try tt.expect(!execArgv("  %U ", .{}, &a));
 }
 
-test "имя программы из Exec" {
+test "program name from Exec" {
     var b: [64]u8 = undefined;
     try tt.expectEqualStrings("app", execName("env FOO=1 /usr/bin/app %U", &b));
     try tt.expectEqualStrings("code", execName("\"/opt/vs code/code\" --new", &b));
@@ -556,7 +556,7 @@ test "OnlyShowIn / NotShowIn" {
     try tt.expect(!shownIn("", "Mango;", "mango"));
 }
 
-test "регистр складывается без смены длины" {
+test "case folds without changing length" {
     var b: [64]u8 = undefined;
     const src = "Ёлка ТЕКСТ Àb Firefox";
     const f = foldStr(src, &b);
@@ -565,14 +565,14 @@ test "регистр складывается без смены длины" {
     try tt.expectEqual(@as(u21, 'Ф'), upper('ф'));
 }
 
-test "не та раскладка" {
+test "wrong layout" {
     var b: [64]u8 = undefined;
     try tt.expectEqualStrings("firefox", swapLayout("ашкуащч", &b).?);
     try tt.expectEqualStrings("телеграм", swapLayout("ntktuhfv", &b).?);
     try tt.expect(swapLayout("123", &b) == null);
 }
 
-test "порядок оценок" {
+test "score order" {
     const exact = scoreWord("firefox", "firefox", true, null);
     const prefix = scoreWord("firefox web browser", "fire", true, null);
     const word = scoreWord("mozilla firefox", "fire", true, null);
@@ -583,7 +583,7 @@ test "порядок оценок" {
     try tt.expectEqual(0, scoreWord("firefox", "xyz", true, null));
 }
 
-test "слова запроса и подсветка" {
+test "query words and highlighting" {
     var words: [8][]const u8 = undefined;
     const n = splitWords("  text  ed ", &words);
     try tt.expectEqual(2, n);

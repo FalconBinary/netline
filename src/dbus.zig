@@ -1,15 +1,15 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Минимальный клиент D-Bus на чистом Zig: аутентификация EXTERNAL, маршалинг сообщений
-//! (little-endian), синхронные вызовы методов. Все чтения проверяют границы.
+//! Minimal D-Bus client in pure Zig: EXTERNAL authentication, message marshalling
+//! (little-endian), synchronous method calls. Every read is bounds-checked.
 
 const std = @import("std");
 const sys = @import("sys.zig");
 
 pub const Error = error{ Connect, Auth, Io, Timeout, Protocol, TooBig, Remote };
 
-// ================================================================= запись
+// ================================================================= writing
 
 pub const W = struct {
     buf: []u8,
@@ -62,7 +62,7 @@ pub const W = struct {
         std.mem.writeInt(u32, w.buf[a.len_pos..][0..4], @intCast(w.n - a.start), .little);
     }
 
-    // ---- элементы словаря a{sv}
+    // ---- a{sv} dictionary entries
     pub fn kvStr(w: *W, key: []const u8, val: []const u8) void {
         w.pad(8);
         w.str(key);
@@ -91,7 +91,7 @@ pub const W = struct {
         for (items) |it| w.str(it);
         w.arrayEnd(a);
     }
-    /// Начать элемент a{sa{sv}}: имя группы и вложенный словарь.
+    /// Start an a{sa{sv}} entry: the group name and a nested dictionary.
     pub fn groupBegin(w: *W, name: []const u8) Arr {
         w.pad(8);
         w.str(name);
@@ -103,7 +103,7 @@ pub const W = struct {
     }
 };
 
-// ================================================================= чтение
+// ================================================================= reading
 
 pub fn alignOf(c: u8) usize {
     return switch (c) {
@@ -115,7 +115,7 @@ pub fn alignOf(c: u8) usize {
     };
 }
 
-/// Индекс сразу после одного полного типа, начинающегося в sig[i].
+/// Index right after one complete type starting at sig[i].
 pub fn typeEnd(sig: []const u8, i: usize) usize {
     if (i >= sig.len) return sig.len;
     switch (sig[i]) {
@@ -186,7 +186,7 @@ pub const R = struct {
         _ = r.take(1);
         return s;
     }
-    /// Начало массива: возвращает позицию конца его данных.
+    /// Start of an array: returns the position where its data ends.
     pub fn arrayEnd(r: *R, elem_align: usize) usize {
         const len = r.u32_();
         r.alignTo(elem_align);
@@ -196,7 +196,7 @@ pub const R = struct {
         }
         return r.p + len;
     }
-    /// Пропустить одно значение типа `t` (один полный тип).
+    /// Skip one value of type `t` (one complete type).
     pub fn skip(r: *R, t: []const u8) void {
         r.skipDepth(t, 0);
     }
@@ -239,7 +239,7 @@ pub const R = struct {
     }
 };
 
-// ================================================================= соединение
+// ================================================================= connection
 
 pub const Reply = struct {
     sig: []const u8,
@@ -252,7 +252,7 @@ pub const Reply = struct {
     pub fn reader(self: Reply) R {
         return .{ .d = self.body };
     }
-    /// Текст ошибки (первый аргумент-строка ошибки D-Bus).
+    /// Error text (the first string argument of a D-Bus error).
     pub fn message(self: Reply) []const u8 {
         if (self.sig.len == 0 or self.sig[0] != 's') return self.err_name;
         var r = self.reader();
@@ -260,7 +260,7 @@ pub const Reply = struct {
     }
 };
 
-/// Входящий вызов метода (например, от BlueZ к нашему агенту сопряжения).
+/// An incoming method call (e.g. from BlueZ to our pairing agent).
 pub const Incoming = struct {
     serial: u32,
     flags: u8,
@@ -276,7 +276,7 @@ pub const Incoming = struct {
     }
 };
 
-/// Результат асинхронного вызова: успех или текст ошибки.
+/// Result of an async call: success or error text.
 pub const Done = struct {
     serial: u32 = 0,
     ok: bool = false,
@@ -293,10 +293,10 @@ pub const Done = struct {
     }
 };
 
-/// Обработчик сигналов, пришедших вперемешку с ответами. Вызывать шину из него нельзя.
+/// Handler for signals that arrive interleaved with replies. It must not call the bus.
 pub const SignalFn = *const fn (path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void;
-/// Обработчик входящих вызовов. Должен ответить (reply/replyError) сразу или позже.
-/// Синхронные вызовы из обработчиков делать нельзя.
+/// Handler for incoming calls. Must reply (reply/replyError) right away or later.
+/// No synchronous calls from handlers.
 pub const MethodFn = *const fn (c: *Conn, m: *const Incoming) void;
 
 const Msg = struct {
@@ -315,8 +315,8 @@ const Msg = struct {
 
 const MAX_ASYNC = 8;
 
-// Буферы — отдельные глобальные массивы (в .bss, а не 1,1 МБ в .data каждого бинарника).
-// Соединение с D-Bus в процессе одно.
+// Buffers are separate global arrays (in .bss rather than 1.1 MB in .data of every binary).
+// There is one D-Bus connection per process.
 var in_buf: [1024 * 1024]u8 = undefined;
 var out_buf: [64 * 1024]u8 = undefined;
 
@@ -327,12 +327,12 @@ pub const Conn = struct {
     serial: u32 = 0,
     in: *[1024 * 1024]u8 = &in_buf,
     ilen: usize = 0,
-    consumed: usize = 0, // длина последнего отданного ответа в начале буфера
+    consumed: usize = 0, // length of the last returned reply at the start of the buffer
     out: *[64 * 1024]u8 = &out_buf,
     waiting: [MAX_ASYNC]u32 = [_]u32{0} ** MAX_ASYNC,
     done: [MAX_ASYNC]Done = [_]Done{.{}} ** MAX_ASYNC,
 
-    /// Подключиться к системной шине (или к адресу из DBUS_SYSTEM_BUS_ADDRESS).
+    /// Connect to the system bus (or to the address in DBUS_SYSTEM_BUS_ADDRESS).
     pub fn connectSystem(c: *Conn) Error!void {
         var path: []const u8 = "/run/dbus/system_bus_socket";
         if (sys.getenv("DBUS_SYSTEM_BUS_ADDRESS")) |addr| {
@@ -346,8 +346,8 @@ pub const Conn = struct {
             sys.close(c.fd);
             c.fd = -1;
         }
-        // AUTH, BEGIN и Hello уходят одним рейсом, не дожидаясь «OK» (так делает и sd-bus):
-        // одно ожидание ответа вместо двух
+        // AUTH, BEGIN and Hello go out in one round trip without waiting for "OK" (sd-bus does this too):
+        // one wait for a reply instead of two
         try c.auth();
         const serial = try c.send(.{ .kind = 1, .path = "/org/freedesktop/DBus", .iface = "org.freedesktop.DBus", .member = "Hello", .dest = "org.freedesktop.DBus" }, "");
         try c.authReply();
@@ -356,7 +356,7 @@ pub const Conn = struct {
     }
 
     fn auth(c: *Conn) Error!void {
-        // AUTH EXTERNAL <uid в виде шестнадцатеричной записи десятичной строки>
+        // AUTH EXTERNAL <uid as the hex encoding of its decimal string>
         var uidbuf: [16]u8 = undefined;
         const uid = std.fmt.bufPrint(&uidbuf, "{d}", .{sys.getuid()}) catch return error.Auth;
         var line: [96]u8 = undefined;
@@ -376,7 +376,7 @@ pub const Conn = struct {
         sys.sendAll(c.fd, line[0..n]) catch return error.Io;
     }
 
-    /// Строка «OK <guid>\r\n» от сервера. Всё, что пришло за ней, — уже сообщения (ответ на Hello).
+    /// The "OK <guid>\r\n" line from the server. Everything after it is already messages (the Hello reply).
     fn authReply(c: *Conn) Error!void {
         var got: usize = 0;
         const end = while (true) {
@@ -384,7 +384,7 @@ pub const Conn = struct {
             if (got >= 256) return error.Auth;
             try c.waitReadable(5000);
             const k = sys.read(c.fd, c.in[got..]) catch return error.Io;
-            if (k == 0) return error.Auth; // REJECTED и закрытие — нет доступа
+            if (k == 0) return error.Auth; // REJECTED and close — no access
             got += k;
         };
         if (!std.mem.startsWith(u8, c.in[0..end], "OK ")) return error.Auth;
@@ -412,7 +412,7 @@ pub const Conn = struct {
         sig: []const u8 = "",
     };
 
-    /// Собрать и отправить сообщение. Возвращает его serial.
+    /// Build and send a message. Returns its serial.
     fn send(c: *Conn, o: Out, body: []const u8) Error!u32 {
         c.serial +%= 1;
         if (c.serial == 0) c.serial = 1;
@@ -421,7 +421,7 @@ pub const Conn = struct {
         w.byte('l');
         w.byte(o.kind);
         w.byte(o.flags);
-        w.byte(1); // версия протокола
+        w.byte(1); // protocol version
         w.u32_(@intCast(body.len));
         w.u32_(serial);
         const fields = w.arrayBegin(8);
@@ -451,21 +451,21 @@ pub const Conn = struct {
         return serial;
     }
 
-    /// Синхронный вызов метода. Ответ ссылается на внутренний буфер — до следующего вызова.
+    /// Synchronous method call. The reply points into the internal buffer — until the next call.
     pub fn call(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!Reply {
         const serial = try c.send(.{ .kind = 1, .path = path, .iface = iface, .member = member, .dest = dest, .sig = sig }, body);
         return c.waitReply(serial);
     }
 
-    /// Отправить вызов, не дожидаясь ответа: ответы на пачку таких вызовов забирает collect.
+    /// Send a call without waiting for the reply: replies to a batch of such calls are taken by collect.
     pub fn sendCall(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!u32 {
         return c.send(.{ .kind = 1, .path = path, .iface = iface, .member = member, .dest = dest, .sig = sig }, body);
     }
 
-    /// Дождаться ответов на вызовы `serials` (0 — пропуск) в любом порядке: для каждого —
-    /// got(ctx, индекс, ответ). Ответ живёт только внутри got, вызывать шину из got нельзя.
-    /// Пачка вместо цепочки синхронных вызовов — одно ожидание вместо N.
-    /// Больше 64 вызовов сразу не отправляйте: у системной шины лимит ожидающих ответов.
+    /// Wait for replies to the calls `serials` (0 — skip) in any order: for each one —
+    /// got(ctx, index, reply). The reply lives only inside got; got must not call the bus.
+    /// A batch instead of a chain of synchronous calls — one wait instead of N.
+    /// Don't send more than 64 calls at once: the system bus limits pending replies.
     pub fn collect(c: *Conn, serials: []u32, ctx: anytype, comptime got: fn (@TypeOf(ctx), usize, Reply) void) Error!void {
         if (c.consumed > 0) {
             c.drop(c.consumed);
@@ -499,12 +499,12 @@ pub const Conn = struct {
         }
     }
 
-    /// Вызов без ответа (флаг NO_REPLY_EXPECTED): шина ответ не пришлёт, ждать нечего.
+    /// Call without a reply (NO_REPLY_EXPECTED flag): the bus won't reply, nothing to wait for.
     pub fn callNoReply(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
         _ = c.send(.{ .kind = 1, .flags = 1, .path = path, .iface = iface, .member = member, .dest = dest, .sig = sig }, body) catch {};
     }
 
-    /// Асинхронный вызов: ответ придёт позже, его забирают через result(serial).
+    /// Async call: the reply comes later and is taken via result(serial).
     pub fn callAsync(c: *Conn, dest: []const u8, path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) Error!u32 {
         var slot: ?usize = null;
         for (c.waiting, 0..) |s, i| {
@@ -516,7 +516,7 @@ pub const Conn = struct {
         return serial;
     }
 
-    /// Забрать результат асинхронного вызова (null — ещё не пришёл).
+    /// Take the result of an async call (null — not here yet).
     pub fn result(c: *Conn, serial: u32) ?Done {
         for (&c.done) |*d| {
             if (d.serial == serial and serial != 0) {
@@ -528,7 +528,7 @@ pub const Conn = struct {
         return null;
     }
 
-    /// Ответить на входящий вызов.
+    /// Reply to an incoming call.
     pub fn reply(c: *Conn, m: *const Incoming, sig: []const u8, body: []const u8) void {
         if (m.flags & 1 != 0) return; // NO_REPLY_EXPECTED
         _ = c.send(.{ .kind = 2, .reply_serial = m.serial, .dest = m.sender, .sig = sig }, body) catch {};
@@ -555,10 +555,10 @@ pub const Conn = struct {
         c.ilen -= n;
     }
 
-    /// Размер первого сообщения в буфере (null — оно ещё не пришло целиком).
+    /// Size of the first message in the buffer (null — it hasn't fully arrived yet).
     fn complete(c: *Conn) Error!?usize {
         if (c.ilen < 16) return null;
-        if (c.in[0] != 'l') return error.Protocol; // big-endian не поддерживаем
+        if (c.in[0] != 'l') return error.Protocol; // big-endian is not supported
         const body_len = std.mem.readInt(u32, c.in[4..8], .little);
         const flen = std.mem.readInt(u32, c.in[12..16], .little);
         const hdr = (16 + @as(usize, flen) + 7) & ~@as(usize, 7);
@@ -600,7 +600,7 @@ pub const Conn = struct {
         return m;
     }
 
-    /// Обработать сообщение, которое не является ответом на текущий синхронный вызов.
+    /// Handle a message that isn't the reply to the current synchronous call.
     fn handle(c: *Conn, m: *const Msg) void {
         switch (m.kind) {
             2, 3 => {
@@ -628,14 +628,14 @@ pub const Conn = struct {
             4 => if (c.on_signal) |cb| cb(m.path, m.iface, m.member, m.sig, m.body),
             1 => {
                 const in = Incoming{ .serial = m.serial, .flags = m.flags, .sender = m.sender, .path = m.path, .iface = m.iface, .member = m.member, .sig = m.sig, .body = m.body };
-                if (c.on_method) |cb| cb(c, &in) else c.replyError(&in, "org.freedesktop.DBus.Error.UnknownMethod", "нет такого метода");
+                if (c.on_method) |cb| cb(c, &in) else c.replyError(&in, "org.freedesktop.DBus.Error.UnknownMethod", "no such method");
             },
             else => {},
         }
     }
 
     fn waitReply(c: *Conn, serial: u32) Error!Reply {
-        // предыдущий ответ уже обработан — убираем его, остальное (если пришло) сохраняем
+        // the previous reply is already handled — drop it, keep the rest (if any arrived)
         if (c.consumed > 0) {
             c.drop(c.consumed);
             c.consumed = 0;
@@ -648,7 +648,7 @@ pub const Conn = struct {
                     return .{ .sig = m.sig, .body = m.body, .err_name = if (m.kind == 3) (if (m.err_name.len > 0) m.err_name else "error") else "" };
                 }
                 c.handle(&m);
-                c.drop(total); // чужое сообщение обработано — выбрасываем
+                c.drop(total); // a foreign message is handled — drop it
             }
             try c.waitReadable(10000);
             const k = sys.read(c.fd, c.in[c.ilen..]) catch return error.Io;
@@ -657,8 +657,8 @@ pub const Conn = struct {
         }
     }
 
-    /// Прочитать, что пришло (сокет готов к чтению), и обработать все целые сообщения:
-    /// ответы на асинхронные вызовы, сигналы, входящие вызовы.
+    /// Read what has arrived (the socket is readable) and handle all complete messages:
+    /// replies to async calls, signals, incoming calls.
     pub fn pump(c: *Conn) Error!void {
         if (c.consumed > 0) {
             c.drop(c.consumed);

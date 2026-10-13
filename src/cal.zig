@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! zcal — календарь для часов zpanel на чистом Zig.
+//! zcal — calendar for the netline clock, in pure Zig.
 //!
-//! Месяц с выделенным «сегодня», неделя с понедельника, русские названия.
-//! Клавиши: ←/→ (или PgUp/PgDn) — месяц, ↑/↓ — год, Home — сегодня, Esc — закрыть.
-//! Колёсико листает месяцы, клик по названию месяца возвращает к сегодняшнему.
+//! The month with "today" highlighted, weeks start on Monday, English names.
+//! Keys: ←/→ (or PgUp/PgDn) — month, ↑/↓ — year, Home — today, Esc — close.
+//! The wheel flips months, a click on the month name returns to today.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -23,10 +23,9 @@ const CELL_W: f32 = 40;
 const CELL_H: f32 = 34;
 const GRID_Y: f32 = 146;
 
-const months = [_][]const u8{ "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь" };
-const months_gen = [_][]const u8{ "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря" };
-const wdays = [_][]const u8{ "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье" };
-const wshort = [_][]const u8{ "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс" };
+const months = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+const wdays = [_][]const u8{ "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+const wshort = [_][]const u8{ "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" };
 
 var today: tz.Date = .{ .year = 1970, .month = 1, .day = 1 };
 var year: i64 = 1970;
@@ -37,7 +36,7 @@ const Wid = enum(u8) { none, prev, next, title };
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     ui.begin("zcal");
-    tz.load(); // часовой пояс читается до песочницы
+    tz.load(); // the time zone is read before the sandbox
     const t = tz.now();
     today = .{ .year = t.year, .month = t.month, .day = t.day };
     year = t.year;
@@ -99,24 +98,24 @@ fn layout() void {
     ui.add(Wid.next, 0, .plain, W - PAD - 30, 89, 28, 28);
 }
 
-/// День недели с понедельника (0 = пн) для числа дней от эпохи.
+/// Day of week counted from Monday (0 = Mon) for a day number since the epoch.
 fn mondayIndex(days: i64) usize {
-    return @intCast(@mod(days + 3, 7)); // 1970-01-01 — четверг
+    return @intCast(@mod(days + 3, 7)); // 1970-01-01 was a Thursday
 }
 
 fn paint(cv: *draw.Canvas) void {
     const t = &theme.t;
     const W = ui.W();
 
-    // сегодняшняя дата
+    // today's date
     const td = tz.daysFromCivil(today.year, today.month, today.day);
     _ = ui.text(cv, wdays[mondayIndex(td)], PAD, 32, 12, t.menu_muted, W - PAD);
     var b: [64]u8 = undefined;
-    const date = std.fmt.bufPrint(&b, "{d} {s} {d}", .{ today.day, months_gen[today.month - 1], today.year }) catch "";
+    const date = std.fmt.bufPrint(&b, "{s} {d}, {d}", .{ months[today.month - 1], today.day, today.year }) catch "";
     _ = ui.text(cv, date, PAD, 56, 20, t.menu_text, W - PAD);
     ui.rrect(cv, PAD, 72, W - 2 * PAD, 1, 0.5, t.menu_border);
 
-    // заголовок месяца и стрелки
+    // month title and arrows
     var mb: [48]u8 = undefined;
     const title = std.fmt.bufPrint(&mb, "{s} {d}", .{ months[month - 1], year }) catch "";
     for (ui.widgets[0..ui.nwid]) |w| {
@@ -135,13 +134,13 @@ fn paint(cv: *draw.Canvas) void {
         }
     }
 
-    // дни недели
+    // weekdays
     for (wshort, 0..) |d, i| {
         const cx = PAD + (@as(f32, @floatFromInt(i)) + 0.5) * CELL_W;
         ui.centered(cv, d, cx, 136, 11.5, if (i >= 5) t.menu_error else t.menu_muted);
     }
 
-    // сетка 6×7: начинаем с понедельника недели, в которой 1-е число
+    // 6×7 grid: start from the Monday of the week containing the 1st
     const first = tz.daysFromCivil(year, month, 1);
     const start = first - @as(i64, @intCast(mondayIndex(first)));
     for (0..42) |cell| {

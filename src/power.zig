@@ -1,14 +1,14 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! zpower — меню питания для zpanel на чистом Zig.
+//! zpower — power menu for netline, in pure Zig.
 //!
-//! Блокировка, выход из сессии, сон, гибернация, перезагрузка, выключение.
-//! Питание — через systemd-logind по D-Bus (без systemctl), выход — через IPC mango
-//! (или logind, если mango недоступен). Блокировку запускает маленький процесс-брокер:
-//! сама zpower после старта не может запускать программы.
-//! Клавиши: ←/→ и Enter, Esc; L — блокировка, E — выход, S — сон, H — гибернация,
-//! R — перезагрузка, P — выключение.
+//! Lock, log out, sleep, hibernate, reboot, power off.
+//! Power goes through systemd-logind over D-Bus (no systemctl), logout through the mango IPC
+//! (or logind if mango is unavailable). Locking is started by a small broker process:
+//! zpower itself cannot launch programs after startup.
+//! Keys: ←/→ and Enter, Esc; L — lock, E — log out, S — sleep, H — hibernate,
+//! R — reboot, P — power off.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -46,7 +46,7 @@ var have_broker = false;
 const View = enum { main, confirm, wait };
 var view: View = .main;
 var chosen: Act = .lock;
-var pending: u32 = 0; // serial асинхронного вызова logind
+var pending: u32 = 0; // serial of the async logind call
 var suspend_after_lock = false;
 
 var user_buf: [64]u8 = undefined;
@@ -61,12 +61,12 @@ fn wid(w: ui.Widget) Wid {
     return @enumFromInt(w.id);
 }
 
-// ================================================================= запуск
+// ================================================================= startup
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     ui.begin("zpower");
-    // брокер — до всех остальных подключений, чтобы не держать лишних дескрипторов
+    // the broker comes before all other connections so it holds no extra descriptors
     const cmds = [_]?broker.Cmd{comptime broker.compile(cfg.lock_cmd)};
     have_broker = broker.start(&cmds);
 
@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
     readInfo();
-    if (!logind_ok) ui.setMsg("systemd-logind недоступен — доступны только блокировка и выход");
+    if (!logind_ok) ui.setMsg("systemd-logind is unavailable — only lock and log out work");
 
     const n: f32 = @floatFromInt(@max(nacts, 4));
     const width: u32 = @intFromFloat(2 * PAD + n * CELL + (n - 1) * GAP);
@@ -111,8 +111,8 @@ const asks = [_]Ask{
     .{ .act = .poweroff, .member = "CanPowerOff" },
 };
 
-/// Какие действия доступны. Блокировка и выход — без logind; про остальное спрашиваем
-/// logind одной пачкой ("yes" или "challenge" — с паролем polkit).
+/// Which actions are available. Lock and log out need no logind; for the rest we ask
+/// logind in one batch ("yes" or "challenge" — with a polkit password).
 fn queryAvailable(can: *[all.len]bool) void {
     can[@intFromEnum(Act.lock)] = have_broker;
     can[@intFromEnum(Act.logout)] = mango_fd >= 0 or logind_ok;
@@ -129,7 +129,7 @@ fn gotCan(can: *[all.len]bool, i: usize, r: dbus.Reply) void {
     can[@intFromEnum(asks[i].act)] = !rr.bad and (std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "challenge"));
 }
 
-/// Пользователь, имя компьютера и время работы — до песочницы.
+/// User, host name and uptime — before the sandbox.
 fn readInfo() void {
     const u = sys.getenv("USER") orelse "";
     user_len = @min(u.len, user_buf.len);
@@ -143,9 +143,9 @@ fn readInfo() void {
     const h = up / 3600;
     const m = (up / 60) % 60;
     const s: []const u8 = (if (h > 0)
-        std.fmt.bufPrint(&sub_buf, "{s} · работает {d} ч {d} мин", .{ host, h, m })
+        std.fmt.bufPrint(&sub_buf, "{s} · up {d} h {d} min", .{ host, h, m })
     else
-        std.fmt.bufPrint(&sub_buf, "{s} · работает {d} мин", .{ host, m })) catch "";
+        std.fmt.bufPrint(&sub_buf, "{s} · up {d} min", .{ host, m })) catch "";
     sub_len = s.len;
 }
 
@@ -153,16 +153,16 @@ fn busFd() i32 {
     return if (logind_ok) bus.fd else -1;
 }
 
-// ================================================================= действия
+// ================================================================= actions
 
 fn label(a: Act) []const u8 {
     return switch (a) {
-        .lock => "Блокировка",
-        .logout => "Выход",
-        .sleep => "Сон",
-        .hibernate => "Гибернация",
-        .reboot => "Перезагрузка",
-        .poweroff => "Выключение",
+        .lock => "Lock",
+        .logout => "Log out",
+        .sleep => "Sleep",
+        .hibernate => "Hibernate",
+        .reboot => "Reboot",
+        .poweroff => "Power off",
     };
 }
 
@@ -192,12 +192,12 @@ fn run(a: Act) void {
                 sys.sendAll(mango_fd, "dispatch quit\n") catch {};
                 ui.quit();
             }
-            // без mango — завершаем свою сессию через logind
+            // without mango — end our session through logind
             logind("/org/freedesktop/login1/session/auto", "org.freedesktop.login1.Session", "Terminate", false);
         },
         .sleep => {
             if (cfg.lock_before_suspend and have_broker) {
-                // сначала блокировка, потом сон — чтобы экран был заперт при пробуждении
+                // lock first, then sleep — so the screen is locked on wakeup
                 broker.run(0);
                 suspend_after_lock = true;
                 view = .wait;
@@ -211,14 +211,14 @@ fn run(a: Act) void {
     }
 }
 
-/// Асинхронный вызов logind: окно не замирает, пока polkit спрашивает пароль.
+/// Async logind call: the window doesn't freeze while polkit asks for a password.
 fn logind(path: []const u8, iface: []const u8, member: []const u8, interactive: bool) void {
-    if (!logind_ok) return ui.setMsg("systemd-logind недоступен");
+    if (!logind_ok) return ui.setMsg("systemd-logind is unavailable");
     var w = dbus.W{ .buf = &body_buf };
     const sig: []const u8 = if (interactive) "b" else "";
     if (interactive) w.boolean(true);
     pending = bus.callAsync(LOGIN, path, iface, member, sig, w.bytes()) catch {
-        return ui.setMsg("ошибка связи с systemd-logind");
+        return ui.setMsg("error talking to systemd-logind");
     };
     view = .wait;
     ui.redraw();
@@ -239,11 +239,11 @@ fn onBus() void {
     if (pending == 0) return;
     const d = bus.result(pending) orelse return;
     pending = 0;
-    if (d.ok) ui.quit(); // система уходит в сон/перезагрузку — меню больше не нужно
+    if (d.ok) ui.quit(); // the system is going to sleep/rebooting — the menu is no longer needed
     view = .main;
     const name = d.errName();
     if (std.mem.indexOf(u8, name, "InteractiveAuthorizationRequired") != null or std.mem.indexOf(u8, name, "AccessDenied") != null) {
-        ui.setMsg("Нужны права администратора (polkit отказал)");
+        ui.setMsg("Administrator rights required (polkit refused)");
     } else ui.setMsg(d.message());
     ui.resetFocus(false);
 }
@@ -268,9 +268,9 @@ fn activate(w: ui.Widget, right: bool) void {
 }
 
 fn onKey(k: ui.Key) bool {
-    if (view == .wait) return k.code != ui.K_ESC; // в ожидании — только Esc
+    if (view == .wait) return k.code != ui.K_ESC; // while waiting — only Esc
     if (view == .confirm) {
-        // та же горячая клавиша ещё раз — подтверждение (P, P — выключить)
+        // the same hotkey once more confirms (P, P — power off)
         if (!k.ctrl and hotkey(k.code) == chosen) {
             run(chosen);
             return true;
@@ -292,7 +292,7 @@ fn onKey(k: ui.Key) bool {
     return true;
 }
 
-/// Горячие клавиши — по физическим клавишам, работают в любой раскладке.
+/// Hotkeys go by physical keys and work in any layout.
 fn hotkey(code: u32) ?Act {
     return switch (code) {
         38 => .lock, // L
@@ -305,7 +305,7 @@ fn hotkey(code: u32) ?Act {
     };
 }
 
-// ================================================================= раскладка и рисование
+// ================================================================= layout and drawing
 
 fn layout() void {
     ui.nwid = 0;
@@ -370,18 +370,18 @@ fn iconOf(a: Act) []const P {
 
 fn verb(a: Act) []const u8 {
     return switch (a) {
-        .logout => "Выйти",
-        .reboot => "Перезагрузить",
-        .poweroff => "Выключить",
+        .logout => "Log out",
+        .reboot => "Reboot",
+        .poweroff => "Power off",
         else => label(a),
     };
 }
 
 fn question(a: Act) []const u8 {
     return switch (a) {
-        .logout => "Выйти из сессии?",
-        .reboot => "Перезагрузить компьютер?",
-        .poweroff => "Выключить компьютер?",
+        .logout => "Log out of the session?",
+        .reboot => "Restart the computer?",
+        .poweroff => "Shut down the computer?",
         else => "",
     };
 }
@@ -391,7 +391,7 @@ fn paint(cv: *draw.Canvas) void {
     const W = ui.W();
     switch (view) {
         .main, .wait => {
-            ui.header(cv, if (user_len > 0) user_buf[0..user_len] else "Питание", sub_buf[0..sub_len], false);
+            ui.header(cv, if (user_len > 0) user_buf[0..user_len] else "Power", sub_buf[0..sub_len], false);
             for (ui.widgets[0..ui.nwid]) |w| {
                 const a = acts[w.idx];
                 const cx = w.x + w.w / 2;
@@ -403,17 +403,17 @@ fn paint(cv: *draw.Canvas) void {
                 ui.icon(cv, iconOf(a), cx - 12, w.y + r - 12, 24, 1.8, c);
                 ui.centered(cv, label(a), cx, w.y + CIRCLE + 22, 12, if (ui.isHover(w) or ui.isFocus(w)) t.menu_text else t.menu_muted);
             }
-            if (view == .wait) ui.centered(cv, "Подождите…", W / 2, ui.H() - 14, 12, t.menu_muted);
+            if (view == .wait) ui.centered(cv, "Please wait…", W / 2, ui.H() - 14, 12, t.menu_muted);
             ui.paintMsg(cv, ui.H() - 14);
         },
         .confirm => {
             ui.icon(cv, iconOf(chosen), W / 2 - 16, 30, 32, 2, if (chosen == .poweroff) t.menu_error else t.menu_text);
             ui.centered(cv, question(chosen), W / 2, 100, 17, t.menu_text);
-            ui.centered(cv, "Несохранённые данные будут потеряны", W / 2, 122, 12, t.menu_muted);
+            ui.centered(cv, "Unsaved data will be lost", W / 2, 122, 12, t.menu_muted);
             for (ui.widgets[0..ui.nwid]) |w| {
                 switch (wid(w)) {
                     .primary => ui.button(cv, w, verb(chosen), .primary),
-                    .secondary => ui.button(cv, w, "Отмена", .secondary),
+                    .secondary => ui.button(cv, w, "Cancel", .secondary),
                     else => {},
                 }
             }

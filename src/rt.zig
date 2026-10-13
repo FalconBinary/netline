@@ -1,22 +1,22 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Минимальная среда выполнения для всех программ zpanel: свой обработчик паники
-//! и настройки std. Подключается из корневого файла каждой программы:
+//! Minimal runtime for all netline programs: our own panic handler
+//! and std options. Pulled in from each program's root file:
 //!
 //!     pub const panic = rt.panic;
 //!     pub const std_options = rt.std_options;
 //!
-//! Стандартный обработчик тянет печать стека, отладочную информацию и форматирование —
-//! это больше половины кода бинарника. Здесь паника просто пишет сообщение в stderr
-//! и завершает процесс. Проверки границ ReleaseSafe при этом остаются на месте.
+//! The default handler drags in stack printing, debug info and formatting —
+//! more than half of a binary's code. Here a panic just writes the message to stderr
+//! and exits the process. ReleaseSafe bounds checks stay in place.
 
 const std = @import("std");
 const sys = @import("sys.zig");
 
 pub const std_options: std.Options = .{
-    // без обработчика SIGSEGV и без отдельного стека сигналов на 256 КБ:
-    // стек всё равно печатать нечем (бинарники собираются без отладочной информации)
+    // no SIGSEGV handler and no separate 256 KB signal stack:
+    // there is nothing to print a stack trace with anyway (binaries are built without debug info)
     .enable_segfault_handler = false,
     .signal_stack_size = null,
 };
@@ -25,7 +25,7 @@ pub const panic = struct {
     pub fn call(msg: []const u8, _: ?usize) noreturn {
         @branchHint(.cold);
         var buf: [256]u8 = undefined;
-        const s = sys.joinZ(&buf, &.{ "zpanel: внутренняя ошибка: ", msg, "\n" });
+        const s = sys.joinZ(&buf, &.{ "netline: internal error: ", msg, "\n" });
         _ = sys.write(2, s) catch {};
         sys.exit(134);
     }

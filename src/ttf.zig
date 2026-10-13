@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Минимальный движок TrueType: разбор шрифта (cmap 4/12, glyf, loca, hmtx), составные глифы,
-//! квадратичные кривые и растеризация с точным подсчётом площади покрытия (без хинтинга).
-//! Все чтения из файла шрифта проверяют границы — битый шрифт не приведёт к выходу за буфер.
+//! Minimal TrueType engine: font parsing (cmap 4/12, glyf, loca, hmtx), composite glyphs,
+//! quadratic curves and rasterization with exact coverage area accounting (no hinting).
+//! Every read from the font file is bounds-checked — a broken font can't cause a buffer overrun.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -40,7 +40,7 @@ pub const Font = struct {
         return std.mem.readInt(u32, self.data[off..][0..4], .big);
     }
 
-    /// Открыть шрифт из памяти. null — не TrueType (например, CFF/OTF) или файл битый.
+    /// Open a font from memory. null — not TrueType (e.g. CFF/OTF) or a broken file.
     pub fn init(data: []const u8) ?Font {
         var f = Font{
             .data = data,
@@ -60,7 +60,7 @@ pub const Font = struct {
         };
         if (data.len < 12) return null;
         const ver = f.u32at(0);
-        if (ver != 0x00010000 and ver != 0x74727565) return null; // 'true'; 'OTTO' (CFF) не поддерживаем
+        if (ver != 0x00010000 and ver != 0x74727565) return null; // 'true'; 'OTTO' (CFF) is not supported
         const n = f.u16at(4);
         var head: usize = 0;
         var maxp: usize = 0;
@@ -96,7 +96,7 @@ pub const Font = struct {
         f.num_hmetrics = f.u16at(hhea + 34);
         if (f.num_hmetrics == 0) return null;
 
-        // выбираем подтаблицу cmap: сначала полный Юникод (формат 12), потом BMP (формат 4)
+        // pick the cmap subtable: full Unicode first (format 12), then BMP (format 4)
         const nsub = f.u16at(cmap + 2);
         var best: usize = 0;
         var best_rank: u8 = 0;
@@ -119,7 +119,7 @@ pub const Font = struct {
         return f;
     }
 
-    /// Номер глифа для символа Юникода (0 — нет в шрифте).
+    /// Glyph index for a Unicode character (0 — not in the font).
     pub fn glyphIndex(self: *const Font, cp: u32) u32 {
         const t = self.cmap;
         if (self.cmap_fmt == 12) {
@@ -138,7 +138,7 @@ pub const Font = struct {
             }
             return 0;
         }
-        // формат 4
+        // format 4
         if (cp > 0xffff) return 0;
         const segx2 = self.u16at(t + 6);
         const segs = segx2 / 2;
@@ -146,7 +146,7 @@ pub const Font = struct {
         const starts = ends + segx2 + 2;
         const deltas = starts + segx2;
         const ranges = deltas + segx2;
-        // первый сегмент, у которого конец ≥ cp (концы идут по возрастанию) — двоичным поиском
+        // the first segment whose end is ≥ cp (ends are ascending) — by binary search
         var lo: usize = 0;
         var hi: usize = segs;
         while (lo < hi) {
@@ -173,7 +173,7 @@ pub const Font = struct {
         return 0;
     }
 
-    /// Ширина глифа в единицах шрифта.
+    /// Glyph advance in font units.
     pub fn advance(self: *const Font, gid: u32) f32 {
         const i = if (gid < self.num_hmetrics) gid else self.num_hmetrics - 1;
         return @floatFromInt(self.u16at(self.hmtx + i * 4));
@@ -190,16 +190,16 @@ pub const Font = struct {
             a = @as(usize, self.u16at(self.loca + gid * 2)) * 2;
             b = @as(usize, self.u16at(self.loca + gid * 2 + 2)) * 2;
         }
-        if (b <= a or b > self.glyf_len) return null; // пустой глиф (пробел)
+        if (b <= a or b > self.glyf_len) return null; // empty glyph (space)
         return .{ self.glyf + a, self.glyf + b };
     }
 };
 
-// ================================================================= контуры
+// ================================================================= outlines
 
 const Pt = struct { x: f32, y: f32 };
 
-/// Трансформация точек глифа: масштаб + смещение (+ матрица составного глифа).
+/// Glyph point transform: scale + offset (+ the composite glyph matrix).
 const Xf = struct {
     a: f32 = 1,
     b: f32 = 0,
@@ -213,13 +213,13 @@ const Xf = struct {
     }
 };
 
-/// Приёмник отрезков: сразу растеризует в буфер накопления.
+/// Segment sink: rasterizes straight into the accumulation buffer.
 const Raster = struct {
     acc: []f32,
     w: usize,
     h: usize,
-    sx: f32, // пиксели на единицу шрифта
-    ox: f32, // сдвиг: пиксель = (x*sx - ox, oy - y*sx)
+    sx: f32, // pixels per font unit
+    ox: f32, // offset: pixel = (x*sx - ox, oy - y*sx)
     oy: f32,
 
     fn toPx(r: *const Raster, p: Pt) Pt {
@@ -230,7 +230,7 @@ const Raster = struct {
         const a = r.toPx(p0);
         const b = r.toPx(p1);
         const c = r.toPx(p2);
-        // число отрезков — по «изгибу» кривой
+        // number of segments — by the curve's "bend"
         const ddx = a.x - 2 * b.x + c.x;
         const ddy = a.y - 2 * b.y + c.y;
         const dd = @sqrt(ddx * ddx + ddy * ddy);
@@ -253,7 +253,7 @@ const Raster = struct {
         r.line(r.toPx(p0), r.toPx(p1));
     }
 
-    /// Добавить отрезок (в пикселях) в буфер накопления площадей.
+    /// Add a segment (in pixels) to the area accumulation buffer.
     fn line(r: *Raster, p0: Pt, p1: Pt) void {
         if (p0.y == p1.y) return;
         var a = p0;
@@ -322,7 +322,7 @@ const Raster = struct {
     }
 };
 
-/// Обойти контуры глифа (с учётом составных) и отдать их растеризатору.
+/// Walk the glyph outlines (including composites) and feed them to the rasterizer.
 fn walkGlyph(f: *const Font, gid: u32, xf: Xf, r: *Raster, depth: u32) void {
     if (depth > 6) return;
     const range = f.glyphRange(gid) orelse return;
@@ -333,7 +333,7 @@ fn walkGlyph(f: *const Font, gid: u32, xf: Xf, r: *Raster, depth: u32) void {
         simpleGlyph(f, g, end, @intCast(ncont), xf, r);
         return;
     }
-    // составной глиф
+    // composite glyph
     var p = g + 10;
     while (p + 4 <= end) {
         const flags = f.u16at(p);
@@ -371,7 +371,7 @@ fn walkGlyph(f: *const Font, gid: u32, xf: Xf, r: *Raster, depth: u32) void {
             m.d = f2dot14(f.i16at(p + 6));
             p += 8;
         }
-        // итоговая матрица: xf ∘ m
+        // resulting matrix: xf ∘ m
         const comb = Xf{
             .a = xf.a * m.a + xf.c * m.b,
             .b = xf.b * m.a + xf.d * m.b,
@@ -457,7 +457,7 @@ fn simpleGlyph(f: *const Font, g: usize, end: usize, ncont: usize, xf: Xf, r: *R
     }
 }
 
-/// Один замкнутый контур из точек на кривой и контрольных точек (с подразумеваемыми серединами).
+/// One closed contour of on-curve and control points (with implied midpoints).
 fn contour(pts: []const Pt, flags: []const u8, r: *Raster) void {
     const n = pts.len;
     if (n < 2) return;
@@ -466,7 +466,7 @@ fn contour(pts: []const Pt, flags: []const u8, r: *Raster) void {
             return fl & 1 != 0;
         }
     }.f;
-    // стартовая точка — на кривой
+    // the start point is on the curve
     var first: Pt = undefined;
     var si: usize = 0;
     if (on(flags[0])) {
@@ -507,15 +507,15 @@ fn midpoint(a: Pt, b: Pt) Pt {
     return .{ .x = (a.x + b.x) / 2, .y = (a.y + b.y) / 2 };
 }
 
-// ================================================================= кэш глифов и текст
+// ================================================================= glyph cache and text
 
 pub const Glyph = struct {
     gid: u32 = 0xffffffff,
     size: u16 = 0,
     w: u16 = 0,
     h: u16 = 0,
-    left: i16 = 0, // смещение битмапа от точки пера по X
-    top: i16 = 0, // смещение верхнего края от базовой линии (вверх положительно)
+    left: i16 = 0, // bitmap offset from the pen position along X
+    top: i16 = 0, // offset of the top edge from the baseline (positive is up)
     off: u32 = 0,
     adv: f32 = 0,
 };
@@ -532,7 +532,7 @@ fn fnt() ?*const Font {
     return if (font) |*f| f else null;
 }
 
-/// Загрузить первый подходящий шрифт из списка (файл отображается в память).
+/// Load the first suitable font from the list (the file is memory-mapped).
 pub fn load(paths: []const []const u8) bool {
     var buf: [512]u8 = undefined;
     for (paths) |p| {
@@ -556,7 +556,7 @@ fn hashIdx(gid: u32, size: u16) usize {
     return @as(usize, (gid *% 2654435761) ^ (@as(u32, size) *% 40503)) % CACHE_N;
 }
 
-/// Глиф заданного размера (в пикселях на em) — из кэша или свежерастеризованный.
+/// A glyph of the given size (in pixels per em) — from the cache or freshly rasterized.
 pub fn glyph(gid: u32, size: u16) ?*const Glyph {
     const f = fnt() orelse return null;
     const hi = hashIdx(gid, size);
@@ -576,7 +576,7 @@ pub fn glyph(gid: u32, size: u16) ?*const Glyph {
         if (w_f > 0 and h_f > 0 and w_f <= 128 and h_f <= 128) {
             const w: usize = @intFromFloat(w_f);
             const h: usize = @intFromFloat(h_f);
-            if (pool_used + w * h > pool.len) { // кэш переполнен — начинаем заново
+            if (pool_used + w * h > pool.len) { // cache is full — start over
                 pool_used = 0;
                 for (&cache) |*c| c.* = .{};
             }
@@ -584,7 +584,7 @@ pub fn glyph(gid: u32, size: u16) ?*const Glyph {
             @memset(acc, 0);
             var r = Raster{ .acc = acc, .w = w, .h = h, .sx = sx, .ox = left, .oy = top };
             walkGlyph(f, gid, .{}, &r, 0);
-            // накопление площадей -> покрытие 0..255 (слегка «жирнее» для мелкого текста)
+            // accumulated areas -> coverage 0..255 (slightly "bolder" for small text)
             const out = pool[pool_used .. pool_used + w * h];
             var s: f32 = 0;
             for (acc, out) |a, *o| {
@@ -604,7 +604,7 @@ pub fn glyph(gid: u32, size: u16) ?*const Glyph {
     return &cache[hi];
 }
 
-/// Декодер UTF-8 (неверные байты заменяются на U+FFFD).
+/// UTF-8 decoder (invalid bytes are replaced by U+FFFD).
 pub const Utf8 = struct {
     s: []const u8,
     i: usize = 0,
@@ -631,8 +631,8 @@ pub const Utf8 = struct {
     }
 };
 
-/// Кэш «символ → номер глифа»: поиск по cmap — на каждый символ каждого кадра.
-/// В ячейке cp + 1, чтобы пустая (нулевая) таблица лежала в .bss, а не в файле.
+/// "Character → glyph index" cache: a cmap lookup for every character of every frame.
+/// The slot holds cp + 1 so that the empty (zero) table lives in .bss rather than in the file.
 const CpSlot = struct { cp1: u32 = 0, gid: u32 = 0 };
 var cp_cache: [512]CpSlot = [_]CpSlot{.{}} ** 512;
 
@@ -646,7 +646,7 @@ fn glyphFor(cp: u32) u32 {
     return g;
 }
 
-/// Ширина строки в пикселях.
+/// String width in pixels.
 pub fn width(s: []const u8, size: u16) f32 {
     var it = Utf8{ .s = s };
     var w: f32 = 0;
@@ -656,13 +656,13 @@ pub fn width(s: []const u8, size: u16) f32 {
     return w;
 }
 
-/// Высота строчных/прописных над базовой линией (для вертикального центрирования).
+/// Height of lowercase/capitals above the baseline (for vertical centering).
 pub fn ascent(size: u16) f32 {
     const f = fnt() orelse return @floatFromInt(size);
     return f.ascender * @as(f32, @floatFromInt(size)) / f.upem;
 }
 
-/// Нарисовать строку: (x, baseline) — точка пера на базовой линии. Возвращает новую X.
+/// Draw a string: (x, baseline) is the pen position on the baseline. Returns the new X.
 pub fn drawText(cv: *draw.Canvas, s: []const u8, x: f32, baseline: f32, size: u16, color: u32, clip_x1: f32) f32 {
     var it = Utf8{ .s = s };
     var pen = x;

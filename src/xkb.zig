@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Разбор текстовой раскладки XKB, которую присылает композитор (wl_keyboard.keymap):
-//! только то, что нужно для ввода текста — коды клавиш, символы по группам (раскладкам)
-//! и двум уровням (обычный/Shift), Caps Lock для букв. Латиница, кириллица, Uxxxx.
+//! Parses the text XKB keymap the compositor sends (wl_keyboard.keymap):
+//! only what text input needs — key codes, symbols per group (layout)
+//! and two levels (plain/Shift), Caps Lock for letters. Latin, Cyrillic, Uxxxx.
 
 const std = @import("std");
 
@@ -11,7 +11,7 @@ pub const Keymap = struct {
     syms: [256][4][2]u32 = std.mem.zeroes([256][4][2]u32),
     ngroups: [256]u8 = [_]u8{0} ** 256,
 
-    /// Символ (кодовая точка Юникода) для клавиши evdev, или 0.
+    /// The symbol (Unicode code point) for an evdev key, or 0.
     pub fn char(km: *const Keymap, evdev: u32, group: u32, shift: bool, caps: bool) u32 {
         const code = evdev + 8;
         if (code >= 256) return 0;
@@ -30,7 +30,7 @@ fn isLower(c: u32) bool {
     return (c >= 'a' and c <= 'z') or (c >= 0x430 and c <= 0x45f);
 }
 
-// ================================================================= токенайзер
+// ================================================================= tokenizer
 
 const Tok = struct {
     kind: enum { ident, keyname, string, punct, end },
@@ -86,7 +86,7 @@ fn isPunct(t: Tok, p: u8) bool {
     return t.kind == .punct and t.s[0] == p;
 }
 
-/// Найти блок `name ... { ... };` и вернуть его тело.
+/// Find the block `name ... { ... };` and return its body.
 fn section(text: []const u8, name: []const u8) ?[]const u8 {
     const at = std.mem.indexOf(u8, text, name) orelse return null;
     const open = std.mem.indexOfScalarPos(u8, text, at, '{') orelse return null;
@@ -102,14 +102,14 @@ fn section(text: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-// ================================================================= разбор
+// ================================================================= parsing
 
 const MAX_NAMES = 768;
 
-/// Имена клавиш (<AE01>, <LFSH> — до 8 байт) → коды: имя упаковано в u64,
-/// открытая адресация. Раньше каждое имя в xkb_symbols искалось перебором всех.
+/// Key names (<AE01>, <LFSH> — up to 8 bytes) → codes: the name is packed into a u64,
+/// open addressing. Previously every name in xkb_symbols was looked up by a linear scan.
 const Names = struct {
-    keys: [1024]u64 = [_]u64{0} ** 1024, // 0 — пусто (у имени хотя бы один байт ненулевой)
+    keys: [1024]u64 = [_]u64{0} ** 1024, // 0 — empty (a name has at least one nonzero byte)
     codes: [1024]u16 = undefined,
     n: usize = 0,
 
@@ -135,7 +135,7 @@ const Names = struct {
             t.keys[i] = k;
             t.codes[i] = code;
             t.n += 1;
-        } // повтор имени: действует первое, как раньше при переборе
+        } // repeated name: the first one wins, as with the old linear scan
     }
 
     fn get(t: *const Names, name: []const u8) ?u16 {
@@ -183,7 +183,7 @@ pub fn parse(text: []const u8) Keymap {
         if (!isPunct(l.next(), '{')) continue;
         const code = names.get(kn.s);
         var implicit: u8 = 0;
-        // тело клавиши до закрывающей '}'
+        // key body up to the closing '}'
         while (true) {
             const x = l.next();
             if (x.kind == .end or isPunct(x, '}')) break;
@@ -205,7 +205,7 @@ pub fn parse(text: []const u8) Keymap {
                         if (code) |c| readList(&km, c, group, &l) else skipList(&l);
                     } else skipList(&l);
                 } else {
-                    _ = l.next(); // строка или идентификатор
+                    _ = l.next(); // string or identifier
                 }
             } else if (isPunct(x, '[')) {
                 implicit += 1;
@@ -243,7 +243,7 @@ fn readList(km: *Keymap, code: u16, group: u8, l: *Lexer) void {
     km.ngroups[code] = @max(km.ngroups[code], group);
 }
 
-// ================================================================= имена keysym -> Юникод
+// ================================================================= keysym names -> Unicode
 
 const Named = struct { n: []const u8, c: u21 };
 
@@ -265,7 +265,7 @@ const ascii_names = [_]Named{
     .{ .n = "guillemotleft", .c = 0xab }, .{ .n = "guillemotright", .c = 0xbb }, .{ .n = "sterling", .c = 0xa3 },
 };
 
-// строчные кириллические буквы по суффиксу имени Cyrillic_*
+// lowercase Cyrillic letters by the suffix of the Cyrillic_* name
 const cyr = [_]Named{
     .{ .n = "a", .c = 0x430 },      .{ .n = "be", .c = 0x431 },       .{ .n = "ve", .c = 0x432 },
     .{ .n = "ghe", .c = 0x433 },    .{ .n = "de", .c = 0x434 },       .{ .n = "ie", .c = 0x435 },
@@ -286,11 +286,11 @@ pub fn keysymChar(name: []const u8) u32 {
         if (c >= 0x20 and c < 0x7f) return c;
         return 0;
     }
-    // Uxxxx — символ Юникода
+    // Uxxxx — a Unicode character
     if (name.len >= 5 and name[0] == 'U' and std.ascii.isHex(name[1])) {
         return std.fmt.parseInt(u21, name[1..], 16) catch 0;
     }
-    // 0x1000xxxx — числовой keysym Юникода, 0x20..0xff — Latin-1
+    // 0x1000xxxx — a numeric Unicode keysym, 0x20..0xff — Latin-1
     if (std.mem.startsWith(u8, name, "0x")) {
         const v = std.fmt.parseInt(u32, name[2..], 16) catch return 0;
         if (v >= 0x01000000 and v <= 0x0110ffff) return v - 0x01000000;

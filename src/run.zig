@@ -1,20 +1,20 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! zrun — лаунчер для zpanel на чистом Zig, вместо rofi.
+//! zrun — launcher for netline, in pure Zig, instead of rofi.
 //!
-//! Две вкладки: «Приложения» (.desktop-файлы из папок XDG, с переводами) и «Команды»
-//! (всё из PATH). Нечёткий поиск с подсветкой совпадений, часто запускаемое — выше,
-//! запрос, набранный не в той раскладке («ашкуащч»), тоже находит. Иконки — PNG из темы
-//! иконок; если её нет — плитка с первой буквой.
+//! Two tabs: "Apps" (.desktop files from the XDG folders, with translations) and "Commands"
+//! (everything in PATH). Fuzzy search with match highlighting, frequently launched entries rank higher,
+//! and a query typed in the wrong layout ("ашкуащч") is found too. Icons are PNG from the icon
+//! theme; if there is none — a tile with the first letter.
 //!
-//! Всё читается до песочницы. Запускает программы маленький процесс-брокер, отделённый
-//! сразу после чтения списка: для приложения ему передаётся только номер в этом списке,
-//! а строку Exec он разбирает сам и выполняет без shell.
+//! Everything is read before the sandbox. Programs are launched by a small broker process forked
+//! right after the list is read: for an app it is given only the number in that list,
+//! and it parses the Exec line itself and runs it without a shell.
 //!
-//! Клавиши: ввод — поиск, ↑/↓ (Ctrl+P/N, Ctrl+K/J), PgUp/PgDn, Enter — запустить,
-//! Shift+Enter — в терминале, Tab — другая вкладка, Esc — закрыть.
-//! В «Командах» Ctrl+Enter выполняет набранную строку как есть. `zrun run` — сразу «Команды».
+//! Keys: typing — search, ↑/↓ (Ctrl+P/N, Ctrl+K/J), PgUp/PgDn, Enter — launch,
+//! Shift+Enter — in a terminal, Tab — the other tab, Esc — close.
+//! In "Commands" Ctrl+Enter runs the typed line as is. `zrun run` opens "Commands" right away.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -36,9 +36,9 @@ const FIELD_Y: f32 = 56;
 const LIST_Y: f32 = 106;
 const ICON: f32 = 32;
 
-// ================================================================= строки
+// ================================================================= strings
 
-/// Все строки (имена, Exec, пути) — в одном буфере: страницы занимаются по мере заполнения.
+/// All strings (names, Exec, paths) live in one buffer: pages are committed as it fills.
 var arena: [1 << 20]u8 = undefined;
 var arena_n: usize = 0;
 
@@ -49,7 +49,7 @@ const Str = extern struct {
     fn get(s: Str) []const u8 {
         return arena[s.off..][0..s.len];
     }
-    /// Только для строк, сохранённых через keepZ.
+    /// Only for strings saved via keepZ.
     fn z(s: Str) [:0]const u8 {
         return arena[s.off .. s.off + s.len :0];
     }
@@ -63,7 +63,7 @@ fn keep(s: []const u8) Str {
     return r;
 }
 
-/// С завершающим нулём — для путей и execve.
+/// Zero-terminated — for paths and execve.
 fn keepZ(s: []const u8) Str {
     if (arena_n + s.len + 1 > arena.len) return .{};
     const r = keep(s);
@@ -72,7 +72,7 @@ fn keepZ(s: []const u8) Str {
     return r;
 }
 
-/// В нижнем регистре — для поиска.
+/// Lowercased — for searching.
 fn keepFold(s: []const u8) Str {
     if (arena_n + s.len > arena.len) return .{};
     const r = Str{ .off = @intCast(arena_n), .len = @intCast(s.len) };
@@ -81,16 +81,16 @@ fn keepFold(s: []const u8) Str {
     return r;
 }
 
-// ================================================================= данные
+// ================================================================= data
 
 const IconState = enum(u8) { unknown, none, ready };
 
 const App = extern struct {
     id: Str = .{}, // org.mozilla.firefox.desktop
-    file: Str = .{}, // путь к .desktop (для %k)
+    file: Str = .{}, // path to the .desktop file (for %k)
     name: Str = .{},
-    sub: Str = .{}, // GenericName или Comment
-    exec: Str = .{}, // Exec после unescape
+    sub: Str = .{}, // GenericName or Comment
+    exec: Str = .{}, // Exec after unescape
     icon: Str = .{},
     dir: Str = .{}, // Path=
     f_name: Str = .{},
@@ -101,7 +101,7 @@ const App = extern struct {
     f_id: Str = .{},
     visible: bool = false,
     terminal: bool = false,
-    rank: u16 = 0, // место по алфавиту
+    rank: u16 = 0, // alphabetical position
     uses: u32 = 0,
     icon_state: IconState = .unknown,
     icon_off: u32 = 0,
@@ -110,7 +110,7 @@ const App = extern struct {
 const MAX_APPS = 1024;
 var apps: [MAX_APPS]App = undefined;
 var napps: usize = 0;
-var vis: [MAX_APPS]u16 = undefined; // видимые приложения по алфавиту
+var vis: [MAX_APPS]u16 = undefined; // visible apps in alphabetical order
 var nvis: usize = 0;
 
 const Exe = extern struct { name: Str, f_name: Str, uses: u32 = 0 };
@@ -118,7 +118,7 @@ const MAX_EXES = 8192;
 var exes: [MAX_EXES]Exe = undefined;
 var nexes: usize = 0;
 
-// хеш-таблицы индексов (заполнены не больше чем наполовину)
+// index hash tables (filled at most halfway)
 const EMPTY: u16 = 0xffff;
 var app_tab = [_]u16{EMPTY} ** (MAX_APPS * 2);
 var exe_tab = [_]u16{EMPTY} ** (MAX_EXES * 2);
@@ -140,7 +140,7 @@ fn exeKey(i: u16) []const u8 {
     return exes[i].name.get();
 }
 
-/// Найти ключ; если его нет — в slot свободная ячейка для него.
+/// Find a key; if it isn't there, slot gets a free cell for it.
 fn lookup(tab: []u16, key: []const u8, comptime keyOf: fn (u16) []const u8, slot: *usize) ?u16 {
     const mask = tab.len - 1;
     var i = hash(key) & mask;
@@ -156,7 +156,7 @@ fn isExe(name: []const u8) bool {
     return lookup(&exe_tab, name, exeKey, &slot) != null;
 }
 
-// ================================================================= окружение
+// ================================================================= environment
 
 var home: []const u8 = "";
 var home_z: Str = .{};
@@ -167,8 +167,8 @@ var ndata: usize = 0;
 var cache_dir: Str = .{};
 var hist_dir: Str = .{};
 var hist_path: Str = .{};
-var list_path: Str = .{}; // кэш списка приложений и команд
-var icons_path: Str = .{}; // кэш готовых иконок
+var list_path: Str = .{}; // cache of the app and command list
+var icons_path: Str = .{}; // cache of prepared icons
 var fbuf: [64 * 1024]u8 = undefined;
 
 fn env(name: []const u8) ?[]const u8 {
@@ -186,7 +186,7 @@ fn addData(d0: []const u8) void {
     ndata += 1;
 }
 
-/// Папки данных XDG по убыванию приоритета, язык, окружение, путь к истории.
+/// XDG data folders by descending priority, language, desktop, history path.
 fn setupEnv() void {
     home = env("HOME") orelse "";
     home_z = keepZ(if (home.len > 0) home else "/");
@@ -199,7 +199,7 @@ fn setupEnv() void {
     } else if (home.len > 0) addData(std.fmt.bufPrint(&b, "{s}/.local/share", .{home}) catch "");
     var it = std.mem.tokenizeScalar(u8, env("XDG_DATA_DIRS") orelse "/usr/local/share:/usr/share", ':');
     while (it.next()) |d| addData(d);
-    // приложения Flatpak — даже если сессия запущена без его XDG_DATA_DIRS
+    // Flatpak apps — even if the session was started without its XDG_DATA_DIRS
     if (home.len > 0) addData(std.fmt.bufPrint(&b, "{s}/.local/share/flatpak/exports/share", .{home}) catch "");
     addData("/var/lib/flatpak/exports/share");
 
@@ -207,14 +207,14 @@ fn setupEnv() void {
     if (cache.len > 0 and cache[0] == '/') {
         cache_dir = keepZ(cache);
         var b2: [512]u8 = undefined;
-        hist_dir = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel", .{cache}) catch "");
-        hist_path = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel/zrun-history", .{cache}) catch "");
-        list_path = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel/zrun-cache", .{cache}) catch "");
-        icons_path = keepZ(std.fmt.bufPrint(&b2, "{s}/zpanel/zrun-icons", .{cache}) catch "");
+        hist_dir = keepZ(std.fmt.bufPrint(&b2, "{s}/netline", .{cache}) catch "");
+        hist_path = keepZ(std.fmt.bufPrint(&b2, "{s}/netline/zrun-history", .{cache}) catch "");
+        list_path = keepZ(std.fmt.bufPrint(&b2, "{s}/netline/zrun-cache", .{cache}) catch "");
+        icons_path = keepZ(std.fmt.bufPrint(&b2, "{s}/netline/zrun-icons", .{cache}) catch "");
     }
 }
 
-// ================================================================= команды из PATH
+// ================================================================= commands from PATH
 
 fn loadExes() void {
     var b: [512]u8 = undefined;
@@ -229,7 +229,7 @@ fn loadExes() void {
             var slot: usize = 0;
             if (lookup(&exe_tab, name, exeKey, &slot) != null) continue;
             const s = keep(name);
-            if (s.len == 0) return; // буфер строк кончился
+            if (s.len == 0) return; // the string buffer ran out
             const lower = for (name) |c| {
                 if (c >= 'A' and c <= 'Z') break false;
             } else true;
@@ -253,16 +253,16 @@ fn sortExes() void {
     }
 }
 
-// ================================================================= приложения
+// ================================================================= applications
 
 fn loadApps() void {
     var b: [512]u8 = undefined;
     for (data_dirs[0..ndata]) |d| scanApps(sys.joinZ(&b, &.{ d, "/applications" }), "", 0);
 }
 
-/// ID файла по спецификации: путь от папки applications, «/» → «-» (kde4/okular.desktop → kde4-okular.desktop).
+/// File ID per the spec: path from the applications folder, "/" → "-" (kde4/okular.desktop → kde4-okular.desktop).
 fn scanApps(path: [:0]const u8, prefix: []const u8, depth: u32) void {
-    watch(path); // и несуществующие: появится папка — кэш устареет
+    watch(path); // nonexistent ones too: if the folder appears, the cache goes stale
     var dir = sys.Dir.open(path) orelse return;
     defer dir.deinit();
     var b: [512]u8 = undefined;
@@ -280,9 +280,9 @@ fn scanApps(path: [:0]const u8, prefix: []const u8, depth: u32) void {
 fn addApp(path: [:0]const u8, id: []const u8) void {
     if (napps == MAX_APPS) return;
     var slot: usize = 0;
-    // такой ID уже был в папке с большим приоритетом — он и действует (в том числе Hidden=true)
+    // this ID was already in a higher-priority folder — that one wins (including Hidden=true)
     if (lookup(&app_tab, id, appKey, &slot) != null) return;
-    watch(path); // правка файла на месте не меняет время папки
+    watch(path); // editing a file in place doesn't change the folder's time
     const data = sys.readFile(path, &fbuf) orelse return;
     const e = desk.parse(data, loc);
     var a = App{ .id = keep(id) };
@@ -295,7 +295,7 @@ fn addApp(path: [:0]const u8, id: []const u8) void {
     napps += 1;
 }
 
-/// TryExec: программы нет — приложение не показываем.
+/// TryExec: if the program is missing, the app is not shown.
 fn tryExecOk(te: []const u8) bool {
     if (te.len == 0) return true;
     var b: [512]u8 = undefined;
@@ -333,7 +333,7 @@ fn fill(a: *App, e: *const desk.Entry, path: []const u8) void {
     const id = a.id.get();
     a.f_id = keepFold(if (std.mem.endsWith(u8, id, ".desktop")) id[0 .. id.len - 8] else id);
     a.terminal = e.terminal;
-    if (a.exec.len == 0) a.visible = false; // буфер строк кончился
+    if (a.exec.len == 0) a.visible = false; // the string buffer ran out
 }
 
 fn appLess(_: void, a: u16, b: u16) bool {
@@ -351,9 +351,9 @@ fn sortApps() void {
     for (vis[0..nvis], 0..) |i, r| apps[i].rank = @intCast(r);
 }
 
-// ================================================================= история запусков
-// Файл ~/.cache/zpanel/zrun-history: строки «число<TAB>a:id.desktop» или «число<TAB>r:программа».
-// Пишет его брокер; окно только читает при запуске.
+// ================================================================= launch history
+// The file ~/.cache/netline/zrun-history: lines "count<TAB>a:id.desktop" or "count<TAB>r:program".
+// The broker writes it; the window only reads it at startup.
 
 fn loadHistory() void {
     if (hist_path.len == 0) return;
@@ -407,11 +407,11 @@ fn bumpHistory(kind: []const u8, key: []const u8) void {
     };
     std.sort.pdq(Rec, recs[0..nrec], {}, S.more);
     if (!found) {
-        if (nrec == recs.len) nrec -= 1; // самая редкая запись уступает место новой
+        if (nrec == recs.len) nrec -= 1; // the rarest entry makes room for the new one
         recs[nrec] = .{ .n = 1, .k = fk };
         nrec += 1;
     }
-    // старые привычки постепенно забываются
+    // old habits are gradually forgotten
     if (recs[0].n > 5000) {
         for (recs[0..nrec]) |*r| r.n = @max(1, r.n / 2);
     }
@@ -434,12 +434,12 @@ fn bumpHistory(kind: []const u8, key: []const u8) void {
     sys.rename(tmp, hist_path.z()) catch sys.unlink(tmp);
 }
 
-// ================================================================= кэш списка
-// Построение списка — это чтение всех .desktop-файлов (с переводами — десятки КБ каждый),
-// всего PATH и сотни проверок папок иконок. Результат пишется в ~/.cache/zpanel/zrun-cache
-// одним блоком вместе с «отпечатками» (время изменения, размер, inode) всего, что читалось:
-// папок PATH и applications, каждого .desktop-файла, папок тем иконок. При запуске
-// отпечатки сверяются — изменилось хоть что-то, список строится заново.
+// ================================================================= list cache
+// Building the list means reading all .desktop files (with translations — tens of KB each),
+// all of PATH and hundreds of icon folder checks. The result is written to ~/.cache/netline/zrun-cache
+// in one block together with "fingerprints" (modification time, size, inode) of everything that was read:
+// the PATH and applications folders, every .desktop file, the icon theme folders. At startup
+// the fingerprints are compared — if anything changed, the list is rebuilt.
 
 const Watch = extern struct { path: Str, st: sys.Stamp };
 const MAX_WATCH = 4096;
@@ -447,9 +447,9 @@ var watches: [MAX_WATCH]Watch = undefined;
 var nwatch: usize = 0;
 var watch_full = false;
 
-/// Запомнить отпечаток пути (до чтения: правка во время чтения не останется незамеченной).
+/// Remember a path's fingerprint (before reading: an edit during the read won't go unnoticed).
 fn watch(path: []const u8) void {
-    if (list_path.len == 0) return; // кэшировать некуда — и отпечатки не нужны
+    if (list_path.len == 0) return; // nowhere to cache — no fingerprints needed either
     if (nwatch == MAX_WATCH) {
         watch_full = true;
         return;
@@ -463,9 +463,9 @@ fn watch(path: []const u8) void {
     nwatch += 1;
 }
 
-const CACHE_MAGIC: u64 = 0x3143_4e55_525a_7a01; // версия формата — в последнем байте
+const CACHE_MAGIC: u64 = 0x3143_4e55_525a_7a01; // format version in the last byte
 
-/// Отпечаток раскладки структур: другой бинарник с другими полями не прочтёт чужой кэш.
+/// Fingerprint of the struct layout: another binary with other fields won't read a foreign cache.
 const layout_key: u64 = blk: {
     @setEvalBranchQuota(100000);
     var h: u64 = 0xcbf29ce484222325;
@@ -482,9 +482,9 @@ const layout_key: u64 = blk: {
 const Header = extern struct {
     magic: u64,
     layout: u64,
-    env: u64, // окружение и настройки, от которых зависит список
-    gen: u64, // номер этого кэша: на него ссылается кэш иконок
-    base: u32, // строки кэша лежат в arena[base..end]
+    env: u64, // the environment and settings the list depends on
+    gen: u64, // number of this cache: the icon cache refers to it
+    base: u32, // the cache strings live in arena[base..end]
     end: u32,
     nwatch: u32,
     napps: u32,
@@ -519,14 +519,14 @@ fn validStr(x: Str, end: usize) bool {
     return @as(usize, x.off) + x.len <= end;
 }
 
-/// Строка с нулём на конце. Пустое поле ({0, 0}: у скрытых приложений нет иконки и папки)
-/// тоже годится — для пустых z() не вызывается.
+/// A zero-terminated string. An empty field ({0, 0}: hidden apps have no icon and folder)
+/// is fine too — z() isn't called for empty ones.
 fn validZ(x: Str, end: usize) bool {
     if (x.len == 0 and x.off == 0) return true;
     return @as(usize, x.off) + x.len < end and arena[x.off + x.len] == 0;
 }
 
-/// Путь: непустая строка с нулём на конце (дальше от него берётся z()).
+/// A path: a non-empty zero-terminated string (z() is taken from it later).
 fn validPath(x: Str, end: usize) bool {
     return x.len > 0 and validZ(x, end);
 }
@@ -541,8 +541,8 @@ fn readExact(fd: i32, buf: []u8) bool {
     return true;
 }
 
-/// Прочитать кэш списка. false — нет, устарел или битый (тогда строки, которые
-/// успели лечь в arena, отбрасываются и список строится заново).
+/// Read the list cache. false — missing, stale or broken (then the strings that
+/// already landed in arena are dropped and the list is rebuilt).
 fn loadList() bool {
     arena_base = arena_n;
     if (list_path.len == 0) return false;
@@ -570,13 +570,13 @@ fn readList(fd: i32) bool {
     const end: usize = h.end;
     if (!readExact(fd, arena[h.base..end])) return false;
 
-    // сначала отпечатки: если что-то поменялось, остальное и читать незачем
+    // fingerprints first: if anything changed, there's no point reading the rest
     if (!readExact(fd, std.mem.sliceAsBytes(watches[0..h.nwatch]))) return false;
     for (watches[0..h.nwatch]) |w| {
         if (!validPath(w.path, end)) return false;
         const now = sys.stamp(w.path.z());
         if (!std.meta.eql(now, w.st)) {
-            sys.tracef("кэш списка устарел: {s}", .{w.path.get()});
+            sys.tracef("list cache is stale: {s}", .{w.path.get()});
             return false;
         }
     }
@@ -588,7 +588,7 @@ fn readList(fd: i32) bool {
     var rp: [read_paths.len]Str = undefined;
     if (!readExact(fd, std.mem.sliceAsBytes(rp[0..h.nread]))) return false;
 
-    // проверка ссылок: битый файл — пересборка, а не выход за буфер
+    // reference checks: a broken file means a rebuild, not a buffer overrun
     for (apps[0..h.napps]) |*a| {
         inline for (std.meta.fields(App)) |f| {
             if (f.type == Str) {
@@ -619,7 +619,7 @@ fn readList(fd: i32) bool {
     npix = h.npix;
     nread = h.nread;
     list_gen = h.gen;
-    // хеш-таблицы — из списков (быстрее, чем хранить)
+    // hash tables — from the lists (faster than storing them)
     @memset(&app_tab, EMPTY);
     for (0..napps) |i| {
         var slot: usize = 0;
@@ -633,7 +633,7 @@ fn readList(fd: i32) bool {
     return true;
 }
 
-/// Записать кэш списка (до песочницы; через временный файл — недописанный не прочтётся).
+/// Write the list cache (before the sandbox; via a temporary file — a half-written one won't be read).
 fn saveList() void {
     if (list_path.len == 0 or watch_full) return;
     list_gen = sys.random();
@@ -662,7 +662,7 @@ fn saveList() void {
         std.mem.asBytes(&h),
         arena[arena_base..arena_n],
         std.mem.sliceAsBytes(watches[0..nwatch]),
-        std.mem.sliceAsBytes(apps[0..napps]), // счётчики запусков ещё нулевые: история читается после
+        std.mem.sliceAsBytes(apps[0..napps]), // launch counters are still zero: history is read afterwards
         std.mem.sliceAsBytes(exes[0..nexes]),
         std.mem.sliceAsBytes(icon_dirs[0..nicon]),
         std.mem.sliceAsBytes(pix_dirs[0..npix]),
@@ -679,10 +679,10 @@ fn saveList() void {
     sys.rename(tmp, list_path.z()) catch sys.unlink(tmp);
 }
 
-// ================================================================= брокер запуска
-// Отделяется после чтения списков, до подключения к Wayland и песочницы. Сообщения:
-//   'A' <номер u16> <флаги> — приложение из списка (Exec разбирается здесь, без shell);
-//   'R' <флаги> <строка>    — команда через /bin/sh -c (вкладка «Команды»).
+// ================================================================= launch broker
+// Forks after the lists are read, before connecting to Wayland and the sandbox. Messages:
+//   'A' <number u16> <flags> — an app from the list (Exec is parsed here, without a shell);
+//   'R' <flags> <line>       — a command via /bin/sh -c (the "Commands" tab).
 
 const F_TERM: u8 = 1;
 var broker_fd: i32 = -1;
@@ -703,7 +703,7 @@ fn serve(fd: i32) noreturn {
     var b: [512]u8 = undefined;
     while (true) {
         const n = sys.read(fd, &b) catch sys.exit(0);
-        if (n == 0) sys.exit(0); // окно закрылось
+        if (n == 0) sys.exit(0); // the window closed
         const m = b[0..n];
         if (m.len == 4 and m[0] == 'A') {
             const i = std.mem.readInt(u16, m[1..3], .little);
@@ -741,13 +741,13 @@ fn runCommand(cmd: []const u8, term: bool) void {
     av.add(cmd);
     if (av.overflow) return;
     spawn(&av, home_z.z());
-    // в историю — только имена программ: в набранных строках с аргументами бывают пароли
+    // only program names go into the history: typed lines with arguments may contain passwords
     if (isExe(cmd)) bumpHistory("r:", cmd);
 }
 
-// ================================================================= иконки
-// Только PNG: тема из config.zig или GTK, её Inherits, затем hicolor; размер — ровно под
-// экран или крупнее (с уменьшением). Иконки грузятся при первом показе строки.
+// ================================================================= icons
+// PNG only: the theme from config.zig or GTK, its Inherits, then hicolor; the size is exactly the
+// screen's or larger (scaled down). Icons are loaded when a row is first shown.
 
 const IconDir = extern struct { path: Str, size: u16, rank: u8 };
 var icon_dirs: [64]IconDir = undefined;
@@ -760,7 +760,7 @@ var nread: usize = 0;
 
 const sizes = [_]u16{ 16, 22, 24, 32, 48, 64, 96, 128, 192, 256, 512 };
 
-const POOL = 1 << 20; // пикселей: 4 МБ на все показанные иконки, страницы — по мере надобности
+const POOL = 1 << 20; // pixels: 4 MB for all shown icons, pages committed as needed
 var pool: ?[*]u32 = null;
 var pool_n: usize = 0;
 var icon_t: u32 = 0;
@@ -822,7 +822,7 @@ fn iconSetup() void {
         nroots += 1;
     }
 
-    // темы по порядку: своя, то, от чего она наследует, hicolor
+    // themes in order: our own, what it inherits from, hicolor
     var themes: [5][]const u8 = undefined;
     var nthemes: usize = 0;
     const own = userTheme();
@@ -851,14 +851,14 @@ fn iconSetup() void {
         for (roots[0..nroots]) |r| {
             if (r.len == 0) continue;
             const tp = sys.joinZ(&b, &.{ r.get(), "/", th });
-            watch(tp); // новая папка размера в теме меняет время этой папки
+            watch(tp); // a new size folder in the theme changes this folder's time
             if (!sys.exists(tp)) continue;
             for (sizes) |s| {
                 if (nicon == icon_dirs.len) break;
                 var pb: [600]u8 = undefined;
                 const p = std.fmt.bufPrint(&pb, "{s}/{s}/{d}x{d}/apps", .{ r.get(), th, s, s }) catch continue;
                 if (!sys.exists(sys.joinZ(&b, &.{p}))) continue;
-                watch(p); // новые иконки (установка программы)
+                watch(p); // new icons (a program was installed)
                 icon_dirs[nicon] = .{ .path = keepZ(p), .size = s, .rank = @intCast(rank) };
                 nicon += 1;
             }
@@ -874,7 +874,7 @@ fn iconSetup() void {
         npix += 1;
     }
 
-    // что окно сможет читать в песочнице: корни тем, pixmaps и папки иконок с абсолютным путём
+    // what the window may read in the sandbox: theme roots, pixmaps and icon folders with absolute paths
     for (roots[0..nroots]) |r| {
         if (r.len > 0) addRead(r.z());
     }
@@ -899,7 +899,7 @@ fn dirBefore(t: u32, a: u8, b: u8) bool {
     return sizeKey(da.size, t) < sizeKey(db.size, t);
 }
 
-/// Масштаб экрана поменялся (или первый кадр): иконки — заново под новый размер.
+/// The screen scale changed (or the first frame): redo the icons for the new size.
 fn resetIcons(t: u32) void {
     icon_t = t;
     pool_n = 0;
@@ -921,11 +921,11 @@ fn iconOf(a: *App) ?[]const u32 {
     return pool.?[a.icon_off..][0 .. t * t];
 }
 
-// ---------------------------------------------------------------- кэш готовых иконок
-// ~/.cache/zpanel/zrun-icons: иконки уже уменьшены под экран, и отмечено, у кого иконки
-// нет (чтобы не перебирать десятки путей при каждом запуске). Файл открыт до песочницы;
-// читается при первом кадре, дописывается при закрытии, если появились новые.
-// Действует, пока не перестроен список (номер list_gen) и не поменялся масштаб.
+// ---------------------------------------------------------------- cache of prepared icons
+// ~/.cache/netline/zrun-icons: icons already scaled for the screen, plus a note of which have no
+// icon (so dozens of paths aren't tried on every launch). The file is opened before the sandbox;
+// it's read at the first frame and appended to on close if new icons appeared.
+// It is valid until the list is rebuilt (list_gen number) or the scale changes.
 
 var icons_fd: i32 = -1;
 var icons_dirty = false;
@@ -957,10 +957,10 @@ fn loadIconCache(t: u32) void {
         }
     }
     pool_n = h.pool_n;
-    sys.tracef("иконки из кэша: {d} КБ", .{pool_n * 4 / 1024});
+    sys.tracef("icons from cache: {d} KB", .{pool_n * 4 / 1024});
 }
 
-/// При закрытии: дописать кэш иконок, если за этот запуск появились новые.
+/// On close: append to the icon cache if new icons appeared during this run.
 fn saveIconCache() void {
     if (icons_fd < 0 or !icons_dirty or list_gen == 0 or icon_t == 0) return;
     const h = IconHeader{ .magic = CACHE_MAGIC, .gen = list_gen, .t = icon_t, .napps = @intCast(napps), .pool_n = @intCast(pool_n) };
@@ -1003,7 +1003,7 @@ fn tryIcon(a: *App, path: [*:0]const u8, t: u32) bool {
     return true;
 }
 
-// ================================================================= поиск
+// ================================================================= search
 
 const Mode = enum(u8) { apps, cmds };
 var mode: Mode = .apps;
@@ -1013,7 +1013,7 @@ var last_len: usize = 0;
 var last_mode: ?Mode = null;
 
 const Hit = struct { idx: u16, alt: bool = false, score: u32 = 0 };
-const TYPED: u16 = 0xffff; // строка «выполнить набранное» во вкладке «Команды»
+const TYPED: u16 = 0xffff; // the "run what was typed" row in the "Commands" tab
 var hits: [MAX_EXES + 1]Hit = undefined;
 var nhits: usize = 0;
 var list: ui.List = .{};
@@ -1041,7 +1041,7 @@ fn appFields(a: *const App) [6]desk.Field {
     };
 }
 
-/// Оценка по словам запроса и по ним же в другой раскладке (чуть ниже).
+/// Score by the query words and by the same words in the other layout (slightly lower).
 fn rate(fields: []const desk.Field, h: *Hit) void {
     h.score = desk.scoreFields(fields, words[0..nwords]);
     if (nalt > 0) {
@@ -1118,7 +1118,7 @@ fn refilter() void {
     list.sel = 0;
     list.scroll = 0;
     list.setCount(nhits);
-    ui.kbd_nav = true; // подсвечена первая строка — её и запустит Enter
+    ui.kbd_nav = true; // the first row is highlighted — Enter launches it
 }
 
 fn setMode(m: Mode) void {
@@ -1127,23 +1127,23 @@ fn setMode(m: Mode) void {
     ui.redraw();
 }
 
-// ================================================================= запуск
+// ================================================================= launching
 
-/// Строка, которая подсвечена: под мышью или выбранная стрелками.
+/// The highlighted row: under the mouse or selected with the arrows.
 fn current() usize {
     if (!ui.kbd_nav and ui.hover.id == @intFromEnum(Wid.row)) return ui.hover.idx;
     return list.sel;
 }
 
 fn launch(pos: usize, term: bool, raw: bool) void {
-    if (broker_fd < 0) return ui.setMsg("Не удалось запустить процесс запуска");
+    if (broker_fd < 0) return ui.setMsg("Could not start the launch process");
     const flags: u8 = if (term) F_TERM else 0;
     switch (mode) {
         .apps => {
             if (pos >= nhits) return;
             var m = [4]u8{ 'A', 0, 0, flags };
             std.mem.writeInt(u16, m[1..3], hits[pos].idx, .little);
-            sys.sendAll(broker_fd, &m) catch return ui.setMsg("Процесс запуска не отвечает");
+            sys.sendAll(broker_fd, &m) catch return ui.setMsg("The launch process is not responding");
         },
         .cmds => {
             const q = std.mem.trim(u8, query.text(), " ");
@@ -1153,16 +1153,16 @@ fn launch(pos: usize, term: bool, raw: bool) void {
             m[0] = 'R';
             m[1] = flags;
             @memcpy(m[2..][0..cmd.len], cmd);
-            sys.sendAll(broker_fd, m[0 .. 2 + cmd.len]) catch return ui.setMsg("Процесс запуска не отвечает");
+            sys.sendAll(broker_fd, m[0 .. 2 + cmd.len]) catch return ui.setMsg("The launch process is not responding");
         },
     }
     ui.quit();
 }
 
-// ================================================================= окно
+// ================================================================= window
 
 const Wid = enum(u8) { none, tab, field, row };
-const tab_labels = [_][]const u8{ "Приложения", "Команды" };
+const tab_labels = [_][]const u8{ "Apps", "Commands" };
 
 fn wid(w: ui.Widget) Wid {
     return @enumFromInt(w.id);
@@ -1174,7 +1174,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     ui.begin("zrun");
     setupEnv();
     if (loadList()) {
-        sys.tracef("список из кэша: {d} приложений, {d} команд", .{ napps, nexes });
+        sys.tracef("list from cache: {d} apps, {d} commands", .{ napps, nexes });
     } else {
         loadExes();
         sortExes();
@@ -1182,12 +1182,12 @@ pub fn main(init: std.process.Init.Minimal) void {
         sortApps();
         iconSetup();
         saveList();
-        sys.tracef("список построен: {d} приложений, {d} команд", .{ napps, nexes });
+        sys.tracef("list built: {d} apps, {d} commands", .{ napps, nexes });
     }
-    sortApps(); // видимые по алфавиту (из кэша — заново: это быстро)
+    sortApps(); // visible ones alphabetically (from the cache too: it's fast)
     loadHistory();
     if (cfg.launcher_icons and icons_path.len > 0) {
-        icons_fd = sys.openCreate(icons_path.z()) catch -1; // пишется уже из песочницы
+        icons_fd = sys.openCreate(icons_path.z()) catch -1; // written from inside the sandbox
     }
     startBroker();
 
@@ -1209,7 +1209,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
 fn start() void {
     list.visible = cfg.launcher_rows;
-    ui.resetFocus(false); // фокус в поле поиска — и не уходит из него
+    ui.resetFocus(false); // focus is in the search field and stays there
 }
 
 fn close() void {
@@ -1260,7 +1260,7 @@ fn tabW(i: usize) f32 {
 }
 
 fn layout() void {
-    // поле изменилось (ввод, вставка, Ctrl+U) или вкладка — пересчитываем список
+    // the field changed (typing, paste, Ctrl+U) or the tab — recompute the list
     if (last_mode != mode or last_len != query.len or !std.mem.eql(u8, last_q[0..last_len], query.text())) refilter();
     ui.nwid = 0;
     const W = ui.W();
@@ -1285,17 +1285,13 @@ const ic_prompt = [_]draw.Prim{
     .{ .seg = .{ .x0 = 9, .y0 = 12.5, .x1 = 13, .y1 = 12.5 } },
 };
 
-fn plural(n: usize, one: []const u8, few: []const u8, many: []const u8) []const u8 {
-    const d = n % 10;
-    const h = n % 100;
-    if (d == 1 and h != 11) return one;
-    if (d >= 2 and d <= 4 and (h < 12 or h > 14)) return few;
-    return many;
+fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
+    return if (n == 1) one else many;
 }
 
 fn countLabel(b: []u8) []const u8 {
     const n = if (mode == .cmds and nhits > 0 and hits[0].idx == TYPED) nhits - 1 else nhits;
-    const word = if (mode == .apps) plural(n, "приложение", "приложения", "приложений") else plural(n, "команда", "команды", "команд");
+    const word = if (mode == .apps) plural(n, "app", "apps") else plural(n, "command", "commands");
     return std.fmt.bufPrint(b, "{d} {s}", .{ n, word }) catch "";
 }
 
@@ -1311,12 +1307,12 @@ fn paint(cv: *draw.Canvas) void {
                 } else if (ui.isHover(w)) ui.rrect(cv, w.x, w.y, w.w, w.h, w.h / 2, t.menu_hover);
                 ui.centered(cv, tab_labels[w.idx], w.x + w.w / 2, ui.mid(w.y, w.h, 13), 13, if (on) t.menu_text else t.menu_muted);
             },
-            .field => ui.field(cv, w, &query, if (mode == .apps) "Поиск приложений" else "Команда или программа", false, 0),
+            .field => ui.field(cv, w, &query, if (mode == .apps) "Search apps" else "Command or program", false, 0),
             .row => paintRow(cv, w),
             .none => {},
         }
     }
-    // справа от вкладок — сколько найдено (или ошибка)
+    // to the right of the tabs — how many were found (or an error)
     var b: [48]u8 = undefined;
     const err = ui.msg().len > 0;
     const info = if (err) ui.msg() else countLabel(&b);
@@ -1325,10 +1321,10 @@ fn paint(cv: *draw.Canvas) void {
     if (nhits == 0) {
         const cy = LIST_Y + @as(f32, @floatFromInt(list.visible)) * ROW_H / 2;
         const empty_all = (mode == .apps and nvis == 0) or (mode == .cmds and nexes == 0);
-        const title = if (empty_all) (if (mode == .apps) "Приложения не найдены" else "Команды не найдены") else "Ничего не найдено";
+        const title = if (empty_all) (if (mode == .apps) "No apps found" else "No commands found") else "Nothing found";
         const hint = if (empty_all)
-            (if (mode == .apps) "Нет .desktop-файлов в папках applications" else "Пустая переменная PATH")
-        else if (mode == .apps) "Tab — искать среди команд" else "";
+            (if (mode == .apps) "No .desktop files in the applications folders" else "PATH is empty")
+        else if (mode == .apps) "Tab — search commands" else "";
         ui.centered(cv, title, W / 2, cy - 4, 15, t.menu_text);
         if (hint.len > 0) ui.centered(cv, hint, W / 2, cy + 18, 12, t.menu_muted);
     }
@@ -1344,7 +1340,7 @@ fn paintAppIcon(cv: *draw.Canvas, a: *App, x: f32, y: f32) void {
         cv.argb(px, icon_t, icon_t, @intFromFloat(@round(x * ui.S)), @intFromFloat(@round(y * ui.S)));
         return;
     }
-    // заглушка: плитка с первой буквой названия
+    // placeholder: a tile with the first letter of the name
     tile(cv, x, y);
     const name = a.name.get();
     const len = @min(std.unicode.utf8ByteSequenceLength(name[0]) catch 1, name.len);
@@ -1378,7 +1374,7 @@ fn paintRow(cv: *draw.Canvas, w: ui.Widget) void {
             ui.icon(cv, &ic_prompt, ix + 8, iy + 8, 16, 1.6, if (typed) t.menu_accent else t.menu_muted);
             if (typed) {
                 _ = ui.text(cv, std.mem.trim(u8, query.text(), " "), tx, w.y + 20, 14, t.menu_text, right);
-                _ = ui.text(cv, "Выполнить · Shift+Enter — в терминале", tx, w.y + 37, 11.5, t.menu_muted, right);
+                _ = ui.text(cv, "Run · Shift+Enter — in a terminal", tx, w.y + 37, 11.5, t.menu_muted, right);
             } else {
                 const e = exes[h.idx];
                 const hl = desk.highlight(e.f_name.get(), hitWords(h));

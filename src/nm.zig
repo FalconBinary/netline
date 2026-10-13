@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Клиент NetworkManager поверх D-Bus: список сетей, подключение (открытые, WPA/WPA2/WPA3
-//! Personal, OWE, 802.1X: PEAP, TTLS, EAP-TLS), отключение, «забыть сеть», вкл/выкл радио.
-//! Сама аутентификация и шифрование выполняются системным демоном — пароли уходят ему по D-Bus.
+//! NetworkManager client over D-Bus: network list, connecting (open, WPA/WPA2/WPA3
+//! Personal, OWE, 802.1X: PEAP, TTLS, EAP-TLS), disconnecting, "forget network", radio on/off.
+//! Authentication and encryption are done by the system daemon — passwords go to it over D-Bus.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -27,7 +27,7 @@ pub const Path = struct {
 
     pub fn set(p: *Path, s: []const u8) void {
         const k = @min(s.len, p.buf.len);
-        std.mem.copyForwards(u8, p.buf[0..k], s[0..k]); // источник может быть этим же буфером
+        std.mem.copyForwards(u8, p.buf[0..k], s[0..k]); // the source may be this same buffer
         p.len = @intCast(k);
     }
     pub fn get(p: *const Path) []const u8 {
@@ -39,7 +39,7 @@ pub const Net = struct {
     ssid_buf: [32]u8 = undefined,
     ssid_len: u8 = 0,
     ap: Path = .{},
-    conn: Path = .{}, // сохранённое подключение (если известна)
+    conn: Path = .{}, // the saved connection (if known)
     strength: u8 = 0,
     sec: Security = .open,
     active: bool = false,
@@ -52,7 +52,7 @@ pub const Net = struct {
 
 pub const Eap = enum(u8) { peap, ttls, tls };
 
-/// Что нужно для нового подключения.
+/// What a new connection needs.
 pub const Spec = struct {
     ssid: []const u8,
     hidden: bool = false,
@@ -73,7 +73,7 @@ pub const Spec = struct {
 pub var bus: dbus.Conn = .{};
 pub var device: Path = .{};
 pub var wifi_enabled: bool = true;
-/// Текст последней ошибки (для показа пользователю).
+/// Text of the last error (to show to the user).
 pub var err_buf: [200]u8 = undefined;
 pub var err_len: usize = 0;
 
@@ -91,8 +91,8 @@ fn setError(msg: []const u8) void {
 fn call(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) ?dbus.Reply {
     const r = bus.call(NM, path, iface, member, sig, body) catch |e| {
         setError(switch (e) {
-            error.Timeout => "NetworkManager не отвечает",
-            else => "ошибка связи с NetworkManager",
+            error.Timeout => "NetworkManager is not responding",
+            else => "error talking to NetworkManager",
         });
         return null;
     };
@@ -103,7 +103,7 @@ fn call(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8
     return r;
 }
 
-/// Прочитать свойство: возвращает читатель, стоящий на значении, и его сигнатуру.
+/// Read a property: returns a reader positioned at the value, and its signature.
 fn getProp(path: []const u8, iface: []const u8, name: []const u8) ?struct { r: dbus.R, sig: []const u8 } {
     var w = dbus.W{ .buf = &body_buf };
     w.str(iface);
@@ -120,18 +120,18 @@ fn getU32(path: []const u8, iface: []const u8, name: []const u8) ?u32 {
     return p.r.u32_();
 }
 
-// ================================================================= инициализация
+// ================================================================= initialization
 
 pub fn init() bool {
     bus.connectSystem() catch {
-        setError("нет доступа к системной шине D-Bus");
+        setError("no access to the D-Bus system bus");
         return false;
     };
     const rep = call(NM_PATH, NM, "GetDevices", "", "") orelse {
-        setError("NetworkManager не запущен");
+        setError("NetworkManager is not running");
         return false;
     };
-    // копируем пути: следующий вызов перезапишет буфер ответа
+    // copy the paths: the next call overwrites the reply buffer
     var paths: [32]Path = undefined;
     var n: usize = 0;
     var r = rep.reader();
@@ -147,12 +147,12 @@ pub fn init() bool {
         }
     }
     if (device.len == 0) {
-        setError("Wi‑Fi адаптер не найден");
+        setError("Wi‑Fi adapter not found");
         return false;
     }
-    // Подписки: всё от нашего устройства (смена состояния — так не теряется причина неудачи;
-    // точки доступа появились/исчезли, закончился поиск — LastScan) и включение радио.
-    // Меню узнаёт о новых сетях и о ходе подключения сразу, а не опросом.
+    // Subscriptions: everything from our device (state changes — so the failure reason isn't lost;
+    // access points added/removed, scan finished — LastScan) and radio power.
+    // The menu learns about new networks and connection progress right away, not by polling.
     var rule_buf: [400]u8 = undefined;
     addMatch(sys.joinZ(&rule_buf, &.{ "type='signal',sender='", NM, "',path='", device.get(), "'" }));
     addMatch("type='signal',sender='" ++ NM ++ "',path='" ++ NM_PATH ++ "',member='PropertiesChanged'");
@@ -167,17 +167,17 @@ fn addMatch(rule: []const u8) void {
     _ = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes()) catch {};
 }
 
-/// Последняя причина перехода устройства в FAILED (0 — не было).
+/// The last reason the device went to FAILED (0 — none).
 var fail_reason: u32 = 0;
-/// Список сетей изменился (новые/пропавшие точки, закончился поиск) — стоит перечитать.
+/// The network list changed (new/vanished access points, scan finished) — worth rereading.
 pub var nets_changed = false;
-/// Устройство сменило состояние — стоит проверить ход подключения.
+/// The device changed state — worth checking the connection progress.
 pub var state_changed = false;
 
 fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
     const eql = std.mem.eql;
     if (eql(u8, path, NM_PATH)) {
-        // включили/выключили радио (например, правым кликом по значку на панели)
+        // the radio was turned on/off (e.g. by right-clicking the panel icon)
         if (!eql(u8, member, "PropertiesChanged") or !eql(u8, sig, "sa{sv}as")) return;
         var r = dbus.R{ .d = body };
         if (!eql(u8, r.str(), NM)) return;
@@ -207,7 +207,7 @@ fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []cons
     } else if (eql(u8, iface, WIFI) and (eql(u8, member, "AccessPointAdded") or eql(u8, member, "AccessPointRemoved"))) {
         nets_changed = true;
     } else if (eql(u8, member, "PropertiesChanged")) {
-        // LastScan, AccessPoints, ActiveAccessPoint у Device.Wireless (старые NM шлют сигнал от имени интерфейса)
+        // LastScan, AccessPoints, ActiveAccessPoint of Device.Wireless (old NM send the signal on behalf of the interface)
         var r = dbus.R{ .d = body };
         if (eql(u8, iface, WIFI) or (eql(u8, sig, "sa{sv}as") and eql(u8, r.str(), WIFI))) nets_changed = true;
     }
@@ -229,22 +229,22 @@ pub fn setEnabled(on: bool) bool {
     return true;
 }
 
-/// Попросить NM поискать сети. Ответа не ждём («слишком часто» — не страшно):
-/// о результатах скажут сигналы AccessPointAdded и LastScan.
+/// Ask NM to scan for networks. We don't wait for the reply ("too often" is harmless):
+/// the AccessPointAdded and LastScan signals report the results.
 pub fn scan() void {
     var w = dbus.W{ .buf = &body_buf };
-    const a = w.arrayBegin(8); // пустой a{sv}
+    const a = w.arrayBegin(8); // empty a{sv}
     w.arrayEnd(a);
     bus.callNoReply(NM, device.get(), WIFI, "RequestScan", "a{sv}", w.bytes());
 }
 
-// ================================================================= список сетей
+// ================================================================= network list
 
 const Saved = struct { path: Path = .{}, ssid: [32]u8 = undefined, ssid_len: u8 = 0 };
 var saved: [64]Saved = undefined;
 var nsaved: usize = 0;
 
-/// Перечитать сохранённые Wi‑Fi-подключения (путь + SSID).
+/// Reread the saved Wi‑Fi connections (path + SSID).
 pub fn loadSaved() void {
     nsaved = 0;
     const rep = call("/org/freedesktop/NetworkManager/Settings", SETTINGS, "ListConnections", "", "") orelse return;
@@ -256,7 +256,7 @@ pub fn loadSaved() void {
         paths[n].set(r.str());
         n += 1;
     }
-    // GetSettings для всех профилей — пачками, а не по одному вызову с ожиданием
+    // GetSettings for all profiles — in batches, not one call at a time with a wait each
     var start: usize = 0;
     while (start < n) : (start += BATCH) {
         const stop = @min(n, start + BATCH);
@@ -265,13 +265,13 @@ pub fn loadSaved() void {
             serials[i] = bus.sendCall(NM, p.get(), CONN, "GetSettings", "", "") catch 0;
         }
         bus.collect(serials[0 .. stop - start], paths[start..stop], gotSettings) catch {
-            setError("ошибка связи с NetworkManager");
+            setError("error talking to NetworkManager");
             return;
         };
     }
 }
 
-/// Сколько вызовов отправлять одной пачкой (у системной шины лимит ожидающих ответов).
+/// How many calls to send in one batch (the system bus limits pending replies).
 const BATCH = 32;
 
 fn gotSettings(paths: []Path, i: usize, s: dbus.Reply) void {
@@ -321,17 +321,17 @@ fn savedFor(ssid: []const u8) ?*const Saved {
 fn securityOf(flags: u32, wpa: u32, rsn: u32) Security {
     const km = wpa | rsn;
     if (km & 0x200 != 0 or km & 0x2000 != 0) return .eap; // 802.1X, Suite-B
-    if (km & 0x100 != 0) return .psk; // PSK (в т.ч. смешанный PSK/SAE)
-    if (km & 0x400 != 0) return .sae; // только WPA3 Personal
+    if (km & 0x100 != 0) return .psk; // PSK (including mixed PSK/SAE)
+    if (km & 0x400 != 0) return .sae; // WPA3 Personal only
     if (km & 0x800 != 0) return .owe; // Enhanced Open
     if (flags & 1 != 0) return .wep;
     return .open;
 }
 
-/// Заполнить список видимых сетей (по одной на SSID, самая сильная точка). Возвращает число.
+/// Fill the list of visible networks (one per SSID, the strongest access point). Returns the count.
 pub fn networks(out: []Net) usize {
     nets_changed = false;
-    // активная точка и список точек — одной пачкой, одно ожидание вместо двух
+    // active access point and the access point list in one batch, one wait instead of two
     var head = Head{};
     {
         var w = dbus.W{ .buf = &body_buf };
@@ -342,11 +342,11 @@ pub fn networks(out: []Net) usize {
             bus.sendCall(NM, device.get(), WIFI, "GetAllAccessPoints", "", "") catch 0,
         };
         if (serials[1] == 0) {
-            setError("ошибка связи с NetworkManager");
+            setError("error talking to NetworkManager");
             return 0;
         }
         bus.collect(&serials, &head, gotHead) catch {
-            setError("ошибка связи с NetworkManager");
+            setError("error talking to NetworkManager");
             return 0;
         };
     }
@@ -368,7 +368,7 @@ pub fn networks(out: []Net) usize {
         }
         ctx.base = start;
         bus.collect(serials[0 .. stop - start], &ctx, gotAp) catch {
-            setError("ошибка связи с NetworkManager");
+            setError("error talking to NetworkManager");
             break;
         };
     }
@@ -378,7 +378,7 @@ pub fn networks(out: []Net) usize {
             net.conn = sv.path;
         }
     }
-    // активная сверху, затем по силе сигнала
+    // active on top, then by signal strength
     std.mem.sort(Net, out[0..n], {}, struct {
         fn lt(_: void, a: Net, b: Net) bool {
             if (a.active != b.active) return a.active;
@@ -413,7 +413,7 @@ fn gotHead(h: *Head, i: usize, rep: dbus.Reply) void {
 
 const ApCtx = struct { aps: []Path, out: []Net, n: *usize, active: []const u8, base: usize = 0 };
 
-/// Свойства одной точки доступа → строка списка (по одной на SSID, самая сильная точка).
+/// Properties of one access point → a list row (one per SSID, the strongest access point).
 fn gotAp(ctx: *ApCtx, i: usize, props: dbus.Reply) void {
     if (!props.ok()) return;
     const ap = &ctx.aps[ctx.base + i];
@@ -448,11 +448,11 @@ fn gotAp(ctx: *ApCtx, i: usize, props: dbus.Reply) void {
                 rsn = pr.u32_();
             } else pr.skip(vs);
         }
-        if (pr.bad or net.ssid_len == 0) return; // скрытые сети в списке не показываем
+        if (pr.bad or net.ssid_len == 0) return; // hidden networks are not shown in the list
         net.sec = securityOf(flags, wpa, rsn);
         net.active = std.mem.eql(u8, ap.get(), ctx.active);
 
-        // одна строка на SSID: оставляем самую сильную точку (но активную — всегда)
+        // one row per SSID: keep the strongest access point (but the active one always)
         var dup: ?usize = null;
         for (out[0..n], 0..) |*o, k| {
             if (std.mem.eql(u8, o.ssid(), net.ssid())) dup = k;
@@ -467,11 +467,11 @@ fn gotAp(ctx: *ApCtx, i: usize, props: dbus.Reply) void {
     }
 }
 
-// ================================================================= действия
+// ================================================================= actions
 
-/// Путь активного подключения, которое сейчас поднимается (для отслеживания).
+/// Path of the active connection currently coming up (for tracking).
 pub var activating: Path = .{};
-/// Путь сохранённого профиля, созданного нами (удаляется, если подключиться не удалось).
+/// Path of the saved profile we created (removed if the connection failed).
 pub var created: Path = .{};
 
 pub fn activateSaved(conn: []const u8, ap: []const u8) bool {
@@ -488,7 +488,7 @@ pub fn activateSaved(conn: []const u8, ap: []const u8) bool {
 }
 
 fn fileUri(buf: []u8, path: []const u8) []const u8 {
-    // file:///абсолютный/путь\0 ; "~/" раскрываем в $HOME
+    // file:///absolute/path\0 ; "~/" is expanded to $HOME
     var p = path;
     var home: []const u8 = "";
     if (std.mem.startsWith(u8, p, "~/")) {
@@ -496,7 +496,7 @@ fn fileUri(buf: []u8, path: []const u8) []const u8 {
         p = p[1..];
     }
     const z = sys.joinZ(buf, &.{ "file://", home, p });
-    return buf[0 .. z.len + 1]; // вместе с завершающим нулём
+    return buf[0 .. z.len + 1]; // including the terminating zero
 }
 
 pub fn addAndActivate(spec: Spec, ap: []const u8) bool {
@@ -547,7 +547,7 @@ pub fn addAndActivate(spec: Spec, ap: []const u8) bool {
             },
             .tls => {
                 w.kvBytes("client-cert", fileUri(&b1, spec.client_cert));
-                // для .p12/.pfx ключ лежит в том же файле
+                // for .p12/.pfx the key is in the same file
                 w.kvBytes("private-key", fileUri(&b2, if (spec.private_key.len > 0) spec.private_key else spec.client_cert));
                 if (spec.key_password.len > 0) w.kvStr("private-key-password", spec.key_password);
             },
@@ -564,7 +564,7 @@ pub fn addAndActivate(spec: Spec, ap: []const u8) bool {
     w.str(device.get());
     w.str(if (ap.len > 0 and !spec.hidden) ap else "/");
     if (w.overflow) {
-        setError("слишком длинные данные");
+        setError("data is too long");
         return false;
     }
     const ok = blk: {
@@ -574,7 +574,7 @@ pub fn addAndActivate(spec: Spec, ap: []const u8) bool {
         activating.set(r.str());
         break :blk !r.bad;
     };
-    // в буферах были пароли — затираем сразу после отправки
+    // the buffers held passwords — wipe them right after sending
     secureZero(&body_buf);
     secureZero(bus.out);
     return ok;
@@ -582,11 +582,11 @@ pub fn addAndActivate(spec: Spec, ap: []const u8) bool {
 
 pub const Progress = enum { working, done, failed };
 
-/// Состояние текущего подключения. При ошибке — причина в lastError().
+/// State of the current connection. On error the reason is in lastError().
 pub fn progress() Progress {
     if (activating.len == 0) return .failed;
     var p = getProp(activating.get(), ACTIVE, "State") orelse {
-        // объект исчез — активация отменена/провалена
+        // the object is gone — activation was canceled/failed
         failReason();
         return .failed;
     };
@@ -612,12 +612,12 @@ fn failReason() void {
         }
     }
     setError(switch (reason) {
-        7, 8 => "Неверный пароль или логин",
-        9, 10 => "Ошибка аутентификации 802.1X — проверьте метод и сертификаты",
-        11 => "Сервер не ответил на аутентификацию",
-        5, 6 => "Не удалось получить IP-адрес",
-        53 => "Сеть не найдена",
-        else => "Не удалось подключиться",
+        7, 8 => "Wrong password or login",
+        9, 10 => "802.1X authentication error — check the method and certificates",
+        11 => "The server did not respond to authentication",
+        5, 6 => "Could not get an IP address",
+        53 => "Network not found",
+        else => "Could not connect",
     });
 }
 
@@ -631,7 +631,7 @@ pub fn forget(conn: []const u8) bool {
     return true;
 }
 
-/// Удалить профиль, который мы только что создали (если подключение не удалось).
+/// Remove the profile we just created (if the connection failed).
 pub fn dropCreated() void {
     if (created.len > 0) _ = forget(created.get());
     created.len = 0;

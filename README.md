@@ -1,152 +1,152 @@
-# zpanel
+# netline
 
-Минималистичная панель для **MangoWM** на чистом Zig: без libwayland, без libc, без сторонних библиотек.
-Wayland-протокол, отрисовка, шрифты, иконки, клиент D-Bus и декодеры JPEG/PNG сделаны вручную.
+A minimalist panel for **MangoWM** in pure Zig: no libwayland, no libc, no third-party libraries.
+The Wayland protocol, rendering, fonts, icons, the D-Bus client and the JPEG/PNG decoders are all hand-written.
 
-Каждый значок открывает своё меню в одном стиле — и у каждого меню свой клиент, без внешних утилит:
+Every icon opens its own menu in the same style — and every menu has its own client, with no external utilities:
 
-| Программа | Что это | С чем говорит |
+| Program | What it is | Talks to |
 |---|---|---|
-| **zpanel** | сама панель | Wayland, IPC mango, ядро (netlink) |
-| **zrun** | лаунчер приложений и команд (вместо rofi) | .desktop-файлы, PATH |
-| **zwifi** | меню Wi‑Fi, в том числе корпоративные сети 802.1X | NetworkManager по D-Bus |
-| **zbt** | меню Bluetooth: подключение, сопряжение, батарея | BlueZ по D-Bus |
-| **zwall** | выбор обоев с превью | демон zbg |
-| **zbg** | демон обоев (вместо swaybg) | Wayland |
-| **zpower** | блокировка, выход, сон, гибернация, перезагрузка, выключение | systemd-logind по D-Bus, IPC mango |
-| **zcal** | календарь по клику на часы | — |
+| **netline** | the panel itself | Wayland, mango IPC, the kernel (netlink) |
+| **zrun** | app and command launcher (instead of rofi) | .desktop files, PATH |
+| **zwifi** | Wi‑Fi menu, including 802.1X enterprise networks | NetworkManager over D-Bus |
+| **zbt** | Bluetooth menu: connecting, pairing, battery | BlueZ over D-Bus |
+| **zwall** | wallpaper picker with thumbnails | the zbg daemon |
+| **zbg** | wallpaper daemon (instead of swaybg) | Wayland |
+| **zpower** | lock, log out, sleep, hibernate, reboot, power off | systemd-logind over D-Bus, mango IPC |
+| **zcal** | calendar on a click on the clock | — |
 
 ```
-[ ⠿  ━━ • • · · ● · · · ]   Пн, 12 октября 2026  13:31   [ wifi  bt  обои  ⏻ ]
+[ ⠿  ━━ • • · · ● · · · ]   Mon, 12 October 2026  13:31   [ wifi  bt  wallpaper  ⏻ ]
 ```
 
-## Что есть
+## Features
 
-| Элемент | ЛКМ | ПКМ |
+| Item | Left click | Right click |
 |---|---|---|
-| Лаунчер (сетка точек) | приложения **zrun** | команды **zrun run** |
-| Теги mango | перейти на тег | toggleview |
-| Колёсико над панелью | — | следующий / предыдущий тег |
-| Часы (по центру) | календарь **zcal** | — |
-| Wi‑Fi | меню **zwifi** | вкл/выкл Wi‑Fi |
-| Bluetooth | меню **zbt** | вкл/выкл Bluetooth |
-| Обои | выбор **zwall** | случайные обои |
-| Питание | меню **zpower** | заблокировать |
+| Launcher (dot grid) | apps **zrun** | commands **zrun run** |
+| mango tags | go to tag | toggleview |
+| Wheel over the panel | — | next / previous tag |
+| Clock (centered) | calendar **zcal** | — |
+| Wi‑Fi | **zwifi** menu | Wi‑Fi on/off |
+| Bluetooth | **zbt** menu | Bluetooth on/off |
+| Wallpaper | **zwall** picker | random wallpaper |
+| Power | **zpower** menu | lock |
 
-Теги: активный — «таблетка», занятый — яркая точка, пустой — тусклая, срочный — красная.
-Можно переключить на цифры (`tag_style = .numbers`).
+Tags: active — a "pill", occupied — a bright dot, empty — a dim one, urgent — red.
+Can be switched to numbers (`tag_style = .numbers`).
 
-## Меню
+## Menus
 
-Все меню устроены одинаково: карточка по центру экрана, вокруг — лёгкое затемнение.
-Клик мимо карточки или `Esc` закрывает меню, повторный клик по значку — тоже.
-Пока меню закрыто, его программа не запущена и ничего не потребляет.
-Управление с клавиатуры: `Tab`/`Shift+Tab` — по кнопкам и полям, стрелки — по спискам, `Enter`, `Esc` — назад/закрыть.
-Цвета — поля `menu_*` в файле темы, меню подхватывают изменения на лету.
+All menus work the same way: a card in the center of the screen with a light dimming around it.
+A click outside the card or `Esc` closes the menu, and so does another click on the icon.
+While a menu is closed, its program isn't running and uses nothing.
+Keyboard control: `Tab`/`Shift+Tab` — through buttons and fields, arrows — through lists, `Enter`, `Esc` — back/close.
+Colors are the `menu_*` fields in the theme file; menus pick up changes on the fly.
 
-### Лаунчер: zrun
+### Launcher: zrun
 
-- **Приложения** — из `.desktop`-файлов в папках XDG (`~/.local/share/applications`, `/usr/share/applications`,
-  Flatpak): названия на языке системы, `NoDisplay`, `Hidden`, `TryExec`, `OnlyShowIn`/`NotShowIn` учитываются,
-  свой файл в `~/.local/share/applications` перекрывает системный с тем же именем.
-- **Команды** — всё из `PATH`; первая строка — «выполнить набранное как есть» (через `/bin/sh -c`).
-- **Поиск** без учёта регистра и `ё`/`е`: по названию (в том числе английскому), имени программы, описанию и ключевым
-  словам. Сначала совпадения с начала слова, потом внутри слова, потом нечёткие («gte» → GNOME Text Editor);
-  совпавшие буквы подсвечиваются. Запрос в не той раскладке тоже находит: «ашкуащч» — это firefox.
-- **Часто запускаемое — выше.** Счётчики в `~/.cache/zpanel/zrun-history`; из «Команд» туда попадают только
-  имена программ, набранные строки с аргументами не сохраняются.
-- **Иконки** — PNG из темы иконок (`icon_theme` или тема GTK, затем hicolor), под масштаб экрана, грузятся только
-  для показанных строк. SVG не читаются: если PNG нет — плитка с первой буквой. `launcher_icons = false` — только плитки.
-- **Быстрый запуск.** Список приложений и команд кэшируется в `~/.cache/zpanel/zrun-cache` вместе с «отпечатками»
-  (время изменения, размер, inode) всего, что читалось: папок `PATH` и `applications`, каждого `.desktop`-файла,
-  папок тем иконок. При запуске сверяются только отпечатки, а не сотни файлов; изменилось хоть что-то
-  (установили программу, поправили `.desktop`) — список строится заново. Иконки, уже уменьшенные под экран,
-  лежат в `zrun-icons`, там же отмечено, у кого иконки нет. Кэш можно просто удалить.
+- **Apps** — from `.desktop` files in the XDG folders (`~/.local/share/applications`, `/usr/share/applications`,
+  Flatpak): names in the system language; `NoDisplay`, `Hidden`, `TryExec`, `OnlyShowIn`/`NotShowIn` are honored;
+  your own file in `~/.local/share/applications` overrides a system one with the same name.
+- **Commands** — everything in `PATH`; the first row is "run what was typed as is" (via `/bin/sh -c`).
+- **Search** is case-insensitive (and treats Cyrillic `ё`/`е` alike): by name (including the untranslated one), program name, description and
+  keywords. Matches at the start of a word come first, then inside a word, then fuzzy ones ("gte" → GNOME Text Editor);
+  matched letters are highlighted. A query typed in the wrong layout (Russian ЙЦУКЕН instead of QWERTY) is found too: "ашкуащч" is firefox.
+- **Frequently launched entries rank higher.** Counters live in `~/.cache/netline/zrun-history`; from "Commands" only
+  program names go there, typed lines with arguments are not saved.
+- **Icons** — PNG from the icon theme (`icon_theme` or the GTK theme, then hicolor), sized for the screen scale, loaded only
+  for the rows shown. SVG is not read: if there is no PNG, a tile with the first letter is drawn. `launcher_icons = false` — tiles only.
+- **Fast startup.** The app and command list is cached in `~/.cache/netline/zrun-cache` along with "fingerprints"
+  (modification time, size, inode) of everything that was read: the `PATH` and `applications` folders, every `.desktop` file,
+  the icon theme folders. At startup only the fingerprints are compared, not hundreds of files; if anything changed
+  (a program was installed, a `.desktop` file edited), the list is rebuilt. Icons already scaled for the screen
+  live in `zrun-icons`, which also records which entries have no icon. The cache can simply be deleted.
 
-Клавиши: ввод — поиск, `↑`/`↓` (или `Ctrl+P`/`Ctrl+N`, `Ctrl+K`/`Ctrl+J`), `PgUp`/`PgDn`, `Enter` — запустить,
-`Shift+Enter` — запустить в терминале (`terminal` в `config.zig`), `Tab` — другая вкладка, `Esc` — закрыть.
-Во вкладке «Команды» `Ctrl+Enter` выполняет набранную строку как есть, даже если она совпала с именем программы.
-`zrun run` открывает сразу «Команды».
+Keys: typing — search, `↑`/`↓` (or `Ctrl+P`/`Ctrl+N`, `Ctrl+K`/`Ctrl+J`), `PgUp`/`PgDn`, `Enter` — launch,
+`Shift+Enter` — launch in a terminal (`terminal` in `config.zig`), `Tab` — the other tab, `Esc` — close.
+In the "Commands" tab `Ctrl+Enter` runs the typed line as is, even if it matches a program name.
+`zrun run` opens "Commands" right away.
 
-Приложения запускаются без shell: строка `Exec` разбирается по спецификации (кавычки, `%i`, `%c`, `%k`;
-`%f`/`%u` убираются), рабочая папка — `Path=` или домашняя, `Terminal=true` — в терминале.
+Apps are launched without a shell: the `Exec` line is parsed per the spec (quotes, `%i`, `%c`, `%k`;
+`%f`/`%u` are removed), the working folder is `Path=` or home, `Terminal=true` runs in a terminal.
 
 ### Wi‑Fi: zwifi
 
-- **Список сетей**: уровень сигнала, замок для защищённых, пометка `802.1X` для корпоративных,
-  галочка у текущей. Сохранённые сети подключаются одним кликом; у них есть кнопка `⋯` — «Отключиться» и «Забыть сеть».
-- **Личные сети**: открытые, OWE, WPA/WPA2 и WPA3 (SAE) — пароль можно показать кнопкой с глазом.
-- **Корпоративные сети 802.1X**:
-  - PEAP — фаза 2 MSCHAPv2, GTC или MD5;
-  - TTLS — фаза 2 PAP, MSCHAPv2, MSCHAP или CHAP;
-  - EAP-TLS — по сертификату: `.p12`/`.pfx` или пара сертификат + ключ, пароль ключа;
-  - анонимный логин, CA-сертификат (путь, `~/` раскрывается) и домен сервера для его проверки.
-    Если указан только домен, сервер проверяется по системным сертификатам.
-    Без CA и домена меню предупреждает, что сервер не проверяется.
-- **Скрытые сети** — кнопка «Другая сеть…».
-- **Неверный пароль** распознаётся, неудачный профиль удаляется, данные остаются в форме для исправления.
+- **Network list**: signal level, a lock for secured networks, an `802.1X` mark for enterprise ones,
+  a check mark on the current one. Saved networks connect with one click; they have a `⋯` button — "Disconnect" and "Forget network".
+- **Personal networks**: open, OWE, WPA/WPA2 and WPA3 (SAE) — the password can be revealed with the eye button.
+- **802.1X enterprise networks**:
+  - PEAP — phase 2 MSCHAPv2, GTC or MD5;
+  - TTLS — phase 2 PAP, MSCHAPv2, MSCHAP or CHAP;
+  - EAP-TLS — by certificate: `.p12`/`.pfx` or a certificate + key pair, key password;
+  - anonymous login, CA certificate (a path, `~/` is expanded) and the server domain to verify it.
+    If only the domain is given, the server is verified against the system certificates.
+    Without a CA and domain the menu warns that the server is not verified.
+- **Hidden networks** — the "Other network…" button.
+- **A wrong password** is detected, the failed profile is removed, and the data stays in the form for correction.
 
-`Ctrl+V` — вставить, `Ctrl+U` — очистить поле. Ввод учитывает раскладку (латиница и кириллица), Shift и Caps Lock.
-Аутентификацию и шифрование выполняет NetworkManager (wpa_supplicant/iwd под ним): пароль передаётся ему один раз
-и хранится в его профилях (доступны только root). В памяти zwifi пароли затираются сразу после отправки и при выходе.
+`Ctrl+V` — paste, `Ctrl+U` — clear the field. Input follows the keyboard layout (Latin and Cyrillic), Shift and Caps Lock.
+Authentication and encryption are done by NetworkManager (with wpa_supplicant/iwd underneath): the password is passed to it once
+and stored in its profiles (readable by root only). In zwifi's memory passwords are wiped right after sending and on exit.
 
 ### Bluetooth: zbt
 
-- **Сопряжённые устройства** с иконкой по типу (наушники, колонка, клавиатура, мышь, геймпад, телефон, компьютер),
-  состоянием и зарядом батареи («Подключено · 80%»). Клик — подключить; для подключённого (а также по кнопке `⋯`
-  или ПКМ) — действия «Отключить» и «Забыть устройство».
-- **Добавить устройство** — поиск новых и сопряжение со своим агентом: подтверждение кода (на обоих экранах одинаковые
-  цифры), показ кода для ввода на клавиатуре, ввод PIN для старых устройств. Новое устройство сразу становится доверенным и подключается.
-- **Переключатель** включает адаптер (снимает и программную блокировку rfkill).
-- **Устройства без экрана** (наушники, колонки, мыши, геймпады) сопрягаются без кода: подтверждение zbt даёт сам,
-  а старым устройствам с зашитым PIN сначала пробует `0000`, затем `1234`; не подошли — спросит PIN.
-  Сопряжение без кода («Just Works») zbt подтверждает сам для любого выбранного устройства.
-- В поиске показываются устройства с именем или известным типом; безымянный BLE-шум (чужие телефоны, метки) скрыт.
-- **Диагностика:** `zbt scan [секунды]` — поиск (по умолчанию 20 секунд) и полный список того, что видит bluetoothd: тип устройства, классическое или BLE, производитель; если показывать в меню нечего — подсказка, что сделать.
+- **Paired devices** with an icon by type (headphones, speaker, keyboard, mouse, gamepad, phone, computer),
+  state and battery level ("Connected · 80%"). A click connects; for a connected device (and via the `⋯` button
+  or right click) there are "Disconnect" and "Forget device".
+- **Add device** — discovering new devices and pairing with our own agent: passkey confirmation (the same digits
+  on both screens), showing a passkey to type on a keyboard, PIN entry for old devices. A new device is trusted and connected right away.
+- **The toggle** powers the adapter (and lifts the rfkill soft block).
+- **Devices without a screen** (headphones, speakers, mice, gamepads) pair without a code: zbt confirms by itself,
+  and for old devices with a hard-wired PIN it first tries `0000`, then `1234`; if those fail it asks for the PIN.
+  Code-less pairing ("Just Works") is confirmed by zbt itself for any device you selected.
+- Discovery shows devices with a name or a known type; nameless BLE noise (other people's phones, tags) is hidden.
+- **Diagnostics:** `zbt scan [seconds]` — discovery (20 seconds by default) and the full list of what bluetoothd sees: device type, classic or BLE, manufacturer; if there is nothing to show in the menu, a hint on what to do.
 
-Агент сопряжения принимает запросы только от самого bluetoothd: чужая программа на шине не может подсунуть
-поддельный запрос. Отмена или закрытие меню во время сопряжения отклоняет запрос устройства.
+The pairing agent accepts requests only from bluetoothd itself: another program on the bus cannot slip in
+a forged request. Canceling or closing the menu during pairing rejects the device's request.
 
-### Обои: zwall и zbg
+### Wallpaper: zwall and zbg
 
-**zbg** — демон, который рисует обои на всех мониторах (вместо swaybg). Мониторы можно подключать и отключать на ходу,
-поддерживаются целый и дробный масштаб (картинка рендерится в родном разрешении экрана, без мыла).
-Выбор запоминается в `~/.cache/zpanel/wallpaper` и восстанавливается при запуске.
+**zbg** is a daemon that draws the wallpaper on all monitors (instead of swaybg). Monitors can be plugged and unplugged on the fly,
+integer and fractional scale are supported (the image is rendered at the screen's native resolution, no blur).
+The choice is remembered in `~/.cache/netline/wallpaper` and restored at startup.
 
-**zwall** — сетка превью из папки обоев (`wallpaper_dir`, по умолчанию `~/Pictures/wallpapers`):
+**zwall** is a grid of thumbnails from the wallpaper folder (`wallpaper_dir`, `~/Pictures/wallpapers` by default):
 
-- клик — обои меняются сразу, меню остаётся открытым, можно перебрать несколько подряд;
-- «Случайные» — случайные обои (то же делает ПКМ по значку: `zwall random`);
-- стрелки, `PgUp`/`PgDn`, `Home`/`End` и колёсико — навигация, `Enter` — применить;
-- превью делаются в фоне (видимые первыми) и кэшируются в `~/.cache/zpanel/thumbs`, повторное открытие — мгновенное;
-  превью удалённых файлов из кэша убираются. В памяти — только превью видимого экрана и экрана сверху и снизу
-  (не больше 36), сразу в размере плитки на экране: ~1,5 МБ при масштабе 1×, ~6 МБ при 2×; кадр рисует их
-  пиксель в пиксель, без пересчёта. Остальные подгружаются из кэша при прокрутке.
+- a click changes the wallpaper right away, the menu stays open, you can try several in a row;
+- "Random" — a random wallpaper (a right click on the icon does the same: `zwall random`);
+- arrows, `PgUp`/`PgDn`, `Home`/`End` and the wheel — navigation, `Enter` — apply;
+- thumbnails are made in the background (visible ones first) and cached in `~/.cache/netline/thumbs`, so reopening is instant;
+  thumbnails of deleted files are removed from the cache. Only the thumbnails of the visible screen and the screens above and below
+  (at most 36) are kept in memory, right at the on-screen tile size: ~1.5 MB at 1× scale, ~6 MB at 2×; the frame draws them
+  pixel for pixel, with no rescaling. The rest are loaded from the cache while scrolling.
 
-Форматы: **JPEG** (baseline и progressive, EXIF-поворот) и **PNG** (все типы, прозрачность, interlace).
-Не поддерживаются WebP, AVIF, HEIC, а также редкие JPEG (CMYK, lossless, арифметическое кодирование) —
-такие файлы помечаются «не открывается». Битый или недокачанный файл обои не испортит: zbg сначала декодирует
-картинку и только потом меняет обои. `wallpaper_mode` — `.fill` (заполнить с обрезкой) или `.fit` (целиком, поля цвета `desktop`).
+Formats: **JPEG** (baseline and progressive, EXIF rotation) and **PNG** (all types, transparency, interlace).
+WebP, AVIF, HEIC and rare JPEGs (CMYK, lossless, arithmetic coding) are not supported —
+such files are marked "can't open". A broken or partly downloaded file won't spoil the wallpaper: zbg decodes
+the image first and only then switches. `wallpaper_mode` — `.fill` (fill with cropping) or `.fit` (whole, with `desktop`-colored borders).
 
-### Питание: zpower
+### Power: zpower
 
-Блокировка, выход из сессии, сон, гибернация, перезагрузка, выключение — показываются только действия,
-доступные в системе (то, что разрешает logind). Горячие клавиши: `L` — блокировка, `E` — выход, `S` — сон,
-`H` — гибернация, `R` — перезагрузка, `P` — выключение. Выход, перезагрузка и выключение спрашивают подтверждение
-(повторное нажатие той же клавиши — «да»; отключается `power_confirm = false`). Перед сном экран блокируется
-(`lock_before_suspend`). Если polkit не разрешает действие, меню так и пишет.
+Lock, log out, sleep, hibernate, reboot, power off — only the actions
+available on the system (what logind allows) are shown. Hotkeys: `L` — lock, `E` — log out, `S` — sleep,
+`H` — hibernate, `R` — reboot, `P` — power off. Log out, reboot and power off ask for confirmation
+(pressing the same key again means "yes"; turned off with `power_confirm = false`). The screen is locked before sleep
+(`lock_before_suspend`). If polkit doesn't allow an action, the menu says so.
 
-Выключение и сон — через systemd-logind по D-Bus (без `systemctl`), выход — через IPC mango (`quit`), а если mango
-недоступен — через logind. В шапке — пользователь, имя машины и время работы.
+Power off and sleep go through systemd-logind over D-Bus (no `systemctl`), log out through the mango IPC (`quit`), or through
+logind if mango is unavailable. The header shows the user, host name and uptime.
 
-### Календарь: zcal
+### Calendar: zcal
 
-Месяц с выделенным «сегодня», неделя с понедельника, выходные выделены цветом.
-`←`/`→` (или `PgUp`/`PgDn`, колёсико) — месяц, `↑`/`↓` — год, `Home` или клик по названию месяца — к сегодняшнему дню.
+The month with "today" highlighted, weeks start on Monday, weekends are colored.
+`←`/`→` (or `PgUp`/`PgDn`, the wheel) — month, `↑`/`↓` — year, `Home` or a click on the month name — back to today.
 
-### Горячие клавиши в mango
+### Hotkeys in mango
 
-Каждое меню можно открыть и с клавиатуры, например в `~/.config/mango/config.conf`:
+Every menu can also be opened from the keyboard, e.g. in `~/.config/mango/config.conf`:
 
 ```ini
 bind=SUPER,D,spawn,zrun
@@ -158,176 +158,184 @@ bind=SUPER,Escape,spawn,zpower
 bind=SUPER,C,spawn,zcal
 ```
 
-## Цвета
+## Colors
 
-У каждого элемента свой цвет: фон панели, рамка, подсветка, лаунчер, каждое состояние тегов, часы,
-Wi‑Fi (горящие/негорящие дуги, перечёркивание), Bluetooth (вкл/подключено/выкл), обои, питание, цвет рабочего стола под обоями
-и все цвета меню.
+Every item has its own color: panel background, border, highlight, launcher, each tag state, clock,
+Wi‑Fi (lit/unlit arcs, strike-through), Bluetooth (on/connected/off), wallpaper, power, the desktop color under the wallpaper
+and all menu colors.
 
-Два способа поменять:
+Two ways to change them:
 
-- **Без пересборки** — файл `~/.config/zpanel/theme` (или `$XDG_CONFIG_HOME/zpanel/theme`).
-  Скопируйте `theme.example` и правьте: панель, меню и zbg перечитывают файл сразу после сохранения.
+- **Without rebuilding** — the file `~/.config/netline/theme` (or `$XDG_CONFIG_HOME/netline/theme`).
+  Copy `theme.example` and edit it: the panel, menus and zbg reread the file right after you save it.
   ```ini
   background = #2e3440e6
   clock      = #ebcb8b
   power      = #a3be8c
   ```
-  Формат — `#RRGGBB` или `#RRGGBBAA` (AA — непрозрачность). Не указанные цвета берутся из `config.zig`.
-  Папку `~/.config/zpanel` нужно создать до запуска панели — иначе live-перезагрузка заработает после перезапуска.
-- **Значения по умолчанию** — `theme` в `src/config.zig`. Опечатка в цвете там — ошибка сборки.
+  The format is `#RRGGBB` or `#RRGGBBAA` (AA is opacity). Colors that aren't set come from `config.zig`.
+  The `~/.config/netline` folder must exist before the panel starts — otherwise live reload only works after a restart.
+- **Defaults** — `theme` in `src/config.zig`. A typo in a color there is a build error.
 
-Рамка вокруг панели включается в `config.zig`: `border_width = 1`.
+A border around the panel is enabled in `config.zig`: `border_width = 1`.
 
-## Нагрузка на систему
+## Clock font
 
-Панель практически ничего не потребляет, когда ничего не меняется (замер в тесте: 0 пробуждений и 0 тиков CPU за 8 секунд простоя).
+The date and time are drawn with one TrueType font: the first file found in `clock_font_paths` in `src/config.zig`
+(by default Noto Sans, then DejaVu Sans). To use a different font, put the path to its `.ttf` first in that list and rebuild.
+Only TrueType outlines (glyf) are supported, not CFF/OTF. A font with tabular (equal-width) digits keeps the clock from
+shifting as the minutes change — Noto Sans and DejaVu Sans have them. If no font is found, the clock falls back to
+the panel's vector digits, and the date is shown in numbers: `12.10.2026  13:31`.
 
-- **Нет опроса раз в секунду.** Часы будит таймер ровно на границе минуты (`CLOCK_REALTIME`, с перевзводом при переводе часов).
-  Wi‑Fi и Bluetooth обновляются по событиям ядра: изменения интерфейсов (netlink), uevent'ы rfkill/bluetooth
-  и включение адаптера Bluetooth (канал управления mgmt, права root не нужны).
-- **Лишние события отсекает ядро.** На сокеты событий поставлены фильтры BPF: панель не просыпается ни от батареи
-  (событие на каждый процент заряда), ни от USB, звука, подсветки, ни от сканирования Wi‑Fi — только от того, что
-  меняет значки. Подсистему в событии udevd подписывает хешем (так фильтрует и libudev); без udevd панель слушает
-  события ядра как раньше.
-- **Запасной опрос — только когда нужен**: раз в 30 с (`status_poll_s`) при подключённом Wi‑Fi (уровень сигнала
-  событий не даёт), пока нет связи с mango и если ядро не дало канал mgmt для Bluetooth.
-  Иначе панель спит до события.
-- **Рисуется только то, что изменилось.** Новый кадр сравнивается с предыдущим. Если пиксели совпали, композитор вообще не трогается.
-  Если нет — ему отправляются только изменившиеся прямоугольники (при смене минуты — только прямоугольник с изменившимися цифрами, а не вся панель).
-  Это минимум работы и для CPU, и для GPU композитора.
-- Буферы в общей памяти (memfd), никаких динамических аллокаций, один поток.
-- **Рисование дешёвое.** Смешивание цветов целочисленное (по два канала в одном слове), у скруглённых
-  прямоугольников функция расстояния считается только у краёв, середина заливается подряд.
-  Иконки и цифры часов считаются по функции расстояния один раз: маска покрытия кэшируется, и в следующих
-  кадрах она просто накладывается цветом — в 7–30 раз быстрее (цифры часов — около 1 мкс).
-  Текст меню: кэш «символ → глиф» и двоичный поиск по таблице шрифта (на ~40% быстрее).
-- **Теги перерисовываются, только если изменились** — IPC mango присылает события и на то, что панель не показывает.
-- **Маленькие бинарники.** Свой обработчик паники вместо стандартного (печать стека и форматирование),
-  буферы в `.bss`: все семь программ вместе — около 1,1 МБ (ReleaseSafe, x86_64), панель в памяти — ~0,6 МБ,
-  из них 0,4 МБ — два буфера кадра, которые читает композитор.
+## System load
 
-Замер (aarch64, headless sway): 10 с простоя — 0 пробуждений и 0 мкс процессора; 400 движений мыши
-с подсветкой значков — 33 мс процессора; 200 событий тегов — 78 мс.
+The panel uses practically nothing while nothing changes (measured: 0 wakeups and 0 CPU ticks over 8 seconds idle).
 
-Меню работают только пока открыты. Затемнение экрана — один пиксель, растянутый композитором
-(`wp_viewporter` + `single-pixel-buffer`), так что ни лишней памяти, ни заметной работы GPU.
-Меню открываются без лишних шагов: брокер запускает простые команды из `config.zig` сразу через `execve`
-(без `/bin/sh` на каждый клик), раскладка клавиатуры разбирается через хеш-таблицу имён клавиш,
-а подключение к D-Bus отправляет AUTH, BEGIN и Hello одним рейсом.
+- **No once-a-second polling.** The clock is woken by a timer exactly at the minute boundary (`CLOCK_REALTIME`, re-armed when the clock is changed).
+  Wi‑Fi and Bluetooth are updated from kernel events: interface changes (netlink), rfkill/bluetooth uevents
+  and Bluetooth adapter power (the mgmt control channel, no root needed).
+- **The kernel drops unneeded events.** BPF filters are attached to the event sockets: the panel doesn't wake up for the battery
+  (an event for every percent of charge), USB, sound, backlight or Wi‑Fi scans — only for what
+  changes the icons. udevd signs the subsystem in its events with a hash (libudev filters the same way); without udevd the panel listens
+  to kernel events as before.
+- **The fallback poll runs only when needed**: every 30 s (`status_poll_s`) while Wi‑Fi is connected (signal level
+  sends no events), while there is no connection to mango, and if the kernel gave no mgmt channel for Bluetooth.
+  Otherwise the panel sleeps until an event.
+- **Only what changed is drawn.** A new frame is compared to the previous one. If the pixels match, the compositor isn't touched at all.
+  If not, only the changed rectangles are sent to it (when the minute changes — only the rectangle with the changed digits, not the whole panel).
+  That's the minimum of work for both the CPU and the compositor's GPU.
+- Buffers in shared memory (memfd), no dynamic allocations, a single thread.
+- **Drawing is cheap.** Color blending is integer (two channels in one word); for rounded
+  rectangles the distance function is evaluated only near the edges, and the middle is filled in one run.
+  Icons are computed via the distance function once: the coverage mask is cached, and in the following
+  frames it is just blended with a color — 7–30 times faster.
+  Text (the clock and the menus): a "character → glyph" cache, rasterized glyphs are cached, and a binary search over the font table (~40% faster).
+- **Tags are redrawn only if they changed** — the mango IPC also sends events for things the panel doesn't show.
+- **Small binaries.** Our own panic handler instead of the standard one (stack printing and formatting),
+  buffers in `.bss`: all seven programs together were about 1.1 MB (ReleaseSafe, x86_64), the panel in memory is ~0.6 MB,
+  0.4 MB of which are the two frame buffers the compositor reads.
 
-**zwifi и zbt живут сигналами, а не опросом.** zwifi подписан на сигналы своего устройства в NetworkManager:
-новая сеть появляется в списке через десятки миллисекунд после того, как NM её нашёл (раньше — до 3 с,
-на следующем такте), а результат подключения виден сразу по смене состояния устройства. Сам zwifi раз в 10 с
-только просит NM поискать сети. Пачку сигналов (точки, `LastScan`) он собирает 40 мс и перечитывает список
-один раз. zbt загружает устройства один раз, а дальше ведёт таблицу по сигналам bluetoothd
-(`InterfacesAdded`/`Removed`, `PropertiesChanged`): во время поиска он не обращается к bluetoothd вовсе
-(раньше выкачивал все объекты на каждый сигнал, до трёх раз в секунду), найденное устройство рисуется в тот же
-момент. Уровень сигнала (RSSI) меняется постоянно, поэтому порядок списка пересчитывается раз в такт,
-а перерисовка нужна, только если строки поменялись местами.
+Measured (aarch64, headless sway): 10 s idle — 0 wakeups and 0 µs of CPU; 400 mouse movements
+with icon highlighting — 33 ms of CPU; 200 tag events — 78 ms.
 
-Замер (aarch64 VM, NetworkManager + hwsim, bluetoothd + btvirt):
+Menus run only while open. The screen dimming is one pixel stretched by the compositor
+(`wp_viewporter` + `single-pixel-buffer`), so there's no extra memory and no noticeable GPU work.
+Menus open without extra steps: the broker runs simple commands from `config.zig` directly via `execve`
+(no `/bin/sh` per click), the keyboard layout is parsed through a hash table of key names,
+and the D-Bus connection sends AUTH, BEGIN and Hello in one round trip.
 
-| | было | стало |
+**zwifi and zbt run on signals, not polling.** zwifi subscribes to its device's signals in NetworkManager:
+a new network appears in the list tens of milliseconds after NM found it (previously up to 3 s,
+on the next tick), and the connection result is visible right away from the device's state change. zwifi itself only
+asks NM to scan every 10 s. It collects a batch of signals (access points, `LastScan`) for 40 ms and rereads the list
+once. zbt loads the devices once and then maintains the table from bluetoothd signals
+(`InterfacesAdded`/`Removed`, `PropertiesChanged`): during discovery it doesn't call bluetoothd at all
+(previously it fetched all objects on every signal, up to three times a second), and a found device is drawn the same
+moment. The signal level (RSSI) changes all the time, so the list order is recomputed once per tick,
+and a redraw is needed only if rows swapped places.
+
+Measured (aarch64 VM, NetworkManager + hwsim, bluetoothd + btvirt):
+
+| | before | after |
 |---|---|---|
-| zwifi: вызовов NM за 30 с открытого меню | 47–53 | 15–21 |
-| zwifi: новая сеть в списке после сигнала NM | 0,1–3 с | 0–45 мс |
-| zwifi: запросов состояния за время подключения | 41 | по сигналам |
-| zbt: вызовов bluetoothd за 20 с поиска | полная выгрузка на каждый сигнал | 0 |
-| zbt: новое устройство в списке после сигнала | 120–350 мс | 0–2 мс |
-| zbt: процессор за 20 с поиска | 98–117 мс | 64–88 мс |
+| zwifi: NM calls over 30 s with the menu open | 47–53 | 15–21 |
+| zwifi: new network in the list after the NM signal | 0.1–3 s | 0–45 ms |
+| zwifi: state requests while connecting | 41 | on signals |
+| zbt: bluetoothd calls over 20 s of discovery | a full dump on every signal | 0 |
+| zbt: new device in the list after the signal | 120–350 ms | 0–2 ms |
+| zbt: CPU over 20 s of discovery | 98–117 ms | 64–88 ms |
 
-**Частичная перерисовка в меню.** Анимация точек («Поиск...», «Подключение...») и подсветка строки под курсором
-перерисовывают только свою полосу строк: кадр берёт прошлый как основу, а примитивы рисования пропускают всё вне
-полосы. Точки обновляются дважды в секунду, а не трижды.
+**Partial redraw in menus.** The dots animation ("Searching...", "Connecting...") and the highlight of the row under the pointer
+redraw only their own band of rows: the frame takes the previous one as the base, and the drawing primitives skip everything outside
+the band. The dots update twice a second, not three times.
 
-### Замеры: `ZPANEL_TRACE=1`
+### Timing: `NETLINE_TRACE=1`
 
-Код замеров есть только в сборке с `-Dtrace=true` (в обычной его нет вовсе). С переменной `ZPANEL_TRACE=1`
-любая программа такой сборки пишет в stderr, когда и почему просыпается и сколько занимает каждый кадр.
-Метки — монотонное время в миллисекундах, их можно сравнивать между процессами
-(клик в панели → первый кадр меню):
+The timing code exists only in a `-Dtrace=true` build (a normal build has none of it). With the variable `NETLINE_TRACE=1`
+any program of such a build writes to stderr when and why it wakes up and how long each frame takes.
+Stamps are monotonic time in milliseconds and can be compared across processes
+(a click in the panel → the first frame of the menu):
 
 ```sh
-zig build -Doptimize=ReleaseSafe -Dtrace=true -p /tmp/zpanel-trace
-pkill zpanel; ZPANEL_TRACE=1 /tmp/zpanel-trace/bin/zpanel 2>&1 | tee /tmp/zpanel.log
+zig build -Doptimize=ReleaseSafe -Dtrace=true -p /tmp/netline-trace
+pkill netline; NETLINE_TRACE=1 /tmp/netline-trace/bin/netline 2>&1 | tee /tmp/netline.log
 ```
 
-В простое в журнале должны быть только строки `пробуждение: часы` раз в минуту
-(и `опрос` раз в 30 с, если подключён Wi‑Fi).
+When idle the log should contain only `wakeup: clock` lines once a minute
+(and `poll` every 30 s if Wi‑Fi is connected).
 
-**zbg** просыпается только при смене обоев или мониторов. Картинка декодируется один раз на все мониторы
-(JPEG — сразу в уменьшенном размере, если экран меньше фото), после отрисовки вся память возвращается системе:
-в простое zbg занимает около 0,2 МБ. Буфер с обоями уничтожается, как только композитор его отпустил
-(wlroots с GPU-рендером загружает картинку в текстуру и отпускает буфер сразу).
+**zbg** wakes up only when the wallpaper or the monitors change. The image is decoded once for all monitors
+(JPEG straight at a reduced size if the screen is smaller than the photo), and after drawing all memory goes back to the system:
+when idle zbg takes about 0.2 MB. The wallpaper buffer is destroyed as soon as the compositor has released it
+(wlroots with GPU rendering uploads the image into a texture and releases the buffer right away).
 
-Декодер JPEG: целочисленное обратное DCT векторами, Хаффман с таблицей «код и значение за один просмотр»,
-baseline-картинка сразу превращается в пиксели (коэффициенты всего кадра не хранятся — для 24-мегапиксельного
-фото это 72 МБ). Масштабирование под экран держит в памяти несколько строк, а не промежуточную картинку.
-Фото 6000×4000 → обои 1600×900 — около 0,16 с, → 4K — около 0,37 с; превью — 0,04 с.
+The JPEG decoder: integer inverse DCT on vectors, Huffman with a "code and value in one lookup" table,
+a baseline image turns into pixels right away (the whole frame's coefficients aren't stored — for a 24-megapixel
+photo that's 72 MB). Scaling to the screen keeps a few rows in memory, not an intermediate image.
+A 6000×4000 photo → 1600×900 wallpaper takes about 0.16 s, → 4K about 0.37 s; a thumbnail 0.04 s.
 
-Для минимальной нагрузки на GPU: оставьте `blur_layer=0` в mango и, если не нужна прозрачность, сделайте фон непрозрачным (`#RRGGBB`).
+For minimal GPU load: keep `blur_layer=0` in mango and, if you don't need transparency, make the background opaque (`#RRGGBB`).
 
-## Безопасность
+## Security
 
-Панель разделена на два процесса.
+The panel is split into two processes.
 
-**Брокер** отделяется первым, ещё до подключения к Wayland, и умеет только три вещи:
-- запустить команду из таблицы, **вшитой при сборке** из `config.zig` (простые — сразу через `execve`,
-  со спецсимволами shell — через `/bin/sh -c`);
-- отправить mango `dispatch` строго проверенного вида (`viewcrossmon,N,МОНИТОР`, `view,N,0`, `toggleview,N`);
-- открыть сокет IPC mango и передать его панели.
+**The broker** forks off first, before connecting to Wayland, and can do only three things:
+- run a command from the table **built in at compile time** from `config.zig` (simple ones directly via `execve`,
+  ones with shell special characters via `/bin/sh -c`);
+- send mango a `dispatch` of a strictly checked form (`viewcrossmon,N,MONITOR`, `view,N,0`, `toggleview,N`);
+- open the mango IPC socket and hand it to the panel.
 
-**Панель** после инициализации запирает себя:
-- **seccomp** — белый список системных вызовов. Нельзя `exec`, `fork`, `socket`, `connect`, `ptrace`, `mprotect`.
-  `mmap` разрешён только без `PROT_EXEC`, `openat` — только на чтение, `ioctl` — только запрос состояния Bluetooth.
-  Любой другой вызов немедленно завершает процесс.
-- **Landlock** — чтение только `/sys`, `/proc`, tzdata и папки темы. Запись запрещена везде, TCP запрещён,
-  сигналы и абстрактные сокеты — только внутри песочницы.
-- `no_new_privs`, `dumpable=0` (нельзя подключиться ptrace'ом), запуск от root запрещён.
+**The panel** locks itself down after initialization:
+- **seccomp** — a system call allowlist. No `exec`, `fork`, `socket`, `connect`, `ptrace`, `mprotect`.
+  `mmap` is allowed only without `PROT_EXEC`, `openat` read-only, `ioctl` only the Bluetooth state request.
+  Any other call kills the process immediately.
+- **Landlock** — read access only to `/sys`, `/proc`, tzdata and the theme folder. Writing is forbidden everywhere, TCP is forbidden,
+  signals and abstract sockets only within the sandbox.
+- `no_new_privs`, `dumpable=0` (no ptrace attach), running as root is not allowed.
 
-Даже если в панели найдётся уязвимость, взломанный процесс не сможет ни запустить программу (кроме вписанных вами), ни открыть сеть, ни записать файл, ни прочитать ваши ключи.
-Брокер не помещён в песочницу намеренно: запущенные им программы (терминал, sudo, лаунчер) должны работать как обычно.
+Even if a vulnerability is found in the panel, the compromised process can't launch a program (other than the ones you wrote in), open the network, write a file or read your keys.
+The broker is deliberately not sandboxed: the programs it launches (a terminal, sudo, the launcher) must work as usual.
 
-**Меню и zbg** запираются так же — сразу после подключения к Wayland и своим службам (D-Bus, сокет zbg):
-тот же seccomp без `exec`, `fork`, `socket`, `connect` и Landlock, где каждому открыто только нужное:
+**Menus and zbg** lock themselves down the same way — right after connecting to Wayland and their services (D-Bus, the zbg socket):
+the same seccomp without `exec`, `fork`, `socket`, `connect`, and Landlock where each one gets only what it needs:
 
-| | читать | писать |
+| | read | write |
 |---|---|---|
-| zwifi, zbt, zpower, zcal | папку темы | — |
-| zrun | папку темы и папки иконок | — (файл кэша иконок открыт заранее) |
-| zwall | папку темы и обоев | только кэш превью |
-| zbg | папку темы и обоев | — (файл выбора открыт заранее) |
+| zwifi, zbt, zpower, zcal | theme folder | — |
+| zrun | theme folder and icon folders | — (the icon cache file is opened up front) |
+| zwall | theme and wallpaper folders | the thumbnail cache only |
+| zbg | theme and wallpaper folders | — (the choice file is opened up front) |
 
-zpower блокирует экран через свой маленький брокер, который умеет запускать только `lock_cmd`.
-zrun читает приложения, `PATH` и историю до песочницы и сразу отделяет свой брокер: приложение ему называется
-только номером в уже прочитанном списке, а `Exec` брокер разбирает и запускает сам, без shell. Строку из вкладки
-«Команды» брокер выполняет через `/bin/sh -c` — так же, как терминал.
-Повторный запуск закрывает меню, только если он от того же пользователя; управлять zbg тоже может только тот же пользователь.
-Декодеры изображений проверяют все границы и ограничивают размеры (до 16384 px по стороне, 80 Мп, файл до 128 МБ),
-битые и «бомбы» дают ошибку, а не выход за буфер; они прогонялись мутационным фаззингом.
+zpower locks the screen through its own small broker, which can only run `lock_cmd`.
+zrun reads the apps, `PATH` and the history before the sandbox and immediately forks its broker: an app is named to it
+only by its number in the already-read list, and the broker parses `Exec` and launches it itself, without a shell. A line from the
+"Commands" tab is run by the broker via `/bin/sh -c` — the same as a terminal would.
+A repeated launch closes a menu only if it comes from the same user; only the same user can control zbg as well.
+The image decoders check all bounds and limit sizes (up to 16384 px per side, 80 MP, files up to 128 MB);
+broken files and "bombs" give an error, not a buffer overrun; they have been through mutation fuzzing.
 
-Разбор всех входных данных (протокол Wayland, D-Bus, JSON mango, netlink, tzdata, файл темы, JPEG, PNG) проверяет границы и защищён от переполнений.
+Parsing of all input data (the Wayland protocol, D-Bus, mango JSON, netlink, tzdata, the theme file, JPEG, PNG) is bounds-checked and protected against overflows.
 
-Если ядро без Landlock, программы работают с одним seccomp и пишут об этом в stderr.
-Нарушение seccomp видно в `dmesg` (`audit: type=1326 ... syscall=N`). Для отладки песочницу можно выключить: `sandbox = false` в `config.zig`.
+If the kernel has no Landlock, the programs run with seccomp alone and say so on stderr.
+A seccomp violation shows up in `dmesg` (`audit: type=1326 ... syscall=N`). For debugging the sandbox can be turned off: `sandbox = false` in `config.zig`.
 
-## Требования
+## Requirements
 
-- **Zig 0.16** (проверено на 0.16.0).
-- **Linux ≥ 5.13** для Landlock (необязательно), архитектуры x86_64, aarch64, riscv64.
-- **MangoWM ≥ 0.14** — IPC через `$MANGO_INSTANCE_SIGNATURE`. Старый `dwl-ipc` в mango удалён с 0.15, поэтому не поддерживается.
-- Шрифт TrueType для меню (DejaVu Sans или Noto Sans есть почти везде; список путей — `font_paths` в `config.zig`).
-- Службы: **NetworkManager** (zwifi), **BlueZ** (zbt), **systemd-logind** или elogind (zpower).
-- Программы: `swaylock` (или любая другая команда в `lock_cmd`) и терминал для `Shift+Enter` в zrun (`foot` по умолчанию).
-  `rofi`, `nmcli`, `bluetoothctl` и `swaybg` больше не нужны.
+- **Zig 0.16** (tested on 0.16.0).
+- **Linux ≥ 5.13** for Landlock (optional), x86_64, aarch64, riscv64.
+- **MangoWM ≥ 0.14** — IPC via `$MANGO_INSTANCE_SIGNATURE`. The old `dwl-ipc` was removed from mango in 0.15 and is not supported.
+- A TrueType font for the clock and menus (DejaVu Sans or Noto Sans are almost everywhere; path lists — `clock_font_paths` and `font_paths` in `config.zig`).
+- Services: **NetworkManager** (zwifi), **BlueZ** (zbt), **systemd-logind** or elogind (zpower).
+- Programs: `swaylock` (or any other command in `lock_cmd`) and a terminal for `Shift+Enter` in zrun (`foot` by default).
+  `rofi`, `nmcli`, `bluetoothctl` and `swaybg` are no longer needed.
 
-## Сборка и установка
+## Building and installing
 
-Команды — по одной (подходят и для bash, и для fish). Пример — для Arch; на других дистрибутивах поставьте
-те же пакеты своим менеджером (в Debian/Ubuntu: `network-manager`, `bluez`, `fonts-dejavu-core`, `swaylock`, `foot`).
+Run the commands one at a time (they work in both bash and fish). The example is for Arch; on other distributions install
+the same packages with your package manager (on Debian/Ubuntu: `network-manager`, `bluez`, `fonts-dejavu-core`, `swaylock`, `foot`).
 
-### 1. Пакеты и службы
+### 1. Packages and services
 
 ```sh
 sudo pacman -S --needed git networkmanager bluez bluez-utils ttf-dejavu swaylock foot
@@ -337,12 +345,12 @@ sudo pacman -S --needed git networkmanager bluez bluez-utils ttf-dejavu swaylock
 sudo systemctl enable --now NetworkManager bluetooth
 ```
 
-`bluez-utils` меню не нужен — только для диагностики (`bluetoothctl`). Если Wi‑Fi раньше поднимали через iwd
-или netctl без NetworkManager, выключите их: zwifi работает через NetworkManager.
+The menu doesn't need `bluez-utils` — it's only for diagnostics (`bluetoothctl`). If Wi‑Fi used to be brought up with iwd
+or netctl without NetworkManager, turn them off: zwifi works through NetworkManager.
 
 ### 2. Zig 0.16
 
-Нужна именно 0.16 (если `zig version` уже показывает `0.16.x` — шаг можно пропустить):
+It has to be 0.16 (if `zig version` already shows `0.16.x`, you can skip this step):
 
 ```sh
 cd ~
@@ -356,162 +364,171 @@ curl -LO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
 tar -xf zig-x86_64-linux-0.16.0.tar.xz
 ```
 
-Добавить в `PATH` — в fish:
+Add it to `PATH` — in fish:
 
 ```sh
 fish_add_path ~/zig-x86_64-linux-0.16.0
 ```
 
-в bash/zsh — строкой `export PATH="$HOME/zig-x86_64-linux-0.16.0:$PATH"` в `~/.bashrc` или `~/.zshrc`.
-Проверка: `zig version` должен вывести `0.16.0`. На ARM вместо `x86_64` — `aarch64`.
+in bash/zsh — with the line `export PATH="$HOME/zig-x86_64-linux-0.16.0:$PATH"` in `~/.bashrc` or `~/.zshrc`.
+Check: `zig version` should print `0.16.0`. On ARM use `aarch64` instead of `x86_64`.
 
-### 3. Клонировать
+### 3. Clone
 
-Новая версия — в ветке `lite`; без `-b lite` скачается `main` со старой версией:
+The new version is on the `lite` branch; without `-b lite` you get `main` with the old version:
 
 ```sh
-git clone -b lite https://github.com/FalconBinary/zpanel.git ~/zpanel
+git clone -b lite https://github.com/FalconBinary/netline.git ~/netline
 ```
 
 ```sh
-cd ~/zpanel
+cd ~/netline
 ```
 
-### 4. Собрать и установить
+### 4. Build and install
 
 ```sh
 zig build -Doptimize=ReleaseSafe
 ```
 
 ```sh
-install -Dm755 zig-out/bin/zbg zig-out/bin/zbt zig-out/bin/zcal zig-out/bin/zpanel zig-out/bin/zpower zig-out/bin/zrun zig-out/bin/zwall zig-out/bin/zwifi -t ~/.local/bin/
+install -Dm755 zig-out/bin/zbg zig-out/bin/zbt zig-out/bin/zcal zig-out/bin/netline zig-out/bin/zpower zig-out/bin/zrun zig-out/bin/zwall zig-out/bin/zwifi -t ~/.local/bin/
 ```
 
-`~/.local/bin` должен быть в `PATH` (в fish: `fish_add_path ~/.local/bin`). Все восемь программ должны лежать
-в одной папке — панель ищет меню рядом с собой.
+`~/.local/bin` must be in `PATH` (in fish: `fish_add_path ~/.local/bin`). All eight programs must be
+in the same folder — the panel looks for the menus next to itself.
 
-`ReleaseSafe` оставляет проверки границ во время работы (лишняя защита для разбора файлов и сетевых данных)
-и почти не уступает в скорости; `ReleaseSmall` даёт бинарники меньше, но без этих проверок.
+`ReleaseSafe` keeps bounds checks at run time (extra protection for parsing files and network data)
+and is almost as fast; `ReleaseSmall` gives smaller binaries, but without those checks.
 
-### 5. Тема и папка обоев
+### 5. Theme and wallpaper folder
 
 ```sh
-mkdir -p ~/.config/zpanel ~/Pictures/wallpapers
+mkdir -p ~/.config/netline ~/Pictures/wallpapers
 ```
 
 ```sh
-cp theme.example ~/.config/zpanel/theme
+cp theme.example ~/.config/netline/theme
 ```
 
-Картинки (JPEG, PNG) — в `~/Pictures/wallpapers`. Цвета — в `~/.config/zpanel/theme`, панель и меню
-подхватывают изменения на лету.
+Images (JPEG, PNG) go in `~/Pictures/wallpapers`. Colors go in `~/.config/netline/theme`; the panel and menus
+pick up changes on the fly.
 
-### 6. Автозапуск в mango
+### 6. Autostart in mango
 
-В `~/.config/mango/config.conf`:
+In `~/.config/mango/config.conf`:
 
 ```ini
 exec_once=zbg
-exec_once=zpanel
+exec_once=netline
 ```
 
-Строки со `swaybg`, `waybar` или другой панелью уберите — иначе будет две панели и двое обоев
-(zbg сам восстанавливает выбранные обои). Горячие клавиши для меню — в разделе
-[«Горячие клавиши в mango»](#горячие-клавиши-в-mango).
+Remove lines with `swaybg`, `waybar` or another panel — otherwise you'll get two panels and two wallpapers
+(zbg restores the chosen wallpaper by itself). Hotkeys for the menus are in the section
+["Hotkeys in mango"](#hotkeys-in-mango).
 
-### 7. Запуск
+### 7. Run
 
-Выйдите из сеанса mango и войдите снова — или запустите из терминала внутри mango:
+Log out of the mango session and log back in — or start them from a terminal inside mango:
 
 ```sh
 zbg &
 ```
 
 ```sh
-zpanel &
+netline &
 ```
 
-### Если что-то не так
+### If something is wrong
 
-- **Панель не появилась** — запустите `zpanel` в терминале и посмотрите сообщение: чаще всего старый mango
-  (нужен ≥ 0.14) или запуск не из сеанса mango.
-- **zwifi: «NetworkManager недоступен»** — служба не запущена (шаг 1).
-- **zbt не видит устройство** — `zbt scan` покажет всё, что видит bluetoothd, и подскажет, что сделать.
-- **Не тот шрифт, терминал или команда блокировки** — `font_paths`, `terminal` (`foot`), `lock_cmd`
-  (`swaylock -f`) и `wallpaper_dir` в `src/config.zig`; после правки — снова шаг 4.
+- **The panel didn't appear** — run `netline` in a terminal and read the message: most often it's an old mango
+  (≥ 0.14 is needed) or it wasn't started from a mango session.
+- **zwifi: "NetworkManager is unavailable"** — the service isn't running (step 1).
+- **zbt doesn't see a device** — `zbt scan` shows everything bluetoothd sees and suggests what to do.
+- **Wrong font, terminal or lock command** — `clock_font_paths`, `font_paths`, `terminal` (`foot`), `lock_cmd`
+  (`swaylock -f`) and `wallpaper_dir` in `src/config.zig`; after editing — step 4 again.
 
-### Обновление
+### Updating
 
 ```sh
-cd ~/zpanel
+cd ~/netline
 ```
 
 ```sh
 git pull
 ```
 
-и снова шаг 4. Если `git pull` пишет о расхождении истории (копия сделана до 13 октября 2026,
-когда репозиторий пересоздан), один раз выполните `git fetch origin` и `git reset --hard origin/lite`
-(локальные правки в этой копии при этом пропадут).
+and step 4 again. If `git pull` reports diverged history (the history was rewritten on 13 October 2026),
+run `git fetch origin` and `git reset --hard origin/lite` once
+(local edits in this copy will be lost).
 
-## Настройка (`src/config.zig`)
+### Upgrading from zpanel
 
-- `position` — `.top` / `.bottom`; `height`, `margin_edge`, `margin_side`, `radius`, `border_width` — геометрия.
-- `left` / `right` — порядок элементов; часы всегда по центру.
-- `clock_format` — `.full` (по умолчанию: `Пн, 12 октября 2026  13:31`), `.hm`, `.hms` (будит панель каждую секунду) или `.date_hm`.
-  Дату словами панель рисует шрифтом из `font_paths`; если ни один не найден — цифрами: `12.10.2026  13:31`.
-- `hover_effect` — подсветка под курсором.
-- `launcher`, `clock`, `wifi`, `bluetooth`, `wallpaper`, `power` — команды для левой/правой/средней кнопки.
-- `font_paths`, `menu_width`, `menu_height`, `menu_radius` — меню.
-- `launcher_width`, `launcher_rows`, `launcher_icons`, `icon_theme`, `terminal` — лаунчер zrun.
-- `wallpaper_dir`, `wallpaper_mode` — папка с обоями и способ вписывания.
-- `lock_cmd`, `power_confirm`, `lock_before_suspend` — блокировка и подтверждения в меню питания.
-- `status_poll_s`, `sandbox` — запасной опрос (только при подключённом Wi‑Fi) и песочница.
+The project used to be called zpanel. After installing netline:
 
-Все программы должны лежать в одной папке с `zpanel` (или в `PATH`) — брокер ищет их рядом с панелью.
+- in `~/.config/mango/config.conf` replace `exec_once=zpanel` with `exec_once=netline`;
+- move the theme: `mv ~/.config/zpanel ~/.config/netline`;
+- move the caches (optional, they are rebuilt anyway): `mv ~/.cache/zpanel ~/.cache/netline`;
+- remove the old binary: `rm ~/.local/bin/zpanel`.
 
-## Устройство
+## Configuration (`src/config.zig`)
+
+- `position` — `.top` / `.bottom`; `height`, `margin_edge`, `margin_side`, `radius`, `border_width` — geometry.
+- `left` / `right` — item order; the clock is always in the center.
+- `clock_format` — `.full` (default: `Mon, 12 October 2026  13:31`), `.hm`, `.hms` (wakes the panel every second) or `.date_hm`.
+- `clock_size`, `clock_font_paths` — clock digit height and font (see [Clock font](#clock-font)).
+- `hover_effect` — highlight under the pointer.
+- `launcher`, `clock`, `wifi`, `bluetooth`, `wallpaper`, `power` — commands for the left/right/middle button.
+- `font_paths`, `menu_width`, `menu_height`, `menu_radius` — menus.
+- `launcher_width`, `launcher_rows`, `launcher_icons`, `icon_theme`, `terminal` — the zrun launcher.
+- `wallpaper_dir`, `wallpaper_mode` — the wallpaper folder and how it's fitted.
+- `lock_cmd`, `power_confirm`, `lock_before_suspend` — locking and confirmations in the power menu.
+- `status_poll_s`, `sandbox` — the fallback poll (only while Wi‑Fi is connected) and the sandbox.
+
+All programs must be in the same folder as `netline` (or in `PATH`) — the broker looks for them next to the panel.
+
+## Layout
 
 ```
 src/
-  main.zig     панель: цикл событий, панели на каждый монитор, ввод, раскладка, рисование, damage
-  ui.zig       общий каркас меню: карточка, затемнение, виджеты, клавиатура, фокус, песочница
-  wifi.zig     zwifi: список сетей, формы, буфер обмена
-  nm.zig       клиент NetworkManager (сканирование, PSK/SAE/PEAP/TTLS/TLS, забыть, отключить)
-  bt.zig       zbt: устройства, поиск, экраны сопряжения
-  bz.zig       клиент BlueZ: адаптер, устройства, батарея, свой агент сопряжения, rfkill
-  wall.zig     zwall: сетка превью, кэш, связь с zbg
-  zbg.zig      демон обоев: слой background на каждом мониторе, масштаб, сокет управления
-  img.zig      декодеры JPEG и PNG (свой inflate) и качественное масштабирование
-  power.zig    zpower: действия logind, подтверждения, блокировка
-  cal.zig      zcal: календарь
-  run.zig      zrun: приложения и команды, иконки, история, брокер запуска
-  desktop.zig  разбор .desktop и Exec, поиск с подсветкой, исправление раскладки (тесты: zig test src/desktop.zig)
-  dbus.zig     клиент D-Bus: аутентификация, маршалинг, вызовы, асинхронные ответы, сигналы, входящие вызовы
-  ttf.zig      шрифтовой движок TrueType: глифы, кривые, сглаживание, кэш
-  xkb.zig      разбор раскладки XKB: группы, Shift, Caps Lock, латиница и кириллица
-  wl.zig       wire-протокол Wayland: сериализация, разбор событий, передача fd
-  sys.zig      сырые системные вызовы Linux, argv и окружение
-  rt.zig       маленький обработчик паники и настройки std для всех программ
-  broker.zig   процесс-брокер: запуск команд, IPC mango
-  sandbox.zig  seccomp-bpf и Landlock
-  theme.zig    файл темы и его перезагрузка (inotify)
-  color.zig    разбор цветов
-  draw.zig     растеризация с антиалиасингом (SDF), картинки, векторные цифры и иконки
-  mango.zig    поток тегов mango + маленький JSON-токенайзер
-  status.zig   Wi‑Fi и Bluetooth из ядра, netlink-события
-  tz.zig       разбор TZif и POSIX TZ
-  config.zig   настройки и цвета по умолчанию
+  main.zig     panel: event loop, a bar per monitor, input, layout, drawing, damage
+  ui.zig       shared menu framework: card, dimming, widgets, keyboard, focus, sandbox
+  wifi.zig     zwifi: network list, forms, clipboard
+  nm.zig       NetworkManager client (scanning, PSK/SAE/PEAP/TTLS/TLS, forget, disconnect)
+  bt.zig       zbt: devices, discovery, pairing screens
+  bz.zig       BlueZ client: adapter, devices, battery, our own pairing agent, rfkill
+  wall.zig     zwall: thumbnail grid, cache, talking to zbg
+  zbg.zig      wallpaper daemon: a background layer on every monitor, scale, control socket
+  img.zig      JPEG and PNG decoders (our own inflate) and high-quality scaling
+  power.zig    zpower: logind actions, confirmations, locking
+  cal.zig      zcal: calendar
+  run.zig      zrun: apps and commands, icons, history, launch broker
+  desktop.zig  .desktop and Exec parsing, search with highlighting, layout fixing (tests: zig test src/desktop.zig)
+  dbus.zig     D-Bus client: authentication, marshalling, calls, async replies, signals, incoming calls
+  ttf.zig      TrueType font engine: glyphs, curves, antialiasing, cache
+  xkb.zig      XKB keymap parsing: groups, Shift, Caps Lock, Latin and Cyrillic
+  wl.zig       Wayland wire protocol: serialization, event parsing, fd passing
+  sys.zig      raw Linux system calls, argv and environment
+  rt.zig       small panic handler and std options for all programs
+  broker.zig   broker process: running commands, mango IPC
+  sandbox.zig  seccomp-bpf and Landlock
+  theme.zig    theme file and its reloading (inotify)
+  color.zig    color parsing
+  draw.zig     antialiased rasterization (SDF), images, vector digits and icons
+  mango.zig    mango tag stream + a tiny JSON tokenizer
+  status.zig   Wi‑Fi and Bluetooth from the kernel, netlink events
+  tz.zig       TZif and POSIX TZ parsing
+  config.zig   settings and default colors
 ```
 
-## Лицензия
+## License
 
 Copyright (c) 2026 Denys ([FalconBinary](https://github.com/FalconBinary))
 
-zpanel — свободная программа: её можно распространять и изменять на условиях
-GNU General Public License версии 3 или (по вашему выбору) любой более поздней версии.
-Полный текст — в файле [LICENSE](LICENSE).
+netline is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License version 3 or (at your option) any later version.
+The full text is in the [LICENSE](LICENSE) file.
 
-Программа распространяется «как есть», без каких-либо гарантий, в том числе гарантий
-пригодности для определённой цели. Автор не несёт ответственности за любой ущерб,
-возникший в результате её использования (разделы 15 и 16 GPL-3.0).
+The program is distributed "as is", without any warranty, including any warranty
+of fitness for a particular purpose. The author is not liable for any damage
+arising from its use (sections 15 and 16 of GPL-3.0).
