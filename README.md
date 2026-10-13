@@ -324,21 +324,89 @@ zrun читает приложения, `PATH` и историю до песоч
 
 ## Сборка и установка
 
-Если папка `zpanel` уже есть (от прошлой установки), обновите её, а не клонируйте заново —
-`git clone` в существующую папку не сработает, и соберётся старая версия:
+Команды — по одной (подходят и для bash, и для fish). Пример — для Arch; на других дистрибутивах поставьте
+те же пакеты своим менеджером (в Debian/Ubuntu: `network-manager`, `bluez`, `fonts-dejavu-core`, `swaylock`, `foot`).
+
+### 1. Пакеты и службы
 
 ```sh
-cd zpanel && git pull
+sudo pacman -S --needed git networkmanager bluez bluez-utils ttf-dejavu swaylock foot
 ```
+
+```sh
+sudo systemctl enable --now NetworkManager bluetooth
+```
+
+`bluez-utils` меню не нужен — только для диагностики (`bluetoothctl`). Если Wi‑Fi раньше поднимали через iwd
+или netctl без NetworkManager, выключите их: zwifi работает через NetworkManager.
+
+### 2. Zig 0.16
+
+Нужна именно 0.16 (если `zig version` уже показывает `0.16.x` — шаг можно пропустить):
+
+```sh
+cd ~
+```
+
+```sh
+curl -LO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+```
+
+```sh
+tar -xf zig-x86_64-linux-0.16.0.tar.xz
+```
+
+Добавить в `PATH` — в fish:
+
+```sh
+fish_add_path ~/zig-x86_64-linux-0.16.0
+```
+
+в bash/zsh — строкой `export PATH="$HOME/zig-x86_64-linux-0.16.0:$PATH"` в `~/.bashrc` или `~/.zshrc`.
+Проверка: `zig version` должен вывести `0.16.0`. На ARM вместо `x86_64` — `aarch64`.
+
+### 3. Клонировать
+
+Новая версия — в ветке `lite`; без `-b lite` скачается `main` со старой версией:
+
+```sh
+git clone -b lite https://github.com/FalconBinary/zpanel.git ~/zpanel
+```
+
+```sh
+cd ~/zpanel
+```
+
+### 4. Собрать и установить
 
 ```sh
 zig build -Doptimize=ReleaseSafe
-install -Dm755 zig-out/bin/* -t ~/.local/bin/
-mkdir -p ~/.config/zpanel ~/Pictures/wallpapers && cp theme.example ~/.config/zpanel/theme
 ```
+
+```sh
+install -Dm755 zig-out/bin/zbg zig-out/bin/zbt zig-out/bin/zcal zig-out/bin/zpanel zig-out/bin/zpower zig-out/bin/zrun zig-out/bin/zwall zig-out/bin/zwifi -t ~/.local/bin/
+```
+
+`~/.local/bin` должен быть в `PATH` (в fish: `fish_add_path ~/.local/bin`). Все восемь программ должны лежать
+в одной папке — панель ищет меню рядом с собой.
 
 `ReleaseSafe` оставляет проверки границ во время работы (лишняя защита для разбора файлов и сетевых данных)
 и почти не уступает в скорости; `ReleaseSmall` даёт бинарники меньше, но без этих проверок.
+
+### 5. Тема и папка обоев
+
+```sh
+mkdir -p ~/.config/zpanel ~/Pictures/wallpapers
+```
+
+```sh
+cp theme.example ~/.config/zpanel/theme
+```
+
+Картинки (JPEG, PNG) — в `~/Pictures/wallpapers`. Цвета — в `~/.config/zpanel/theme`, панель и меню
+подхватывают изменения на лету.
+
+### 6. Автозапуск в mango
 
 В `~/.config/mango/config.conf`:
 
@@ -347,7 +415,44 @@ exec_once=zbg
 exec_once=zpanel
 ```
 
-Если раньше обои ставил swaybg — уберите его строку из конфига: zbg сам восстанавливает выбранные обои.
+Строки со `swaybg`, `waybar` или другой панелью уберите — иначе будет две панели и двое обоев
+(zbg сам восстанавливает выбранные обои). Горячие клавиши для меню — в разделе
+[«Горячие клавиши в mango»](#горячие-клавиши-в-mango).
+
+### 7. Запуск
+
+Выйдите из сеанса mango и войдите снова — или запустите из терминала внутри mango:
+
+```sh
+zbg &
+```
+
+```sh
+zpanel &
+```
+
+### Если что-то не так
+
+- **Панель не появилась** — запустите `zpanel` в терминале и посмотрите сообщение: чаще всего старый mango
+  (нужен ≥ 0.14) или запуск не из сеанса mango.
+- **zwifi: «NetworkManager недоступен»** — служба не запущена (шаг 1).
+- **zbt не видит устройство** — `zbt scan` покажет всё, что видит bluetoothd, и подскажет, что сделать.
+- **Не тот шрифт, терминал или команда блокировки** — `font_paths`, `terminal` (`foot`), `lock_cmd`
+  (`swaylock -f`) и `wallpaper_dir` в `src/config.zig`; после правки — снова шаг 4.
+
+### Обновление
+
+```sh
+cd ~/zpanel
+```
+
+```sh
+git pull
+```
+
+и снова шаг 4. Если `git pull` пишет о расхождении истории (копия сделана до 13 октября 2026,
+когда репозиторий пересоздан), один раз выполните `git fetch origin` и `git reset --hard origin/lite`
+(локальные правки в этой копии при этом пропадут).
 
 ## Настройка (`src/config.zig`)
 
