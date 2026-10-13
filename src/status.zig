@@ -34,22 +34,49 @@ pub fn init() void {
 // ---------------------------------------------------------------- фильтры
 
 const LD_W_ABS: u16 = 0x20;
-const LD_IMM: u16 = 0x00;
-const LDX_IMM: u16 = 0x01;
+const LD_B_ABS: u16 = 0x30;
+const LD_B_IND: u16 = 0x50;
+const LD_LEN: u16 = 0x80;
+const ADD: u16 = 0x04;
+const SUB: u16 = 0x14;
+const AND: u16 = 0x54;
+const TAX: u16 = 0x07;
+const TXA: u16 = 0x87;
 const JEQ: u16 = 0x15;
+const JGE_X: u16 = 0x3d;
 const RET: u16 = 0x06;
 const KEEP: u32 = 0xffffffff;
 
-/// RTM_NEWLINK с атрибутом IFLA_WIRELESS — беспроводные события (конец сканирования
-/// и т. п., NetworkManager сканирует каждые несколько минут). Значок они не меняют:
-/// подключение и отключение приходят отдельным RTM_NEWLINK о состоянии интерфейса.
+// Числа в netlink — в порядке байт процессора: где младший и старший байт u16.
+const lo: u32 = if (builtin.cpu.arch.endian() == .little) 0 else 1;
+const hi: u32 = 1 - lo;
+
+/// RTM_NEWLINK с атрибутом IFLA_WIRELESS — беспроводные события (конец сканирования и т. п.,
+/// NetworkManager сканирует каждые несколько минут). Значок они не меняют: подключение и
+/// отключение приходят отдельным RTM_NEWLINK о состоянии интерфейса.
+/// У такого события атрибуты — IFLA_IFNAME и сразу IFLA_WIRELESS; фильтр смотрит тип второго
+/// атрибута. (Поиск атрибута в ядре, SKF_AD_NLATTR, на рассылках rtnetlink не срабатывает.)
+/// Короткие сообщения не трогаем: чтение за концом в BPF означает «отбросить».
 const route_filter = [_]sys.SockFilter{
-    .{ .code = LDX_IMM, .k = 32 }, // X = начало атрибутов: nlmsghdr (16) + ifinfomsg (16)
-    .{ .code = LD_IMM, .k = 11 }, // A = IFLA_WIRELESS
-    .{ .code = LD_W_ABS, .k = 0xfffff000 + 12 }, // A = смещение атрибута A от X (SKF_AD_NLATTR), 0 — нет
-    .{ .code = JEQ, .k = 0, .jt = 0, .jf = 1 },
-    .{ .code = RET, .k = KEEP },
-    .{ .code = RET, .k = 0 },
+    .{ .code = LD_B_ABS, .k = 32 + hi }, // 0: старший байт длины первого атрибута (IFNAME — короче 256)
+    .{ .code = JEQ, .k = 0, .jt = 0, .jf = 15 }, // 1: иначе — пропустить
+    .{ .code = LD_B_ABS, .k = 32 + lo }, // 2: длина первого атрибута
+    .{ .code = ADD, .k = 3 }, // 3–4: с выравниванием до 4
+    .{ .code = AND, .k = 0xfc },
+    .{ .code = ADD, .k = 32 + 4 }, // 5: конец заголовка второго атрибута
+    .{ .code = TAX, .k = 0 }, // 6
+    .{ .code = LD_LEN, .k = 0 }, // 7
+    .{ .code = JGE_X, .k = 0, .jt = 0, .jf = 8 }, // 8: сообщение короче — пропустить
+    .{ .code = TXA, .k = 0 }, // 9
+    .{ .code = SUB, .k = 4 }, // 10
+    .{ .code = TAX, .k = 0 }, // 11: X — начало второго атрибута
+    .{ .code = LD_B_IND, .k = 2 + lo }, // 12: тип, младший байт
+    .{ .code = JEQ, .k = 11, .jt = 0, .jf = 3 }, // 13: IFLA_WIRELESS?
+    .{ .code = LD_B_IND, .k = 2 + hi }, // 14: старший байт (без флагов NLA_F_*)
+    .{ .code = AND, .k = 0x3f },
+    .{ .code = JEQ, .k = 0, .jt = 1, .jf = 0 }, // 16: да — отбросить
+    .{ .code = RET, .k = KEEP }, // 17
+    .{ .code = RET, .k = 0 }, // 18
 };
 
 /// MurmurHash2 — им udevd подписывает подсистему в заголовке рассылки (как в libudev).

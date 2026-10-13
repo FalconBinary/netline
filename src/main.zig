@@ -210,7 +210,7 @@ pub fn main(init: std.process.Init.Minimal) void {
             .{ .fd = status.mgmt_fd, .events = sys.POLLIN },
         };
         _ = sys.poll(&fds, -1) catch continue;
-        if (sys.trace) traceWake(&fds);
+        if (sys.tracing()) traceWake(&fds);
 
         if (fds[0].revents != 0) readWayland();
         if (fds[1].revents != 0) onClockTimer();
@@ -868,7 +868,7 @@ fn diffRects(a: []const u32, b: []const u32, w: u32, h: u32, out: *[MAX_RECTS]Re
 fn render(i: u8) void {
     const b = &bars[i];
     const t0 = sys.traceStart();
-    defer if (sys.trace) sys.tracef("кадр {d}: {d} мкс", .{ i, sys.traceSince(t0) });
+    defer if (sys.tracing()) sys.tracef("кадр {d}: {d} мкс", .{ i, sys.traceSince(t0) });
     if (!ensureBuffers(i)) return;
     // рисуем в буфер, отличный от показанного, чтобы сравнить кадры
     const k: u1 = if (b.last) |l| ~l else 0;

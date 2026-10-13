@@ -618,8 +618,10 @@ var environ: [:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
 pub fn init(m: std.process.Init.Minimal) void {
     argv = m.args.vector;
     environ = m.environ.block.slice;
-    if (getenv("ZPANEL_TRACE")) |v| trace = v.len > 0 and !std.mem.eql(u8, v, "0");
-    if (trace) tracef("запуск", .{});
+    if (trace_built) {
+        if (getenv("ZPANEL_TRACE")) |v| trace = v.len > 0 and !std.mem.eql(u8, v, "0");
+        tracef("запуск", .{});
+    }
 }
 
 /// Окружение для execve с PATH, в начале которого папка исполняемого файла
@@ -682,11 +684,18 @@ fn envMatch(s: []const u8, name: []const u8) ?[]const u8 {
 }
 
 // ---------------------------------------------------------------- трассировка
-// ZPANEL_TRACE=1 — программы пишут в stderr, когда и почему просыпаются, сколько заняли
-// кадр и запуск. Метка — монотонное время в мс: его можно сравнивать между процессами
-// (клик в панели → первый кадр меню).
+// Сборка с -Dtrace=true и ZPANEL_TRACE=1 — программы пишут в stderr, когда и почему
+// просыпаются, сколько заняли кадр и запуск. Метка — монотонное время в мс: его можно
+// сравнивать между процессами (клик в панели → первый кадр меню).
 
-pub var trace = false;
+/// Замеры вкомпилированы (zig build -Dtrace=true). Иначе весь код трассировки выбрасывается
+/// при сборке: tracing() — константа false.
+const trace_built = @import("build_options").trace;
+var trace = false;
+
+pub inline fn tracing() bool {
+    return trace_built and trace;
+}
 
 fn monoUs() u64 {
     const ts = clockTs(1);
@@ -695,16 +704,16 @@ fn monoUs() u64 {
 
 /// Метка времени для замеров (мкс), 0 — трассировка выключена.
 pub fn traceStart() u64 {
-    return if (trace) monoUs() else 0;
+    return if (tracing()) monoUs() else 0;
 }
 
 /// Сколько мкс прошло с метки traceStart().
 pub fn traceSince(t0: u64) u64 {
-    return if (trace) monoUs() -% t0 else 0;
+    return if (tracing()) monoUs() -% t0 else 0;
 }
 
 pub fn tracef(comptime fmt: []const u8, args: anytype) void {
-    if (!trace) return;
+    if (!tracing()) return;
     const now = monoUs();
     const a0 = if (argv.len > 0) std.mem.span(argv[0]) else "zpanel";
     const name = a0[if (std.mem.lastIndexOfScalar(u8, a0, '/')) |i| i + 1 else 0..];

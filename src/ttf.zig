@@ -632,16 +632,17 @@ pub const Utf8 = struct {
 };
 
 /// Кэш «символ → номер глифа»: поиск по cmap — на каждый символ каждого кадра.
-const CpSlot = struct { cp: u32 = 0xffffffff, gid: u32 = 0 };
+/// В ячейке cp + 1, чтобы пустая (нулевая) таблица лежала в .bss, а не в файле.
+const CpSlot = struct { cp1: u32 = 0, gid: u32 = 0 };
 var cp_cache: [512]CpSlot = [_]CpSlot{.{}} ** 512;
 
 fn glyphFor(cp: u32) u32 {
     const f = fnt() orelse return 0;
     const slot = &cp_cache[(cp *% 2654435761) >> 23];
-    if (slot.cp == cp) return slot.gid;
+    if (slot.cp1 == cp +% 1) return slot.gid;
     const g0 = f.glyphIndex(cp);
     const g = if (g0 != 0 or cp == '?') g0 else f.glyphIndex('?');
-    slot.* = .{ .cp = cp, .gid = g };
+    slot.* = .{ .cp1 = cp +% 1, .gid = g };
     return g;
 }
 

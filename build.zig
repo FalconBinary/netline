@@ -7,6 +7,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const release = optimize != .Debug;
+    // замеры (ZPANEL_TRACE=1) — только в сборке с -Dtrace=true, в обычной их кода нет
+    const trace = b.option(bool, "trace", "вкомпилировать замеры: ZPANEL_TRACE=1 печатает пробуждения и время кадров") orelse false;
+    const opts = b.addOptions();
+    opts.addOption(bool, "trace", trace);
 
     // zpanel — сама панель; меню запускаются кликом по значкам; zbg — демон обоев
     const apps = [_]struct { name: []const u8, root: []const u8 }{
@@ -33,6 +37,7 @@ pub fn build(b: *std.Build) void {
                 .unwind_tables = if (release) .none else null,
             }),
         });
+        exe.root_module.addOptions("build_options", opts);
         b.installArtifact(exe);
     }
 }

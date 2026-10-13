@@ -519,8 +519,16 @@ fn validStr(x: Str, end: usize) bool {
     return @as(usize, x.off) + x.len <= end;
 }
 
+/// Строка с нулём на конце. Пустое поле ({0, 0}: у скрытых приложений нет иконки и папки)
+/// тоже годится — для пустых z() не вызывается.
 fn validZ(x: Str, end: usize) bool {
+    if (x.len == 0 and x.off == 0) return true;
     return @as(usize, x.off) + x.len < end and arena[x.off + x.len] == 0;
+}
+
+/// Путь: непустая строка с нулём на конце (дальше от него берётся z()).
+fn validPath(x: Str, end: usize) bool {
+    return x.len > 0 and validZ(x, end);
 }
 
 fn readExact(fd: i32, buf: []u8) bool {
@@ -565,7 +573,7 @@ fn readList(fd: i32) bool {
     // сначала отпечатки: если что-то поменялось, остальное и читать незачем
     if (!readExact(fd, std.mem.sliceAsBytes(watches[0..h.nwatch]))) return false;
     for (watches[0..h.nwatch]) |w| {
-        if (!validZ(w.path, end)) return false;
+        if (!validPath(w.path, end)) return false;
         const now = sys.stamp(w.path.z());
         if (!std.meta.eql(now, w.st)) {
             sys.tracef("кэш списка устарел: {s}", .{w.path.get()});
@@ -596,10 +604,10 @@ fn readList(fd: i32) bool {
         if (!validStr(e.name, end) or !validStr(e.f_name, end)) return false;
         e.uses = 0;
     }
-    for (icon_dirs[0..h.nicon]) |d| if (!validZ(d.path, end)) return false;
-    for (pix_dirs[0..h.npix]) |d| if (!validZ(d, end)) return false;
+    for (icon_dirs[0..h.nicon]) |d| if (!validPath(d.path, end)) return false;
+    for (pix_dirs[0..h.npix]) |d| if (!validPath(d, end)) return false;
     for (rp[0..h.nread], 0..) |x, i| {
-        if (!validZ(x, end)) return false;
+        if (!validPath(x, end)) return false;
         read_paths[i] = x.z();
     }
 

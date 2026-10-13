@@ -580,7 +580,7 @@ fn render() void {
     const k: u1 = if (card.last) |l| ~l else 0;
     if (card.bufs[k].busy) return;
     const t0 = sys.traceStart();
-    defer if (sys.trace) sys.tracef("кадр {d}: {d} мкс", .{ frames, sys.traceSince(t0) });
+    defer if (sys.tracing()) sys.tracef("кадр {d}: {d} мкс", .{ frames, sys.traceSince(t0) });
     app.layout();
     var cv = draw.Canvas{ .px = pixels(k), .w = @intCast(card.pw), .h = @intCast(card.ph) };
     S = @floatFromInt(card.scale);
