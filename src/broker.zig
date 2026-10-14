@@ -22,6 +22,7 @@ var sock: i32 = -1;
 pub const Cmd = struct {
     argv: ?[*:null]const ?[*:0]const u8 = null, // simple: words separated by spaces
     shell: ?[*:0]const u8 = null, // with special characters — passed whole to /bin/sh -c
+    alt: ?[*:null]const ?[*:0]const u8 = null, // a simple command to run instead if argv[0] isn't installed
 };
 
 /// Characters with which a string is just space-separated words and needs no shell.
@@ -52,6 +53,18 @@ pub fn compile(comptime s: ?[*:0]const u8) ?Cmd {
         for (0..n) |i| av[i] = words[i];
         const final = av;
         return .{ .argv = &final };
+    }
+}
+
+/// A command with a fallback for when its program isn't installed (doas → sudo): both simple,
+/// tried one after the other in the same process — no shell and no extra process.
+pub fn compileAlt(comptime s: ?[*:0]const u8, comptime alt: ?[*:0]const u8) ?Cmd {
+    comptime {
+        var c = compile(s) orelse return null;
+        const a = compile(alt) orelse return c;
+        if (c.argv == null or a.argv == null) @compileError("a command with a fallback must be simple: no shell characters");
+        c.alt = a.argv;
+        return c;
     }
 }
 
@@ -112,7 +125,7 @@ fn serve(fd: i32, cmds: []const ?Cmd) noreturn {
         switch (msg[0]) {
             'C' => if (n == 2 and msg[1] < cmds.len) {
                 if (cmds[msg[1]]) |c| {
-                    if (c.argv) |av| sys.spawnArgv(av, null) else if (c.shell) |sh| sys.spawnShell(sh);
+                    if (c.argv) |av| sys.spawnArgv(av, null, c.alt) else if (c.shell) |sh| sys.spawnShell(sh);
                 }
             },
             'D' => if (validDispatch(msg[1..])) mangoDispatch(msg[1..]),

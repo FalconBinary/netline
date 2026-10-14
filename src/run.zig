@@ -718,7 +718,7 @@ fn spawn(av: *const desk.Argv, dir: [:0]const u8) void {
     var ptrs: [64:null]?[*:0]const u8 = undefined;
     for (0..av.argc) |i| ptrs[i] = av.arg(i).ptr;
     if (av.argc < ptrs.len) ptrs[av.argc] = null;
-    sys.spawnArgv(&ptrs, dir);
+    sys.spawnArgv(&ptrs, dir, null);
 }
 
 fn addTerminal(av: *desk.Argv) void {

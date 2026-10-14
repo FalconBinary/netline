@@ -579,8 +579,9 @@ pub fn spawnShell(cmd: [*:0]const u8) void {
 }
 
 /// Runs a program without a shell, also detached. argv[0] without '/' is looked up in PATH;
-/// dir — working directory (null — don't change).
-pub fn spawnArgv(av: [*:null]const ?[*:0]const u8, dir: ?[*:0]const u8) void {
+/// dir — working directory (null — don't change). alt — run instead if the first program
+/// can't be started (isn't installed): the same process tries it, no extra fork or shell.
+pub fn spawnArgv(av: [*:null]const ?[*:0]const u8, dir: ?[*:0]const u8, alt: ?[*:null]const ?[*:0]const u8) void {
     const pid = fork() catch return;
     if (pid == 0) {
         _ = linux.syscall0(.setsid);
@@ -588,6 +589,7 @@ pub fn spawnArgv(av: [*:null]const ?[*:0]const u8, dir: ?[*:0]const u8) void {
         if (pid2 == 0) {
             if (dir) |d| _ = linux.syscall1(.chdir, @intFromPtr(d));
             execvp(av);
+            if (alt) |a| execvp(a);
             exit(127);
         }
         exit(0);

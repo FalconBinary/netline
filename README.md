@@ -152,8 +152,9 @@ Power off and sleep go through systemd-logind over D-Bus (no `systemctl`), log o
 logind if mango is unavailable. The header shows the user, host name and uptime.
 
 **Without logind** (runit + seatd) reboot and power off run `reboot_cmd` / `poweroff_cmd` from `config.zig` —
-by default `doas -n /usr/bin/reboot || sudo -n /usr/bin/reboot` (and the same for `poweroff`): doas is tried first,
-and if it is missing or has no rule — sudo. `-n` makes them fail instead of asking for a password nobody can type.
+by default `doas -n /usr/bin/reboot` and `doas -n /usr/bin/poweroff`; if doas isn't installed, `reboot_fallback` /
+`poweroff_fallback` run instead (`sudo -n …`) — in the same process, with no shell and no extra process.
+`-n` makes them fail instead of asking for a password nobody can type.
 One narrow rule without a password is needed, either for doas in `/etc/doas.conf`:
 
 ```
@@ -167,8 +168,8 @@ or for sudo (`sudo visudo -f /etc/sudoers.d/netline`):
 youruser ALL=(root) NOPASSWD: /usr/bin/reboot, /usr/bin/poweroff
 ```
 
-If only one of them is used, the command can be just that one (`"sudo -n /usr/bin/reboot"`): then no `/bin/sh` is started
-for the `||`. Sleep and hibernate are hidden then (with elogind installed, zpower uses it like logind and they are back).
+If doas is installed but the rule is for sudo, put the sudo command in `reboot_cmd`/`poweroff_cmd` itself.
+Without logind sleep and hibernate are hidden (with elogind installed, zpower uses it like logind and they are back).
 If the command didn't take the system down in 4 s, the menu says "Not allowed — check the doas/sudo rule".
 
 ### Calendar: zcal
@@ -566,7 +567,7 @@ The project used to be called zpanel. After installing netline:
 - `launcher_width`, `launcher_rows`, `launcher_icons`, `icon_theme`, `terminal` — the zrun launcher.
 - `wallpaper_dir`, `wallpaper_mode` — the wallpaper folder and how it's fitted.
 - `lock_cmd`, `power_confirm`, `lock_before_suspend` — locking and confirmations in the power menu.
-- `reboot_cmd`, `poweroff_cmd` — reboot and power off without logind (doas, otherwise sudo); `null` hides the buttons.
+- `reboot_cmd`, `poweroff_cmd` (+ `*_fallback` if doas isn't installed) — reboot and power off without logind; `null` hides the buttons.
 - `bt_service_on_cmd`, `bt_service_off_cmd` — Bluetooth on demand: when bluetoothd isn't running, the zbt toggle (and
   `zbt toggle`) starts it with this command and waits for it; turning Bluetooth off stops it again. `null` — not used.
 - `status_poll_s`, `sandbox` — the fallback poll (only while Wi‑Fi is connected) and the sandbox.

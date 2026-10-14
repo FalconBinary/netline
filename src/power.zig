@@ -71,8 +71,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     // the broker comes before all other connections so it holds no extra descriptors
     const cmds = [_]?broker.Cmd{
         comptime broker.compile(cfg.lock_cmd),
-        comptime broker.compile(cfg.reboot_cmd),
-        comptime broker.compile(cfg.poweroff_cmd),
+        comptime broker.compileAlt(cfg.reboot_cmd, cfg.reboot_fallback),
+        comptime broker.compileAlt(cfg.poweroff_cmd, cfg.poweroff_fallback),
     };
     have_broker = broker.start(&cmds);
 
