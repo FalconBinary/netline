@@ -15,6 +15,9 @@ pub const Error = error{ Invalid, Unsupported, TooLarge, NoMem, Io };
 pub const MAX_DIM: u32 = 16384;
 pub const MAX_PIXELS: u64 = 80 * 1000 * 1000;
 pub const MAX_FILE: usize = 128 * 1024 * 1024;
+/// The pixel limit for this program: the launcher lowers it for icons, so a huge PNG
+/// among them can't take hundreds of megabytes (up to 80 MP — 320 MB for the pixels alone).
+pub var max_pixels: u64 = MAX_PIXELS;
 
 // ================================================================= memory
 
@@ -45,7 +48,7 @@ pub const Image = struct {
 
 fn newImage(w: u32, h: u32) Error!Image {
     if (w == 0 or h == 0) return error.Invalid;
-    if (w > MAX_DIM or h > MAX_DIM or @as(u64, w) * h > MAX_PIXELS) return error.TooLarge;
+    if (w > MAX_DIM or h > MAX_DIM or @as(u64, w) * h > max_pixels) return error.TooLarge;
     return .{ .w = w, .h = h, .px = try alloc(u32, @as(usize, w) * h) };
 }
 
@@ -1235,6 +1238,8 @@ fn decodeJpeg(d: []const u8, need_w0: u32, need_h0: u32) Error!Image {
                         }
                     }
                 }
+                // the program's own limit applies to the output (already scaled down) — checked before the planes are allocated
+                if (@as(u64, (j.width + j.scale - 1) / j.scale) * ((j.height + j.scale - 1) / j.scale) > max_pixels) return error.TooLarge;
                 j.ncoef = if (j.scale == 8) 1 else 64;
                 const n = 8 / j.scale;
                 for (j.comps[0..nc]) |*c| {

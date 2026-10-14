@@ -191,16 +191,18 @@ fn onTick() void {
                 loaded = true;
                 nm.loadSaved();
                 refresh();
-                nm.scan();
+                if (nm.wifi_enabled) nm.scan();
             } else if (refresh_pending) {
                 refresh_pending = false;
                 refresh();
-            } else nm.scan(); // the results arrive as signals (AccessPointAdded, LastScan)
+            } else if (nm.wifi_enabled) nm.scan(); // the results arrive as signals (AccessPointAdded, LastScan)
         },
         .connecting => {
             ui.redrawText(ui.H() / 2 + 14, 14); // dots animation — only its row
             if (ticks > 90 * 1000 / 500) return fail("Timed out");
-            checkProgress();
+            // the result comes with the device's StateChanged signal; asking NM is only a fallback, once a second
+            // (iwd's answer is the reply to Connect — checking for it costs nothing)
+            if (nm.backend == .iwd or ticks % 2 == 0) checkProgress();
         },
         .done => ui.quit(),
         else => {},
@@ -279,7 +281,7 @@ fn chooseNet(i: usize, right: bool) void {
         .psk, .sae => setView(.password),
         .eap => {
             // iwd takes 802.1X settings only from a root-owned file — no form to fill in
-            if (nm.backend == .iwd) return ui.setMsg("802.1X with iwd: the administrator creates /var/lib/iwd/<SSID>.8021x");
+            if (nm.backend == .iwd) return ui.setMsg(iwd_eap);
             method = .peap;
             phase2 = 0;
             setView(.enterprise);
@@ -287,6 +289,8 @@ fn chooseNet(i: usize, right: bool) void {
         .wep => ui.setMsg("WEP is outdated and insecure — not supported"),
     }
 }
+
+const iwd_eap = "802.1X with iwd: the administrator creates /var/lib/iwd/<SSID>.8021x";
 
 fn connectSimple() void {
     if (nm.addAndActivate(.{ .ssid = target.ssid(), .hidden = target_hidden, .sec = target.sec }, target.ap.get())) {
@@ -432,6 +436,7 @@ fn submit() void {
                     if (nm.addAndActivate(.{ .ssid = ssid, .hidden = true, .sec = .psk, .psk = pw }, "")) startConnecting(.hidden) else ui.setMsg(nm.lastError());
                 },
                 else => {
+                    if (nm.backend == .iwd) return ui.setMsg(iwd_eap);
                     target.sec = .eap;
                     method = .peap;
                     phase2 = 0;

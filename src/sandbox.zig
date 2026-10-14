@@ -131,8 +131,7 @@ const simple = [_]linux.SYS{
     .sendmsg,         .recvmsg,       .memfd_create,    .ftruncate,
     .munmap,          .exit,          .exit_group,      .rt_sigreturn,
     .restart_syscall,
-    // Zig's panic handler resets signals before printing the message
-    .rt_sigaction,  .rt_sigprocmask,
+    // (no rt_sigaction/rt_sigprocmask: only Zig's default panic handler needed them, every program uses rt.panic)
 };
 
 const PROT_EXEC: u32 = 4;

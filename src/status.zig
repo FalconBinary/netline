@@ -147,6 +147,11 @@ pub fn btEvents() bool {
     return mgmt_fd >= 0;
 }
 
+/// Whether interface and rfkill changes arrive as events (otherwise the whole state is polled).
+pub fn events() bool {
+    return route_fd >= 0 and uevent_fd >= 0;
+}
+
 /// Drain mgmt events. true — something changed with the adapters (power, added, removed)
 /// or the channel is gone (then power is learned by polling again).
 pub fn drainMgmt() bool {
@@ -276,7 +281,7 @@ pub fn wifi() Wifi {
 }
 
 /// Signal level 1..3 from link quality in /proc/net/wireless (usually out of 70).
-fn signalLevel() u8 {
+pub fn signalLevel() u8 {
     var buf: [2048]u8 = undefined;
     const d = sys.readFile("/proc/net/wireless", &buf) orelse return 3;
     var lines = std.mem.splitScalar(u8, d, '\n');

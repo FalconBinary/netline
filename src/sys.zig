@@ -347,7 +347,7 @@ const SockaddrAbs = extern struct { family: u16, path: [108]u8 };
 
 fn abstractAddr(name: []const u8, out: *SockaddrAbs) usize {
     out.* = .{ .family = 1, .path = [_]u8{0} ** 108 };
-    const k = @min(name.len, 100);
+    const k: usize = @min(name.len, 100);
     @memcpy(out.path[1 .. 1 + k], name[0..k]); // path[0] = 0 — an abstract name
     return 2 + 1 + k;
 }

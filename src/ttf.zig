@@ -221,6 +221,9 @@ const Raster = struct {
     sx: f32, // pixels per font unit
     ox: f32, // offset: pixel = (x*sx - ox, oy - y*sx)
     oy: f32,
+    // how many more outlines a glyph may consist of: composites referring to composites
+    // could otherwise multiply into billions of walks (the depth limit alone doesn't stop that)
+    budget: u32 = 64,
 
     fn toPx(r: *const Raster, p: Pt) Pt {
         return .{ .x = p.x * r.sx - r.ox, .y = r.oy - p.y * r.sx };
@@ -324,7 +327,8 @@ const Raster = struct {
 
 /// Walk the glyph outlines (including composites) and feed them to the rasterizer.
 fn walkGlyph(f: *const Font, gid: u32, xf: Xf, r: *Raster, depth: u32) void {
-    if (depth > 6) return;
+    if (depth > 6 or r.budget == 0) return;
+    r.budget -= 1;
     const range = f.glyphRange(gid) orelse return;
     const g = range[0];
     const end = range[1];
@@ -510,8 +514,8 @@ fn midpoint(a: Pt, b: Pt) Pt {
 // ================================================================= glyph cache and text
 
 pub const Glyph = struct {
-    gid: u32 = 0xffffffff,
-    size: u16 = 0,
+    gid: u32 = 0,
+    size: u16 = 0, // 0 — an empty slot (so the zeroed table lives in .bss, not in the file)
     w: u16 = 0,
     h: u16 = 0,
     left: i16 = 0, // bitmap offset from the pen position along X
@@ -552,15 +556,12 @@ pub fn load(paths: []const []const u8) bool {
     return false;
 }
 
-fn hashIdx(gid: u32, size: u16) usize {
-    return @as(usize, (gid *% 2654435761) ^ (@as(u32, size) *% 40503)) % CACHE_N;
-}
-
 /// A glyph of the given size (in pixels per em) — from the cache or freshly rasterized.
 pub fn glyph(gid: u32, size: u16) ?*const Glyph {
     const f = fnt() orelse return null;
-    const hi = hashIdx(gid, size);
-    if (cache[hi].gid == gid and cache[hi].size == size) return &cache[hi];
+    if (size == 0) return null;
+    const slot = &cache[@as(usize, (gid *% 2654435761) ^ (@as(u32, size) *% 40503)) % CACHE_N];
+    if (slot.gid == gid and slot.size == size) return slot;
 
     const sx = @as(f32, @floatFromInt(size)) / f.upem;
     var g = Glyph{ .gid = gid, .size = size, .adv = f.advance(gid) * sx };
@@ -573,7 +574,8 @@ pub fn glyph(gid: u32, size: u16) ?*const Glyph {
         const top = @ceil(ymax * sx) + 1;
         const w_f = @ceil(xmax * sx) + 1 - left + 1;
         const h_f = top - (@floor(ymin * sx) - 1) + 1;
-        if (w_f > 0 and h_f > 0 and w_f <= 128 and h_f <= 128) {
+        // a broken bounding box (or a huge one) gets no bitmap, rather than an overflow below
+        if (w_f > 0 and h_f > 0 and w_f <= 128 and h_f <= 128 and @abs(left) < 16384 and @abs(top) < 16384) {
             const w: usize = @intFromFloat(w_f);
             const h: usize = @intFromFloat(h_f);
             if (pool_used + w * h > pool.len) { // cache is full — start over
@@ -600,8 +602,8 @@ pub fn glyph(gid: u32, size: u16) ?*const Glyph {
             pool_used += w * h;
         }
     }
-    cache[hi] = g;
-    return &cache[hi];
+    slot.* = g;
+    return slot;
 }
 
 /// UTF-8 decoder (invalid bytes are replaced by U+FFFD).

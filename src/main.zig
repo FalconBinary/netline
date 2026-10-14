@@ -113,7 +113,8 @@ fn actionIndex(item: cfg.Item) ?u8 {
 var conn: wl.Conn = .{};
 var kinds: [wl.MAX_IDS]Kind = [_]Kind{.none} ** wl.MAX_IDS;
 var owner: [wl.MAX_IDS]u8 = [_]u8{0} ** wl.MAX_IDS;
-var bars: [MAX_BARS]Bar = [_]Bar{.{}} ** MAX_BARS;
+// filled in main: with defaults here (scale = 1) the whole array would sit in the file's .data
+var bars: [MAX_BARS]Bar = undefined;
 
 var registry: u32 = 0;
 var compositor: u32 = 0;
@@ -149,6 +150,7 @@ var burst: u32 = 0; // how many more quick (once a second) checks after a click
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
+    for (&bars) |*b| b.* = .{};
     if (sys.getuid() == 0) {
         sys.log("running as root is not allowed", .{});
         sys.exit(1);
@@ -322,8 +324,21 @@ fn onClockTimer() void {
 
 fn onPollTimer() void {
     _ = drainTimer(poll_timer);
-    if (burst > 0) burst -= 1;
-    refreshStatus(true, true);
+    if (burst > 0) {
+        burst -= 1;
+        refreshStatus(true, true);
+    } else if (status.events()) {
+        // state changes arrive as kernel events: the regular poll only reads what sends none —
+        // the Wi‑Fi signal level and, without the mgmt channel, Bluetooth power
+        if (wifi_state.state == .connected) {
+            const lvl = status.signalLevel();
+            if (lvl != wifi_state.level) {
+                wifi_state.level = lvl;
+                markAllDirty();
+            }
+        }
+        if (!status.btEvents()) refreshStatus(false, true);
+    } else refreshStatus(true, true);
     if (mango.fd < 0 and mango.connect()) applyTags();
     armPoll();
 }

@@ -78,6 +78,10 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     if (bus.connectSystem()) |_| {
         logind_ok = hasLogind();
+        if (!logind_ok) { // nothing else to ask the bus: one descriptor less in the menu
+            sys.close(bus.fd);
+            bus.fd = -1;
+        }
     } else |_| {}
     if (sys.getenv("MANGO_INSTANCE_SIGNATURE")) |p| mango_fd = sys.connectUnix(p) catch -1;
 
@@ -91,7 +95,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
     readInfo();
-    if (!logind_ok and cfg.poweroff_cmd == null) ui.setMsg("systemd-logind is unavailable — only lock and log out work");
+    if (!logind_ok and cfg.poweroff_cmd == null) ui.setMsg("No systemd-logind: only lock and log out");
 
     const n: f32 = @floatFromInt(@max(nacts, 4));
     const width: u32 = @intFromFloat(2 * PAD + n * CELL + (n - 1) * GAP);
@@ -263,7 +267,7 @@ fn onTick() void {
     if (view == .wait and !logind_ok) {
         // the command didn't power the system off within 4 s — most likely doas refused
         view = .main;
-        ui.setMsg("The command failed — check the doas rule (doas -C /etc/doas.conf)");
+        ui.setMsg("The command failed — check the doas rule"); // one line: the card has no room for a second
         ui.resetFocus(false);
     }
 }

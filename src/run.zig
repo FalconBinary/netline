@@ -118,10 +118,10 @@ const MAX_EXES = 8192;
 var exes: [MAX_EXES]Exe = undefined;
 var nexes: usize = 0;
 
-// index hash tables (filled at most halfway)
-const EMPTY: u16 = 0xffff;
-var app_tab = [_]u16{EMPTY} ** (MAX_APPS * 2);
-var exe_tab = [_]u16{EMPTY} ** (MAX_EXES * 2);
+// index hash tables (filled at most halfway): a cell holds index + 1, 0 is empty —
+// so the tables are zeroed .bss and not 36 KB of 0xff in the file
+var app_tab = [_]u16{0} ** (MAX_APPS * 2);
+var exe_tab = [_]u16{0} ** (MAX_EXES * 2);
 
 fn hash(s: []const u8) usize {
     var h: u32 = 2166136261;
@@ -144,8 +144,8 @@ fn exeKey(i: u16) []const u8 {
 fn lookup(tab: []u16, key: []const u8, comptime keyOf: fn (u16) []const u8, slot: *usize) ?u16 {
     const mask = tab.len - 1;
     var i = hash(key) & mask;
-    while (tab[i] != EMPTY) : (i = (i + 1) & mask) {
-        if (std.mem.eql(u8, keyOf(tab[i]), key)) return tab[i];
+    while (tab[i] != 0) : (i = (i + 1) & mask) {
+        if (std.mem.eql(u8, keyOf(tab[i] - 1), key)) return tab[i] - 1;
     }
     slot.* = i;
     return null;
@@ -234,7 +234,7 @@ fn loadExes() void {
                 if (c >= 'A' and c <= 'Z') break false;
             } else true;
             exes[nexes] = .{ .name = s, .f_name = if (lower) s else keepFold(name) };
-            exe_tab[slot] = @intCast(nexes);
+            exe_tab[slot] = @intCast(nexes + 1);
             nexes += 1;
         }
     }
@@ -246,10 +246,10 @@ fn exeLess(_: void, a: Exe, b: Exe) bool {
 
 fn sortExes() void {
     std.sort.pdq(Exe, exes[0..nexes], {}, exeLess);
-    @memset(&exe_tab, EMPTY);
+    @memset(&exe_tab, 0);
     for (0..nexes) |i| {
         var slot: usize = 0;
-        if (lookup(&exe_tab, exes[i].name.get(), exeKey, &slot) == null) exe_tab[slot] = @intCast(i);
+        if (lookup(&exe_tab, exes[i].name.get(), exeKey, &slot) == null) exe_tab[slot] = @intCast(i + 1);
     }
 }
 
@@ -291,7 +291,7 @@ fn addApp(path: [:0]const u8, id: []const u8) void {
         desk.shownIn(e.only_show_in, e.not_show_in, desktops) and tryExecOk(e.try_exec);
     if (a.visible) fill(&a, &e, path);
     apps[napps] = a;
-    app_tab[slot] = @intCast(napps);
+    app_tab[slot] = @intCast(napps + 1);
     napps += 1;
 }
 
@@ -620,15 +620,15 @@ fn readList(fd: i32) bool {
     nread = h.nread;
     list_gen = h.gen;
     // hash tables — from the lists (faster than storing them)
-    @memset(&app_tab, EMPTY);
+    @memset(&app_tab, 0);
     for (0..napps) |i| {
         var slot: usize = 0;
-        if (lookup(&app_tab, apps[i].id.get(), appKey, &slot) == null) app_tab[slot] = @intCast(i);
+        if (lookup(&app_tab, apps[i].id.get(), appKey, &slot) == null) app_tab[slot] = @intCast(i + 1);
     }
-    @memset(&exe_tab, EMPTY);
+    @memset(&exe_tab, 0);
     for (0..nexes) |i| {
         var slot: usize = 0;
-        if (lookup(&exe_tab, exes[i].name.get(), exeKey, &slot) == null) exe_tab[slot] = @intCast(i);
+        if (lookup(&exe_tab, exes[i].name.get(), exeKey, &slot) == null) exe_tab[slot] = @intCast(i + 1);
     }
     return true;
 }
@@ -1170,6 +1170,7 @@ fn wid(w: ui.Widget) Wid {
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
+    img.max_pixels = 4 << 20; // icons: 2048×2048 at most
     if (sys.argIs(1, "run")) mode = .cmds;
     ui.begin("zrun");
     setupEnv();

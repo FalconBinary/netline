@@ -965,12 +965,21 @@ fn stopRepeat() void {
 
 fn repeatable(key: u32) bool {
     return switch (key) {
-        K_ESC, K_TAB, K_ENTER, K_KPENTER, 29, 97, 42, 54, 56, 100, 125, 126, 58 => false,
-        else => true,
+        K_ESC, K_TAB, K_ENTER, K_KPENTER => false,
+        else => !modifier(key),
+    };
+}
+
+/// Ctrl, Shift, Alt, Super, Caps Lock: they only change the state (the modifiers event), no menu reacts to them alone.
+fn modifier(key: u32) bool {
+    return switch (key) {
+        29, 97, 42, 54, 56, 100, 125, 126, 58 => true,
+        else => false,
     };
 }
 
 fn keyPress(key: u32) void {
+    if (modifier(key)) return; // no frame for pressing Shift before a capital letter
     const shift = mods & 1 != 0;
     const ctrl = mods & 4 != 0;
     redraw();

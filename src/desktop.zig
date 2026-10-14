@@ -393,7 +393,7 @@ pub fn scoreWord(h: []const u8, w: []const u8, fuzzy: bool, hl: ?*Hl) u32 {
             s += 600;
         } else if (wordStart(h, at)) {
             s += 400;
-        } else s -= @intCast(@min(at, 50) * 4);
+        } else s -= @as(i32, @intCast(@min(at, 50))) * 4; // (@min with a constant has a narrow type: u6 * 4 overflowed)
         if (w.len == h.len) s += 300;
         s -= @intCast(@min(h.len - w.len, 100));
         if (hl) |m| {
@@ -413,7 +413,7 @@ pub fn scoreWord(h: []const u8, w: []const u8, fuzzy: bool, hl: ?*Hl) u32 {
         const p = std.mem.indexOfPos(u8, h, hi, w[wi..][0..l]) orelse return 0;
         if (wordStart(h, p)) s += 15;
         if (last_end) |e| {
-            if (p == e) s += 10 else s -= @intCast(@min(p - e, 10) * 3);
+            if (p == e) s += 10 else s -= @as(i32, @intCast(@min(p - e, 10))) * 3; // (u4 * 3 overflowed on a gap of 6+)
         }
         mark(&tmp, p);
         last_end = p + l;
@@ -581,6 +581,16 @@ test "score order" {
     try tt.expect(exact > prefix and prefix > word and word > inner and inner > fuzzy and fuzzy > 0);
     try tt.expectEqual(0, scoreWord("gnome text editor", "gte", false, null));
     try tt.expectEqual(0, scoreWord("firefox", "xyz", true, null));
+}
+
+test "score: a far match and long gaps between fuzzy letters" {
+    // a substring far from the start (position 16+) and a fuzzy match with gaps of 6+ letters
+    // used to overflow (the launcher closed while typing)
+    try tt.expect(scoreWord("a long application name settings", "settings", true, null) > 0);
+    try tt.expect(scoreWord("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxtail", "ail", true, null) > 0);
+    try tt.expect(scoreWord("generic app000 settings", "ab", true, null) == 0);
+    try tt.expect(scoreWord("a-very-long-gap-before-b", "ab", true, null) > 0);
+    try tt.expect(scoreWord("apple" ++ "x" ** 200 ++ "banana", "ab", true, null) > 0);
 }
 
 test "query words and highlighting" {

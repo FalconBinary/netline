@@ -119,46 +119,60 @@ pub fn init() bool {
         setError("no access to the D-Bus system bus");
         return false;
     };
-    return attach();
+    return attach("");
 }
 
-/// bluetoothd is on the bus (a cheap check over the existing connection — works inside the sandbox).
-pub fn running() bool {
-    var w = dbus.W{ .buf = &body_buf };
-    w.str(BZ);
-    const r = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", w.bytes()) catch return false;
-    if (!r.ok()) return false;
-    var rr = r.reader();
-    return rr.boolean() and !rr.bad;
-}
-
-/// Find bluetoothd on an already connected bus: at startup and again after the service
-/// was started on demand (config.bt_service_on_cmd) — no new sockets, so it works in the sandbox.
-pub fn attach() bool {
+/// The unique bus name of the running bluetoothd (":1.42"), null — it isn't running.
+/// A cheap check over the existing connection — works inside the sandbox.
+fn nameOwner(buf: *[64]u8) ?[]const u8 {
     var w = dbus.W{ .buf = &body_buf };
     w.str(BZ);
     const r = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", w.bytes()) catch {
         setError("error talking to D-Bus");
-        return false;
+        return null;
     };
     if (!r.ok()) {
         setError("The Bluetooth service (bluetoothd) is not running");
-        return false;
+        return null;
     }
     var rr = r.reader();
     const o = rr.str();
-    owner_len = @min(o.len, owner_buf.len);
-    @memcpy(owner_buf[0..owner_len], o[0..owner_len]);
+    if (rr.bad or o.len == 0) return null;
+    const k = @min(o.len, buf.len);
+    @memcpy(buf[0..k], o[0..k]);
+    return buf[0..k];
+}
+
+/// The bluetoothd we talk to (empty — none yet).
+pub fn owner() []const u8 {
+    return owner_buf[0..owner_len];
+}
+
+/// Find bluetoothd on an already connected bus: at startup and again after the service
+/// was started on demand (config.bt_service_on_cmd). `not` — the instance that was just stopped:
+/// while it is still exiting it doesn't count. No new sockets, so it works in the sandbox.
+pub fn attach(not: []const u8) bool {
+    var ob: [64]u8 = undefined;
+    const o = nameOwner(&ob) orelse return false;
+    if (std.mem.eql(u8, o, not)) return false;
+    owner_len = o.len;
+    @memcpy(owner_buf[0..owner_len], o);
     // signals only from bluetoothd itself — a unicast "signal" from another process is ignored
     bus.setPeer(owner_buf[0..owner_len]);
 
-    // the bus handles our messages in order: the rule is in place before the next call, no need to wait for a reply
-    w = .{ .buf = &body_buf };
-    w.str("type='signal',sender='org.bluez'");
-    bus.callNoReply("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes());
+    // the bus handles our messages in order: the rule is in place before the next call, no need to wait for a reply.
+    // The rule names the well-known name, so it also covers a bluetoothd started later — added once.
+    if (!matched) {
+        var w = dbus.W{ .buf = &body_buf };
+        w.str("type='signal',sender='org.bluez'");
+        bus.callNoReply("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", w.bytes());
+        matched = true;
+    }
     bus.on_signal = onSignal;
     return true;
 }
+
+var matched = false;
 
 fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []const u8, body: []const u8) void {
     const eql = std.mem.eql;

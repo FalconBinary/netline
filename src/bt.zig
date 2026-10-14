@@ -35,10 +35,15 @@ var target: bz.Dev = .{};
 var ok = false;
 var ticks: u32 = 0;
 var timer_on = false;
-/// bluetoothd isn't running but can be started on demand (config.bt_service_on_cmd).
+/// The broker for Bluetooth on demand (config.bt_service_on_cmd) is running.
+var have_broker = false;
+/// bluetoothd isn't running but can be started on demand.
 var can_start = false;
 /// Ticks left while waiting for bluetoothd to appear after starting it (0 — not waiting).
 var starting: u32 = 0;
+/// The bluetoothd we stopped: until it has exited it must not be taken for the new one.
+var stopped_buf: [64]u8 = undefined;
+var stopped_len: usize = 0;
 const svc_cmds = [_]?broker.Cmd{
     broker.compile(cfg.bt_service_on_cmd),
     broker.compile(cfg.bt_service_off_cmd),
@@ -68,8 +73,8 @@ fn wid(w: ui.Widget) Wid {
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     // the broker (service on/off commands) forks before any other connection
-    const have_broker = cfg.bt_service_on_cmd != null and broker.start(&svc_cmds);
-    if (sys.argIs(1, "toggle")) toggleCli(have_broker);
+    have_broker = cfg.bt_service_on_cmd != null and broker.start(&svc_cmds);
+    if (sys.argIs(1, "toggle")) toggleCli();
     if (sys.argIs(1, "scan")) scanCli();
     ui.begin("zbt");
     ok = bz.init();
@@ -99,28 +104,20 @@ pub fn main(init: std.process.Init.Minimal) void {
 }
 
 /// `zbt toggle` (right click on the panel icon): power the adapter on/off; with Bluetooth on demand
-/// it also starts and stops the service itself.
-fn toggleCli(have_broker: bool) noreturn {
+/// it also starts and stops the service itself. The broker reads its order even after we exit
+/// (the message is already in its socket), so there is nothing to wait for.
+fn toggleCli() noreturn {
     if (!bz.init()) {
         if (!have_broker or bz.bus.fd < 0) fatalCli();
         broker.run(0); // the service is off — start it; the adapter comes up powered
-        pause(300); // let the broker spawn the command before we exit
         sys.exit(0);
     }
     _ = bz.load();
     if (bz.adapter.len == 0) fatalCli();
     const on = !bz.powered;
     if (!bz.setPowered(on)) fatalCli();
-    if (!on and have_broker and cfg.bt_service_off_cmd != null) {
-        broker.run(1);
-        pause(300);
-    }
+    if (!on and have_broker and cfg.bt_service_off_cmd != null) broker.run(1);
     sys.exit(0);
-}
-
-fn pause(ms: i32) void {
-    var none = [0]sys.PollFd{};
-    _ = sys.poll(&none, ms) catch {};
 }
 
 fn fatalCli() noreturn {
@@ -213,11 +210,6 @@ fn busFd() i32 {
     return if (ok) bz.bus.fd else -1;
 }
 
-/// The broker is there (the off command is only meaningful with Bluetooth on demand).
-fn canStop() bool {
-    return cfg.bt_service_on_cmd != null;
-}
-
 /// Start bluetoothd on demand and wait for it on the bus (up to 8 s, checked every tick).
 fn startService() void {
     broker.run(0);
@@ -229,22 +221,31 @@ fn startService() void {
 }
 
 fn waitService() void {
-    if (bz.running() and bz.attach()) {
+    starting -= 1;
+    if (bz.attach(stopped_buf[0..stopped_len])) {
         starting = 0;
         can_start = false;
         ok = true;
-        timer_on = false;
-        armTimer();
+        armTimer(); // the waiting timer is off unless the list needs one
         start();
         return ui.redraw();
     }
-    starting -= 1;
     if (starting == 0) {
         ui.setMsg("The Bluetooth service did not start — check the doas rule");
-        timer_on = false;
         armTimer();
     }
     ui.redrawText(ui.H() / 2 + 14, 14);
+}
+
+/// Bluetooth on demand: with the adapter off, stop the service too (it blocks the radio).
+fn stopService() void {
+    broker.run(1);
+    const o = bz.owner();
+    stopped_len = @min(o.len, stopped_buf.len);
+    @memcpy(stopped_buf[0..stopped_len], o[0..stopped_len]);
+    ok = false;
+    can_start = true;
+    ui.redraw();
 }
 
 fn fieldAt(idx: u16) ?*ui.Field {
@@ -551,14 +552,7 @@ fn activate(w: ui.Widget, right: bool) void {
             }
             const on = !bz.powered;
             if (!bz.setPowered(on)) return ui.setMsg(bz.lastError());
-            if (!on and cfg.bt_service_off_cmd != null and canStop()) {
-                // Bluetooth on demand: with the adapter off, stop the service and block the radio too
-                broker.run(1);
-                ok = false;
-                can_start = true;
-                ui.redraw();
-                return;
-            }
+            if (!on and have_broker and cfg.bt_service_off_cmd != null) return stopService();
             refresh();
         },
         .back => goBack(),

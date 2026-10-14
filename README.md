@@ -96,8 +96,9 @@ and stored in its profiles (readable by root only). In zwifi's memory passwords 
 disconnecting, "forget" and the radio toggle work the same way. The password goes to iwd through zwifi's own agent
 (`net.connman.iwd.Agent`): iwd asks for it during the connection, the agent answers only iwd's own bus name and wipes the
 password right after. iwd saves a network only after it connected. 802.1X networks with iwd need a profile written by root
-(`/var/lib/iwd/<SSID>.8021x`, see iwd.network(5)) — the menu says so instead of showing the form. D-Bus access to iwd is
-granted to the `wheel` and `netdev` groups.
+(`/var/lib/iwd/<SSID>.8021x`, see iwd.network(5)) — the menu says so instead of showing the form. The radio toggle finds the
+adapter even while it is off and also lifts an rfkill soft block (iwd's `Adapter.Powered`). D-Bus access to iwd is granted by
+its policy file to certain groups (usually `wheel` or `netdev` — check `/usr/share/dbus-1/system.d/iwd-dbus.conf`).
 
 ### Bluetooth: zbt
 
@@ -236,7 +237,8 @@ The panel uses practically nothing while nothing changes (measured: 0 wakeups an
   Every line of `watch all-tags` is a full snapshot of all monitors, so of the lines that arrived together only the last one
   is parsed; monitors missing from the snapshot (unplugged) free their slot.
 - **Small binaries.** Our own panic handler instead of the standard one (stack printing and formatting),
-  buffers in `.bss`: all eight programs together are about 1.6 MB (ReleaseSafe, x86_64), the panel in memory is ~0.9 MB
+  buffers and zero-initialized tables in `.bss` (no space in the file, no memory until touched): all eight programs together
+  are about 1.5 MB (ReleaseSafe, x86_64), the panel in memory is ~0.9 MB
   on a 1600-pixel-wide screen, 0.4 MB of which are the two frame buffers the compositor reads.
 
 Measured (aarch64, headless sway): 10 s idle — 0 wakeups and 0 µs of CPU; 400 mouse movements
@@ -295,6 +297,18 @@ Measured in the same VM, before → after this version:
 | theme saved by vim: panel frames / zbg CPU with a PNG wallpaper | 3 / 47 ms | 1 / 0 ms |
 | theme saved without a color change: panel frames | 4 | 0 |
 
+The next version, measured the same way:
+
+| | before | after |
+|---|---|---|
+| all eight binaries, x86_64 / aarch64 | 1.65 / 1.48 MB | 1.52 / 1.35 MB |
+| panel: RSS on a 1600-pixel screen | 916 KB | 880 KB |
+| panel: the fallback poll while Wi‑Fi is connected | rereads Wi‑Fi and Bluetooth | reads only the signal level |
+| zbt with Bluetooth on demand: wakeups over 5 s after starting the service | 10 | 0 |
+| `zbt toggle`: time to return | 308 ms | 3 ms |
+| zwifi (NetworkManager): state requests while connecting | every 0.5 s | once a second, plus on signals |
+| menus: frames for pressing Shift, Ctrl, Alt alone | 1 each | 0 |
+
 ### Timing: `NETLINE_TRACE=1`
 
 The timing code exists only in a `-Dtrace=true` build (a normal build has none of it). With the variable `NETLINE_TRACE=1`
@@ -336,7 +350,8 @@ The panel is split into two processes.
 - open the mango IPC socket and hand it to the panel.
 
 **The panel** locks itself down after initialization:
-- **seccomp** — a system call allowlist. No `exec`, `fork`, `socket`, `connect`, `ptrace`, `mprotect`.
+- **seccomp** — a system call allowlist. No `exec`, `fork`, `socket`, `connect`, `ptrace`, `mprotect`, and no signal
+  handlers or masks (`rt_sigaction`, `rt_sigprocmask` — checked with strace: no program needs them once locked down).
   `mmap` is allowed only without `PROT_EXEC`, `openat` read-only, `ioctl` only the Bluetooth state request.
   Any other call kills the process immediately.
 - **Landlock** — read access only to `/sys`, `/proc`, tzdata and the theme folder. Writing is forbidden everywhere, TCP is forbidden,
@@ -364,11 +379,13 @@ A repeated launch closes a menu only if it comes from the same user; only the sa
 The menus and zbg find each other through abstract sockets (`zwifi-<uid>`, `zbg-<uid>`), and anyone on the machine can create
 such a name first. So the owner is checked (`SO_PEERCRED`): a name taken by another user doesn't make a menu or zbg exit
 (they run without the lock or the control socket and say so), and zwall doesn't talk to a stranger's "zbg".
-D-Bus signals are accepted only from the service itself (NetworkManager, bluetoothd), by its unique bus name.
+D-Bus signals are accepted only from the service itself (NetworkManager, iwd, bluetoothd), by its unique bus name.
 Frame buffers are created with `MFD_NOEXEC_SEAL` (Linux ≥ 6.3, otherwise as before): this memory can never be made executable,
 and on kernels 6.3–6.5 with `vm.memfd_noexec = 2` the panel would otherwise get no buffers at all.
-The image decoders check all bounds and limit sizes (up to 16384 px per side, 80 MP, files up to 128 MB);
+The image decoders check all bounds and limit sizes (up to 16384 px per side, 80 MP, files up to 128 MB; zrun takes icons
+up to 2048×2048, so one huge PNG among them can't make the launcher take hundreds of megabytes);
 broken files and "bombs" give an error, not a buffer overrun; they have been through mutation fuzzing.
+The font engine bounds composite glyphs (at most 64 outlines per glyph), so a crafted font can't hang the drawing.
 
 Parsing of all input data (the Wayland protocol, D-Bus, mango JSON, netlink, tzdata, the theme file, JPEG, PNG) is bounds-checked and protected against overflows.
 
@@ -400,8 +417,9 @@ sudo pacman -S --needed git networkmanager bluez bluez-utils ttf-dejavu swaylock
 sudo systemctl enable --now NetworkManager bluetooth
 ```
 
-The menu doesn't need `bluez-utils` — it's only for diagnostics (`bluetoothctl`). If Wi‑Fi used to be brought up with iwd
-or netctl without NetworkManager, turn them off: zwifi works through NetworkManager.
+The menu doesn't need `bluez-utils` — it's only for diagnostics (`bluetoothctl`). zwifi works through NetworkManager,
+or through iwd alone when NetworkManager isn't running; if Wi‑Fi used to be brought up with netctl or a hand-started
+wpa_supplicant, turn that off.
 
 ### 2. Zig 0.16
 
@@ -498,7 +516,7 @@ netline &
 
 - **The panel didn't appear** — run `netline` in a terminal and read the message: most often it's an old mango
   (≥ 0.14 is needed) or it wasn't started from a mango session.
-- **zwifi: "NetworkManager is unavailable"** — the service isn't running (step 1).
+- **zwifi: "Wi‑Fi service is unavailable"** — neither NetworkManager nor iwd is running (step 1).
 - **zbt doesn't see a device** — `zbt scan` shows everything bluetoothd sees and suggests what to do.
 - **Wrong font, terminal or lock command** — `clock_font_paths`, `font_paths`, `terminal` (`foot`), `lock_cmd`
   (`swaylock -f`) and `wallpaper_dir` in `src/config.zig`; after editing — step 4 again.

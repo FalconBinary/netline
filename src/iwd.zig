@@ -22,11 +22,15 @@ const STATION = "net.connman.iwd.Station";
 const DEVICE = "net.connman.iwd.Device";
 const NETWORK = "net.connman.iwd.Network";
 const KNOWN = "net.connman.iwd.KnownNetwork";
+const ADAPTER = "net.connman.iwd.Adapter";
 const AGENT_MGR = "net.connman.iwd.AgentManager";
 const AGENT = "net.connman.iwd.Agent";
 const AGENT_PATH = "/org/netline/zwifi";
 
+/// The device object: the Device interface, and Station while it is powered (same path).
 var station: nm.Path = .{};
+/// Its adapter: Adapter.Powered is the rfkill soft block.
+var adapter: nm.Path = .{};
 var body_buf: [4 * 1024]u8 = undefined;
 var connect_serial: u32 = 0;
 /// The password for the connection in progress: handed to iwd once, on its request.
@@ -77,35 +81,45 @@ pub fn init(owner: []const u8) bool {
     return true;
 }
 
-/// The first device in station mode — that's the one the menu works with.
+/// The first device in station mode — that's the one the menu works with. It is found by its Device
+/// interface: a powered-off device has no Station interface, and the menu must still be able to turn it on.
 fn gotObjects(sc: *Scan, _: usize, rep: dbus.Reply) void {
     if (!rep.ok()) return;
+    const eql = std.mem.eql;
     var r = rep.reader();
     const end = r.arrayEnd(8);
     while (r.p < end and !r.bad and !sc.found) {
         r.alignTo(8);
         const path = r.str();
-        var is_station = false;
+        var is_dev = false;
+        var is_station = true; // Mode: "station" (the default), "ap" or "ad-hoc"
         var powered: ?bool = null;
+        var adp: []const u8 = "";
         const iend = r.arrayEnd(8);
         while (r.p < iend and !r.bad) {
             r.alignTo(8);
             const iface = r.str();
-            if (std.mem.eql(u8, iface, STATION)) is_station = true;
+            const dev = eql(u8, iface, DEVICE);
+            if (dev) is_dev = true;
             const pend = r.arrayEnd(8);
             while (r.p < pend and !r.bad) {
                 r.alignTo(8);
                 const key = r.str();
                 const vs = r.sig();
-                if (std.mem.eql(u8, iface, DEVICE) and std.mem.eql(u8, key, "Powered") and std.mem.eql(u8, vs, "b")) {
+                if (dev and eql(u8, key, "Powered") and eql(u8, vs, "b")) {
                     powered = r.boolean();
+                } else if (dev and eql(u8, key, "Mode") and eql(u8, vs, "s")) {
+                    is_station = eql(u8, r.str(), "station");
+                } else if (dev and eql(u8, key, "Adapter") and eql(u8, vs, "o")) {
+                    adp = r.str();
                 } else r.skip(vs);
             }
             r.p = @max(r.p, pend);
         }
         r.p = @max(r.p, iend);
-        if (is_station and !r.bad) {
+        if (is_dev and is_station and !r.bad) {
             station.set(path);
+            adapter.set(adp);
             sc.found = true;
             sc.powered = powered;
         }
@@ -192,13 +206,28 @@ fn wipePending() void {
 // ================================================================= radio and scanning
 
 pub fn setEnabled(on: bool) bool {
+    if (!setPowered(station.get(), DEVICE, on)) {
+        // the adapter itself is off (rfkill soft block, e.g. the airplane key): Adapter.Powered lifts it,
+        // then the device comes up within a moment
+        if (!on or adapter.len == 0 or !setPowered(adapter.get(), ADAPTER, true)) return false;
+        var attempt: u32 = 0;
+        while (!setPowered(station.get(), DEVICE, true)) : (attempt += 1) {
+            if (attempt == 20) return false;
+            var none = [0]sys.PollFd{};
+            _ = sys.poll(&none, 50) catch {};
+        }
+    }
+    nm.wifi_enabled = on;
+    return true;
+}
+
+fn setPowered(path: []const u8, iface: []const u8, on: bool) bool {
     var w = dbus.W{ .buf = &body_buf };
-    w.str(DEVICE);
+    w.str(iface);
     w.str("Powered");
     w.sig("b");
     w.boolean(on);
-    _ = call(station.get(), PROPS, "Set", "ssv", w.bytes()) orelse return false;
-    nm.wifi_enabled = on;
+    _ = call(path, PROPS, "Set", "ssv", w.bytes()) orelse return false;
     return true;
 }
 
