@@ -16,9 +16,7 @@ Every icon opens its own menu in the same style — and every menu has its own c
 | **zpower** | lock, log out, sleep, hibernate, reboot, power off | systemd-logind over D-Bus or doas/sudo rules, mango IPC |
 | **zcal** | calendar on a click on the clock | — |
 
-```
-[ ⠿  ━━ • • · · ● · · · ]   Mon, 12 October 2026  13:31   [ wifi  bt  wallpaper  ⏻ ]
-```
+![netline panel](docs/panel.png)
 
 ## Features
 
@@ -173,6 +171,8 @@ Without logind sleep and hibernate are hidden (with elogind installed, zpower us
 If the command didn't take the system down in 4 s, the menu says "Not allowed — check the doas/sudo rule".
 
 ### Calendar: zcal
+
+<img src="docs/zcal.png" alt="zcal" width="336">
 
 The month with "today" highlighted, weeks start on Monday, weekends are colored.
 `←`/`→` (or `PgUp`/`PgDn`, the wheel) — month, `↑`/`↓` — year, `Home` or a click on the month name — back to today.
