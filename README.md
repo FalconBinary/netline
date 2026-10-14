@@ -13,7 +13,7 @@ Every icon opens its own menu in the same style — and every menu has its own c
 | **zbt** | Bluetooth menu: connecting, pairing, battery | BlueZ over D-Bus |
 | **zwall** | wallpaper picker with thumbnails | the zbg daemon |
 | **zbg** | wallpaper daemon (instead of swaybg) | Wayland |
-| **zpower** | lock, log out, sleep, hibernate, reboot, power off | systemd-logind over D-Bus or doas rules, mango IPC |
+| **zpower** | lock, log out, sleep, hibernate, reboot, power off | systemd-logind over D-Bus or doas/sudo rules, mango IPC |
 | **zcal** | calendar on a click on the clock | — |
 
 ```
@@ -152,14 +152,24 @@ Power off and sleep go through systemd-logind over D-Bus (no `systemctl`), log o
 logind if mango is unavailable. The header shows the user, host name and uptime.
 
 **Without logind** (runit + seatd) reboot and power off run `reboot_cmd` / `poweroff_cmd` from `config.zig` —
-by default `doas /usr/bin/reboot` and `doas /usr/bin/poweroff`, which need narrow rules in `/etc/doas.conf`:
+by default `doas -n /usr/bin/reboot || sudo -n /usr/bin/reboot` (and the same for `poweroff`): doas is tried first,
+and if it is missing or has no rule — sudo. `-n` makes them fail instead of asking for a password nobody can type.
+One narrow rule without a password is needed, either for doas in `/etc/doas.conf`:
 
 ```
 permit nopass youruser as root cmd /usr/bin/poweroff args
 permit nopass youruser as root cmd /usr/bin/reboot args
 ```
 
-Sleep and hibernate are hidden then. If the command didn't take the system down in 4 s, the menu says the doas rule is missing.
+or for sudo (`sudo visudo -f /etc/sudoers.d/netline`):
+
+```
+youruser ALL=(root) NOPASSWD: /usr/bin/reboot, /usr/bin/poweroff
+```
+
+If only one of them is used, the command can be just that one (`"sudo -n /usr/bin/reboot"`): then no `/bin/sh` is started
+for the `||`. Sleep and hibernate are hidden then (with elogind installed, zpower uses it like logind and they are back).
+If the command didn't take the system down in 4 s, the menu says "Not allowed — check the doas/sudo rule".
 
 ### Calendar: zcal
 
@@ -398,7 +408,7 @@ A seccomp violation shows up in `dmesg` (`audit: type=1326 ... syscall=N`). For 
 - **Linux ≥ 5.13** for Landlock (optional), x86_64, aarch64, riscv64.
 - **MangoWM ≥ 0.14** — IPC via `$MANGO_INSTANCE_SIGNATURE`. The old `dwl-ipc` was removed from mango in 0.15 and is not supported.
 - A TrueType font for the clock and menus (DejaVu Sans or Noto Sans are almost everywhere; path lists — `clock_font_paths` and `font_paths` in `config.zig`).
-- Services: **NetworkManager or iwd** (zwifi), **BlueZ** (zbt), **systemd-logind**, elogind or narrow doas rules (zpower).
+- Services: **NetworkManager or iwd** (zwifi), **BlueZ** (zbt), **systemd-logind**, elogind or narrow doas/sudo rules (zpower).
 - Programs: `swaylock` (or any other command in `lock_cmd`) and a terminal for `Shift+Enter` in zrun (`foot` by default).
   `rofi`, `nmcli`, `bluetoothctl` and `swaybg` are no longer needed.
 
@@ -556,7 +566,7 @@ The project used to be called zpanel. After installing netline:
 - `launcher_width`, `launcher_rows`, `launcher_icons`, `icon_theme`, `terminal` — the zrun launcher.
 - `wallpaper_dir`, `wallpaper_mode` — the wallpaper folder and how it's fitted.
 - `lock_cmd`, `power_confirm`, `lock_before_suspend` — locking and confirmations in the power menu.
-- `reboot_cmd`, `poweroff_cmd` — reboot and power off without logind (doas rules); `null` hides the buttons.
+- `reboot_cmd`, `poweroff_cmd` — reboot and power off without logind (doas, otherwise sudo); `null` hides the buttons.
 - `bt_service_on_cmd`, `bt_service_off_cmd` — Bluetooth on demand: when bluetoothd isn't running, the zbt toggle (and
   `zbt toggle`) starts it with this command and waits for it; turning Bluetooth off stops it again. `null` — not used.
 - `status_poll_s`, `sandbox` — the fallback poll (only while Wi‑Fi is connected) and the sandbox.

@@ -6,7 +6,7 @@
 //! Lock, log out, sleep, hibernate, reboot, power off.
 //! Power goes through systemd-logind over D-Bus (no systemctl), logout through the mango IPC
 //! (or logind if mango is unavailable). Without logind (runit, seatd) reboot and power off run
-//! reboot_cmd/poweroff_cmd from config.zig (e.g. narrow doas rules); sleep is then unavailable.
+//! reboot_cmd/poweroff_cmd from config.zig (narrow doas or sudo rules); sleep is then unavailable.
 //! Locking and those commands are started by a small broker process:
 //! zpower itself cannot launch programs after startup.
 //! Keys: ←/→ and Enter, Esc; L — lock, E — log out, S — sleep, H — hibernate,
@@ -265,9 +265,9 @@ fn onTick() void {
         return;
     }
     if (view == .wait and !logind_ok) {
-        // the command didn't power the system off within 4 s — most likely doas refused
+        // the command didn't power the system off within 4 s — most likely doas/sudo refused
         view = .main;
-        ui.setMsg("The command failed — check the doas rule"); // one line: the card has no room for a second
+        ui.setMsg("Not allowed — check the doas/sudo rule"); // one line: the card has no room for a second
         ui.resetFocus(false);
     }
 }

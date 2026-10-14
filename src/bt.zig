@@ -231,7 +231,7 @@ fn waitService() void {
         return ui.redraw();
     }
     if (starting == 0) {
-        ui.setMsg("The Bluetooth service did not start — check the doas rule");
+        ui.setMsg("The Bluetooth service did not start — check the doas/sudo rule");
         armTimer();
     }
     ui.redrawText(ui.H() / 2 + 14, 14);

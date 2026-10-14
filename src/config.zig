@@ -176,15 +176,19 @@ pub const wallpaper_dir = "~/Pictures/wallpapers";
 pub const wallpaper_mode: enum { fill, fit } = .fill;
 
 pub const lock_cmd = "swaylock -f";
-/// Without systemd-logind (e.g. Void with runit) zpower reboots and powers off with these commands:
-/// narrow doas rules without a password, e.g. "permit nopass user as root cmd /usr/bin/poweroff args".
-/// null — the button is hidden when logind is absent.
-pub const reboot_cmd: ?[*:0]const u8 = "doas /usr/bin/reboot";
-pub const poweroff_cmd: ?[*:0]const u8 = "doas /usr/bin/poweroff";
+/// Without systemd-logind (e.g. Void with runit) zpower reboots and powers off with these commands.
+/// By default doas, and if it is missing or has no rule — sudo; -n: fail instead of asking for a password
+/// nobody can type. Needs a narrow rule without a password, either one:
+///   /etc/doas.conf:         permit nopass youruser as root cmd /usr/bin/poweroff args
+///   /etc/sudoers.d/netline: youruser ALL=(root) NOPASSWD: /usr/bin/reboot, /usr/bin/poweroff
+/// Only one of the two in use — keep just that one, e.g. "sudo -n /usr/bin/reboot" (then no /bin/sh is
+/// started for the "||"). null — the button is hidden when logind is absent.
+pub const reboot_cmd: ?[*:0]const u8 = "doas -n /usr/bin/reboot || sudo -n /usr/bin/reboot";
+pub const poweroff_cmd: ?[*:0]const u8 = "doas -n /usr/bin/poweroff || sudo -n /usr/bin/poweroff";
 
 /// Bluetooth on demand: when bluetoothd isn't running, zbt's toggle (and `zbt toggle`) runs
 /// bt_service_on_cmd and waits for the service; turning Bluetooth off runs bt_service_off_cmd.
-/// For void-hardened: "doas /usr/local/sbin/vh-bluetooth on" / "… off". null — not used.
+/// For void-hardened: "doas -n /usr/local/sbin/vh-bluetooth on" / "… off" (or the same with sudo -n). null — not used.
 pub const bt_service_on_cmd: ?[*:0]const u8 = null;
 pub const bt_service_off_cmd: ?[*:0]const u8 = null;
 
