@@ -14,6 +14,7 @@ const draw = @import("draw.zig");
 const theme = @import("theme.zig");
 const cfg = @import("config.zig");
 const bz = @import("bz.zig");
+const broker = @import("broker.zig");
 const ui = @import("ui.zig");
 const rt = @import("rt.zig");
 
@@ -34,6 +35,14 @@ var target: bz.Dev = .{};
 var ok = false;
 var ticks: u32 = 0;
 var timer_on = false;
+/// bluetoothd isn't running but can be started on demand (config.bt_service_on_cmd).
+var can_start = false;
+/// Ticks left while waiting for bluetoothd to appear after starting it (0 — not waiting).
+var starting: u32 = 0;
+const svc_cmds = [_]?broker.Cmd{
+    broker.compile(cfg.bt_service_on_cmd),
+    broker.compile(cfg.bt_service_off_cmd),
+};
 
 const OpKind = enum { none, connect, disconnect, pair, connect_after_pair, ignore };
 var op: OpKind = .none;
@@ -58,16 +67,17 @@ fn wid(w: ui.Widget) Wid {
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
-    if (sys.argIs(1, "toggle")) {
-        if (!bz.init()) fatalCli();
-        _ = bz.load();
-        if (bz.adapter.len == 0 or !bz.setPowered(!bz.powered)) fatalCli();
-        sys.exit(0);
-    }
+    // the broker (service on/off commands) forks before any other connection
+    const have_broker = cfg.bt_service_on_cmd != null and broker.start(&svc_cmds);
+    if (sys.argIs(1, "toggle")) toggleCli(have_broker);
     if (sys.argIs(1, "scan")) scanCli();
     ui.begin("zbt");
     ok = bz.init();
-    if (!ok) ui.setMsg(bz.lastError());
+    if (!ok) {
+        // bluetoothd is off by design (Bluetooth on demand) — offer the toggle instead of an error
+        can_start = have_broker and bz.bus.fd >= 0;
+        if (!can_start) ui.setMsg(bz.lastError());
+    }
     ui.run(.{
         .width = cfg.menu_width,
         .height = cfg.menu_height,
@@ -86,6 +96,31 @@ pub fn main(init: std.process.Init.Minimal) void {
         .cleanup = cleanup,
         .hover_local = true,
     }, .{}, .{});
+}
+
+/// `zbt toggle` (right click on the panel icon): power the adapter on/off; with Bluetooth on demand
+/// it also starts and stops the service itself.
+fn toggleCli(have_broker: bool) noreturn {
+    if (!bz.init()) {
+        if (!have_broker or bz.bus.fd < 0) fatalCli();
+        broker.run(0); // the service is off — start it; the adapter comes up powered
+        pause(300); // let the broker spawn the command before we exit
+        sys.exit(0);
+    }
+    _ = bz.load();
+    if (bz.adapter.len == 0) fatalCli();
+    const on = !bz.powered;
+    if (!bz.setPowered(on)) fatalCli();
+    if (!on and have_broker and cfg.bt_service_off_cmd != null) {
+        broker.run(1);
+        pause(300);
+    }
+    sys.exit(0);
+}
+
+fn pause(ms: i32) void {
+    var none = [0]sys.PollFd{};
+    _ = sys.poll(&none, ms) catch {};
 }
 
 fn fatalCli() noreturn {
@@ -178,6 +213,40 @@ fn busFd() i32 {
     return if (ok) bz.bus.fd else -1;
 }
 
+/// The broker is there (the off command is only meaningful with Bluetooth on demand).
+fn canStop() bool {
+    return cfg.bt_service_on_cmd != null;
+}
+
+/// Start bluetoothd on demand and wait for it on the bus (up to 8 s, checked every tick).
+fn startService() void {
+    broker.run(0);
+    starting = 16;
+    ui.clearMsg();
+    ui.setTimer(500, 500);
+    timer_on = true;
+    ui.redraw();
+}
+
+fn waitService() void {
+    if (bz.running() and bz.attach()) {
+        starting = 0;
+        can_start = false;
+        ok = true;
+        timer_on = false;
+        armTimer();
+        start();
+        return ui.redraw();
+    }
+    starting -= 1;
+    if (starting == 0) {
+        ui.setMsg("The Bluetooth service did not start — check the doas rule");
+        timer_on = false;
+        armTimer();
+    }
+    ui.redrawText(ui.H() / 2 + 14, 14);
+}
+
 fn fieldAt(idx: u16) ?*ui.Field {
     _ = idx;
     return &pin_field;
@@ -264,6 +333,7 @@ fn armTimer() void {
 fn onTick() void {
     ticks +%= 1;
     if (view == .done) return ui.quit();
+    if (starting > 0) return waitService();
     // A synchronous call may have read signals and agent requests from the socket beyond its reply:
     // they sit in the buffer and the socket is no longer "readable" — handle them here.
     if (ok) pumpBus();
@@ -475,7 +545,21 @@ fn activate(w: ui.Widget, right: bool) void {
             setView(.actions);
         },
         .toggle => {
-            if (bz.setPowered(!bz.powered)) refresh() else ui.setMsg(bz.lastError());
+            if (!ok) {
+                if (can_start and starting == 0) startService();
+                return;
+            }
+            const on = !bz.powered;
+            if (!bz.setPowered(on)) return ui.setMsg(bz.lastError());
+            if (!on and cfg.bt_service_off_cmd != null and canStop()) {
+                // Bluetooth on demand: with the adapter off, stop the service and block the radio too
+                broker.run(1);
+                ok = false;
+                can_start = true;
+                ui.redraw();
+                return;
+            }
+            refresh();
         },
         .back => goBack(),
         .add => setView(.add),
@@ -543,7 +627,7 @@ fn layout() void {
     switch (view) {
         .list, .add => {
             if (view == .add) back();
-            if (view == .list and ok) ui.add(Wid.toggle, 0, .toggle, W - PAD - 40, 20, 40, 22);
+            if (view == .list and (ok or can_start)) ui.add(Wid.toggle, 0, .toggle, W - PAD - 40, 20, 40, 22);
             if (ok and bz.powered) {
                 var i = list.scroll;
                 var y = LIST_Y;
@@ -650,6 +734,15 @@ fn paint(cv: *draw.Canvas) void {
                 var b: [32]u8 = undefined;
                 ui.header(cv, "Add device", ui.dots("Searching", ticks, &b), true);
             }
+            if (!ok and can_start) {
+                paintWidgets(cv);
+                if (starting > 0) {
+                    var b: [32]u8 = undefined;
+                    ui.centered(cv, ui.dots("Starting Bluetooth", ticks, &b), W / 2, H / 2 + 14, 14, t.menu_muted);
+                } else ui.centered(cv, "Bluetooth is off", W / 2, H / 2, 15, t.menu_muted);
+                ui.paintMsg(cv, H - PAD - 52);
+                return;
+            }
             if (!ok) {
                 ui.centered(cv, "Bluetooth is unavailable", W / 2, H / 2 - 8, 15, t.menu_text);
                 ui.centered(cv, ui.msg(), W / 2, H / 2 + 16, 12, t.menu_muted);
@@ -746,7 +839,7 @@ fn paintWidgets(cv: *draw.Canvas) void {
                 if (ui.isHover(w)) ui.rrect(cv, w.x, w.y, w.w, w.h, 8, t.menu_hover);
                 ui.icon(cv, &ui.ic_more, w.x + 6, w.y + 6, 16, 1, t.menu_muted);
             },
-            .toggle => ui.toggle(cv, w, bz.powered),
+            .toggle => ui.toggle(cv, w, ok and bz.powered),
             .back => ui.paintBack(cv, w),
             .add => ui.button(cv, w, "Add device", .secondary),
             .act_conn => ui.button(cv, w, if (target.connected) "Disconnect" else "Connect", if (target.connected) .secondary else .primary),

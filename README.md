@@ -9,11 +9,11 @@ Every icon opens its own menu in the same style — and every menu has its own c
 |---|---|---|
 | **netline** | the panel itself | Wayland, mango IPC, the kernel (netlink) |
 | **zrun** | app and command launcher (instead of rofi) | .desktop files, PATH |
-| **zwifi** | Wi‑Fi menu, including 802.1X enterprise networks | NetworkManager over D-Bus |
+| **zwifi** | Wi‑Fi menu, including 802.1X enterprise networks | NetworkManager or iwd over D-Bus |
 | **zbt** | Bluetooth menu: connecting, pairing, battery | BlueZ over D-Bus |
 | **zwall** | wallpaper picker with thumbnails | the zbg daemon |
 | **zbg** | wallpaper daemon (instead of swaybg) | Wayland |
-| **zpower** | lock, log out, sleep, hibernate, reboot, power off | systemd-logind over D-Bus, mango IPC |
+| **zpower** | lock, log out, sleep, hibernate, reboot, power off | systemd-logind over D-Bus or doas rules, mango IPC |
 | **zcal** | calendar on a click on the clock | — |
 
 ```
@@ -92,6 +92,13 @@ at most half a second in total.
 Authentication and encryption are done by NetworkManager (with wpa_supplicant/iwd underneath): the password is passed to it once
 and stored in its profiles (readable by root only). In zwifi's memory passwords are wiped right after sending and on exit.
 
+**Without NetworkManager zwifi talks to iwd directly** (e.g. Void with runit). The list, connecting, hidden networks,
+disconnecting, "forget" and the radio toggle work the same way. The password goes to iwd through zwifi's own agent
+(`net.connman.iwd.Agent`): iwd asks for it during the connection, the agent answers only iwd's own bus name and wipes the
+password right after. iwd saves a network only after it connected. 802.1X networks with iwd need a profile written by root
+(`/var/lib/iwd/<SSID>.8021x`, see iwd.network(5)) — the menu says so instead of showing the form. D-Bus access to iwd is
+granted to the `wheel` and `netdev` groups.
+
 ### Bluetooth: zbt
 
 - **Paired devices** with an icon by type (headphones, speaker, keyboard, mouse, gamepad, phone, computer),
@@ -142,6 +149,16 @@ available on the system (what logind allows) are shown. Hotkeys: `L` — lock, `
 
 Power off and sleep go through systemd-logind over D-Bus (no `systemctl`), log out through the mango IPC (`quit`), or through
 logind if mango is unavailable. The header shows the user, host name and uptime.
+
+**Without logind** (runit + seatd) reboot and power off run `reboot_cmd` / `poweroff_cmd` from `config.zig` —
+by default `doas /usr/bin/reboot` and `doas /usr/bin/poweroff`, which need narrow rules in `/etc/doas.conf`:
+
+```
+permit nopass youruser as root cmd /usr/bin/poweroff args
+permit nopass youruser as root cmd /usr/bin/reboot args
+```
+
+Sleep and hibernate are hidden then. If the command didn't take the system down in 4 s, the menu says the doas rule is missing.
 
 ### Calendar: zcal
 
@@ -364,7 +381,7 @@ A seccomp violation shows up in `dmesg` (`audit: type=1326 ... syscall=N`). For 
 - **Linux ≥ 5.13** for Landlock (optional), x86_64, aarch64, riscv64.
 - **MangoWM ≥ 0.14** — IPC via `$MANGO_INSTANCE_SIGNATURE`. The old `dwl-ipc` was removed from mango in 0.15 and is not supported.
 - A TrueType font for the clock and menus (DejaVu Sans or Noto Sans are almost everywhere; path lists — `clock_font_paths` and `font_paths` in `config.zig`).
-- Services: **NetworkManager** (zwifi), **BlueZ** (zbt), **systemd-logind** or elogind (zpower).
+- Services: **NetworkManager or iwd** (zwifi), **BlueZ** (zbt), **systemd-logind**, elogind or narrow doas rules (zpower).
 - Programs: `swaylock` (or any other command in `lock_cmd`) and a terminal for `Shift+Enter` in zrun (`foot` by default).
   `rofi`, `nmcli`, `bluetoothctl` and `swaybg` are no longer needed.
 
@@ -521,6 +538,9 @@ The project used to be called zpanel. After installing netline:
 - `launcher_width`, `launcher_rows`, `launcher_icons`, `icon_theme`, `terminal` — the zrun launcher.
 - `wallpaper_dir`, `wallpaper_mode` — the wallpaper folder and how it's fitted.
 - `lock_cmd`, `power_confirm`, `lock_before_suspend` — locking and confirmations in the power menu.
+- `reboot_cmd`, `poweroff_cmd` — reboot and power off without logind (doas rules); `null` hides the buttons.
+- `bt_service_on_cmd`, `bt_service_off_cmd` — Bluetooth on demand: when bluetoothd isn't running, the zbt toggle (and
+  `zbt toggle`) starts it with this command and waits for it; turning Bluetooth off stops it again. `null` — not used.
 - `status_poll_s`, `sandbox` — the fallback poll (only while Wi‑Fi is connected) and the sandbox.
 
 All programs must be in the same folder as `netline` (or in `PATH`) — the broker looks for them next to the panel.

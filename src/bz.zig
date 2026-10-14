@@ -119,6 +119,22 @@ pub fn init() bool {
         setError("no access to the D-Bus system bus");
         return false;
     };
+    return attach();
+}
+
+/// bluetoothd is on the bus (a cheap check over the existing connection — works inside the sandbox).
+pub fn running() bool {
+    var w = dbus.W{ .buf = &body_buf };
+    w.str(BZ);
+    const r = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", w.bytes()) catch return false;
+    if (!r.ok()) return false;
+    var rr = r.reader();
+    return rr.boolean() and !rr.bad;
+}
+
+/// Find bluetoothd on an already connected bus: at startup and again after the service
+/// was started on demand (config.bt_service_on_cmd) — no new sockets, so it works in the sandbox.
+pub fn attach() bool {
     var w = dbus.W{ .buf = &body_buf };
     w.str(BZ);
     const r = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", w.bytes()) catch {

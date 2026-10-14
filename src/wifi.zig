@@ -4,7 +4,8 @@
 //! zwifi — Wi‑Fi menu for netline, in pure Zig.
 //!
 //! Network list, connecting to open, WPA/WPA2/WPA3 Personal and enterprise
-//! (802.1X: PEAP, TTLS, EAP-TLS) networks through NetworkManager over D-Bus.
+//! (802.1X: PEAP, TTLS, EAP-TLS) networks through NetworkManager over D-Bus,
+//! or through iwd when NetworkManager isn't running (802.1X then needs a profile from root).
 //! `zwifi toggle` turns Wi‑Fi on/off without a window.
 //! Keyboard: Tab/Shift+Tab, ↑/↓, Enter, Esc, Ctrl+V — paste, Ctrl+U — clear the field.
 
@@ -118,7 +119,7 @@ fn onBus() void {
         if (!nm_ok) return;
         nm.bus.pump() catch {
             nm_ok = false;
-            ui.setMsg("lost connection to NetworkManager");
+            ui.setMsg("lost connection to the Wi‑Fi service");
             return;
         };
         handleSignals();
@@ -277,6 +278,8 @@ fn chooseNet(i: usize, right: bool) void {
         .open, .owe => connectSimple(),
         .psk, .sae => setView(.password),
         .eap => {
+            // iwd takes 802.1X settings only from a root-owned file — no form to fill in
+            if (nm.backend == .iwd) return ui.setMsg("802.1X with iwd: the administrator creates /var/lib/iwd/<SSID>.8021x");
             method = .peap;
             phase2 = 0;
             setView(.enterprise);
@@ -619,7 +622,7 @@ fn paintList(cv: *draw.Canvas) void {
     const H = ui.H();
     ui.header(cv, "Wi‑Fi", "", false);
     if (!nm_ok) {
-        ui.centered(cv, "NetworkManager is unavailable", W / 2, H / 2 - 8, 15, t.menu_text);
+        ui.centered(cv, "Wi‑Fi service is unavailable", W / 2, H / 2 - 8, 15, t.menu_text);
         ui.centered(cv, ui.msg(), W / 2, H / 2 + 16, 12, t.menu_muted);
         return;
     }

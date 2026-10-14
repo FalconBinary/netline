@@ -4,10 +4,12 @@
 //! NetworkManager client over D-Bus: network list, connecting (open, WPA/WPA2/WPA3
 //! Personal, OWE, 802.1X: PEAP, TTLS, EAP-TLS), disconnecting, "forget network", radio on/off.
 //! Authentication and encryption are done by the system daemon — passwords go to it over D-Bus.
+//! Without NetworkManager the same calls go to iwd (iwd.zig) if it is running.
 
 const std = @import("std");
 const sys = @import("sys.zig");
 const dbus = @import("dbus.zig");
+const iwd = @import("iwd.zig");
 
 const NM = "org.freedesktop.NetworkManager";
 const NM_PATH = "/org/freedesktop/NetworkManager";
@@ -71,6 +73,9 @@ pub const Spec = struct {
 };
 
 pub var bus: dbus.Conn = .{};
+/// Which daemon manages Wi‑Fi: NetworkManager if it is running, otherwise iwd.
+pub const Backend = enum { nm, iwd };
+pub var backend: Backend = .nm;
 pub var device: Path = .{};
 pub var wifi_enabled: bool = true;
 /// Text of the last error (to show to the user).
@@ -83,7 +88,7 @@ pub fn lastError() []const u8 {
     return err_buf[0..err_len];
 }
 
-fn setError(msg: []const u8) void {
+pub fn setError(msg: []const u8) void {
     err_len = @min(msg.len, err_buf.len);
     @memcpy(err_buf[0..err_len], msg[0..err_len]);
 }
@@ -116,26 +121,34 @@ fn getProp(path: []const u8, iface: []const u8, name: []const u8) ?struct { r: d
 
 // ================================================================= initialization
 
-const Devices = struct { paths: [32]Path = undefined, n: usize = 0, types: [32]u32 = [_]u32{0} ** 32, ok: bool = false, enabled: ?bool = null };
+const Devices = struct { paths: [32]Path = undefined, n: usize = 0, types: [32]u32 = [_]u32{0} ** 32, ok: bool = false, enabled: ?bool = null, iwd_owner: Path = .{} };
 
 pub fn init() bool {
     bus.connectSystem() catch {
         setError("no access to the D-Bus system bus");
         return false;
     };
-    // who owns the NetworkManager name (signals are accepted only from it) and the device list — one wait
+    // who owns the NetworkManager name (signals are accepted only from it), the device list
+    // and whether iwd is there instead — one wait
     var devs = Devices{};
     {
         var w = dbus.W{ .buf = &body_buf };
         w.str(NM);
-        var serials = [2]u32{
+        var w2 = dbus.W{ .buf = body_buf[256..] };
+        w2.str(iwd.NAME);
+        var serials = [3]u32{
             bus.sendCall("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", w.bytes()) catch 0,
             bus.sendCall(NM, NM_PATH, NM, "GetDevices", "", "") catch 0,
+            bus.sendCall("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", "s", w2.bytes()) catch 0,
         };
         bus.collect(&serials, &devs, gotDevices) catch {};
     }
     if (!devs.ok or bus.peer_len == 0) {
-        setError("NetworkManager is not running");
+        if (devs.iwd_owner.len > 0) {
+            backend = .iwd;
+            return iwd.init(devs.iwd_owner.get());
+        }
+        setError("Neither NetworkManager nor iwd is running");
         return false;
     }
     // Subscriptions: radio power (before reading it, so a change in between isn't lost), then everything
@@ -178,6 +191,11 @@ fn gotDevices(d: *Devices, i: usize, rep: dbus.Reply) void {
     if (i == 0) {
         const owner = r.str();
         if (!r.bad) bus.setPeer(owner);
+        return;
+    }
+    if (i == 2) {
+        const owner = r.str();
+        if (!r.bad) d.iwd_owner.set(owner);
         return;
     }
     const end = r.arrayEnd(4);
@@ -259,6 +277,7 @@ fn onSignal(path: []const u8, iface: []const u8, member: []const u8, sig: []cons
 }
 
 pub fn setEnabled(on: bool) bool {
+    if (backend == .iwd) return iwd.setEnabled(on);
     var w = dbus.W{ .buf = &body_buf };
     w.str(NM);
     w.str("WirelessEnabled");
@@ -272,6 +291,7 @@ pub fn setEnabled(on: bool) bool {
 /// Ask NM to scan for networks. We don't wait for the reply ("too often" is harmless):
 /// the AccessPointAdded and LastScan signals report the results.
 pub fn scan() void {
+    if (backend == .iwd) return iwd.scan();
     var w = dbus.W{ .buf = &body_buf };
     const a = w.arrayBegin(8); // empty a{sv}
     w.arrayEnd(a);
@@ -287,6 +307,7 @@ var nsaved: usize = 0;
 /// Reread the saved Wi‑Fi connections (path + SSID).
 pub fn loadSaved() void {
     nsaved = 0;
+    if (backend == .iwd) return; // iwd reports the known network with each network
     const rep = call("/org/freedesktop/NetworkManager/Settings", SETTINGS, "ListConnections", "", "") orelse return;
     var paths: [128]Path = undefined;
     var n: usize = 0;
@@ -370,6 +391,7 @@ fn securityOf(flags: u32, wpa: u32, rsn: u32) Security {
 
 /// Fill the list of visible networks (one per SSID, the strongest access point). Returns the count.
 pub fn networks(out: []Net) usize {
+    if (backend == .iwd) return iwd.networks(out);
     nets_changed = false;
     // active access point and the access point list in one batch, one wait instead of two
     var head = Head{};
@@ -515,6 +537,7 @@ pub var activating: Path = .{};
 pub var created: Path = .{};
 
 pub fn activateSaved(conn: []const u8, ap: []const u8) bool {
+    if (backend == .iwd) return iwd.activateSaved(conn, ap);
     fail_reason = 0;
     var w = dbus.W{ .buf = &body_buf };
     w.str(conn);
@@ -540,6 +563,7 @@ fn fileUri(buf: []u8, path: []const u8) []const u8 {
 }
 
 pub fn addAndActivate(spec: Spec, ap: []const u8) bool {
+    if (backend == .iwd) return iwd.addAndActivate(spec, ap);
     fail_reason = 0;
     var w = dbus.W{ .buf = &body_buf };
     const top = w.arrayBegin(8);
@@ -624,6 +648,7 @@ pub const Progress = enum { working, done, failed };
 
 /// State of the current connection. On error the reason is in lastError().
 pub fn progress() Progress {
+    if (backend == .iwd) return iwd.progress();
     if (activating.len == 0) return .failed;
     var p = getProp(activating.get(), ACTIVE, "State") orelse {
         // the object is gone — activation was canceled/failed
@@ -662,17 +687,20 @@ fn failReason() void {
 }
 
 pub fn disconnect() bool {
+    if (backend == .iwd) return iwd.disconnect();
     _ = call(device.get(), DEV, "Disconnect", "", "") orelse return false;
     return true;
 }
 
 pub fn forget(conn: []const u8) bool {
+    if (backend == .iwd) return iwd.forget(conn);
     _ = call(conn, CONN, "Delete", "", "") orelse return false;
     return true;
 }
 
 /// Remove the profile we just created (if the connection failed).
 pub fn dropCreated() void {
+    if (backend == .iwd) return; // iwd saves a network only after it connected
     if (created.len > 0) _ = forget(created.get());
     created.len = 0;
 }

@@ -5,7 +5,9 @@
 //!
 //! Lock, log out, sleep, hibernate, reboot, power off.
 //! Power goes through systemd-logind over D-Bus (no systemctl), logout through the mango IPC
-//! (or logind if mango is unavailable). Locking is started by a small broker process:
+//! (or logind if mango is unavailable). Without logind (runit, seatd) reboot and power off run
+//! reboot_cmd/poweroff_cmd from config.zig (e.g. narrow doas rules); sleep is then unavailable.
+//! Locking and those commands are started by a small broker process:
 //! zpower itself cannot launch programs after startup.
 //! Keys: ←/→ and Enter, Esc; L — lock, E — log out, S — sleep, H — hibernate,
 //! R — reboot, P — power off.
@@ -67,11 +69,15 @@ pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);
     ui.begin("zpower");
     // the broker comes before all other connections so it holds no extra descriptors
-    const cmds = [_]?broker.Cmd{comptime broker.compile(cfg.lock_cmd)};
+    const cmds = [_]?broker.Cmd{
+        comptime broker.compile(cfg.lock_cmd),
+        comptime broker.compile(cfg.reboot_cmd),
+        comptime broker.compile(cfg.poweroff_cmd),
+    };
     have_broker = broker.start(&cmds);
 
     if (bus.connectSystem()) |_| {
-        logind_ok = true;
+        logind_ok = hasLogind();
     } else |_| {}
     if (sys.getenv("MANGO_INSTANCE_SIGNATURE")) |p| mango_fd = sys.connectUnix(p) catch -1;
 
@@ -85,7 +91,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
     readInfo();
-    if (!logind_ok) ui.setMsg("systemd-logind is unavailable — only lock and log out work");
+    if (!logind_ok and cfg.poweroff_cmd == null) ui.setMsg("systemd-logind is unavailable — only lock and log out work");
 
     const n: f32 = @floatFromInt(@max(nacts, 4));
     const width: u32 = @intFromFloat(2 * PAD + n * CELL + (n - 1) * GAP);
@@ -111,12 +117,27 @@ const asks = [_]Ask{
     .{ .act = .poweroff, .member = "CanPowerOff" },
 };
 
+/// Is systemd-logind (or elogind) on the bus — one call before the sandbox.
+fn hasLogind() bool {
+    var w = dbus.W{ .buf = &body_buf };
+    w.str(LOGIN);
+    const r = bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", w.bytes()) catch return false;
+    if (!r.ok()) return false;
+    var rr = r.reader();
+    return rr.boolean() and !rr.bad;
+}
+
 /// Which actions are available. Lock and log out need no logind; for the rest we ask
-/// logind in one batch ("yes" or "challenge" — with a polkit password).
+/// logind in one batch ("yes" or "challenge" — with a polkit password). Without logind —
+/// reboot and power off through the configured commands.
 fn queryAvailable(can: *[all.len]bool) void {
     can[@intFromEnum(Act.lock)] = have_broker;
     can[@intFromEnum(Act.logout)] = mango_fd >= 0 or logind_ok;
-    if (!logind_ok) return;
+    if (!logind_ok) {
+        can[@intFromEnum(Act.reboot)] = have_broker and cfg.reboot_cmd != null;
+        can[@intFromEnum(Act.poweroff)] = have_broker and cfg.poweroff_cmd != null;
+        return;
+    }
     var serials: [asks.len]u32 = undefined;
     for (asks, &serials) |q, *sr| sr.* = bus.sendCall(LOGIN, LPATH, MGR, q.member, "", "") catch 0;
     bus.collect(&serials, can, gotCan) catch {};
@@ -206,9 +227,18 @@ fn run(a: Act) void {
             } else logind(LPATH, MGR, "Suspend", true);
         },
         .hibernate => logind(LPATH, MGR, "Hibernate", true),
-        .reboot => logind(LPATH, MGR, "Reboot", true),
-        .poweroff => logind(LPATH, MGR, "PowerOff", true),
+        .reboot => if (logind_ok) logind(LPATH, MGR, "Reboot", true) else runCmd(1),
+        .poweroff => if (logind_ok) logind(LPATH, MGR, "PowerOff", true) else runCmd(2),
     }
+}
+
+/// Without logind: the broker runs reboot_cmd/poweroff_cmd; the menu shows "please wait"
+/// and closes on its own if the command didn't take the system down.
+fn runCmd(slot: u8) void {
+    broker.run(slot);
+    view = .wait;
+    ui.setTimer(4000, 0);
+    ui.redraw();
 }
 
 /// Async logind call: the window doesn't freeze while polkit asks for a password.
@@ -228,6 +258,13 @@ fn onTick() void {
     if (suspend_after_lock) {
         suspend_after_lock = false;
         logind(LPATH, MGR, "Suspend", true);
+        return;
+    }
+    if (view == .wait and !logind_ok) {
+        // the command didn't power the system off within 4 s — most likely doas refused
+        view = .main;
+        ui.setMsg("The command failed — check the doas rule (doas -C /etc/doas.conf)");
+        ui.resetFocus(false);
     }
 }
 

@@ -176,6 +176,17 @@ pub const wallpaper_dir = "~/Pictures/wallpapers";
 pub const wallpaper_mode: enum { fill, fit } = .fill;
 
 pub const lock_cmd = "swaylock -f";
+/// Without systemd-logind (e.g. Void with runit) zpower reboots and powers off with these commands:
+/// narrow doas rules without a password, e.g. "permit nopass user as root cmd /usr/bin/poweroff args".
+/// null — the button is hidden when logind is absent.
+pub const reboot_cmd: ?[*:0]const u8 = "doas /usr/bin/reboot";
+pub const poweroff_cmd: ?[*:0]const u8 = "doas /usr/bin/poweroff";
+
+/// Bluetooth on demand: when bluetoothd isn't running, zbt's toggle (and `zbt toggle`) runs
+/// bt_service_on_cmd and waits for the service; turning Bluetooth off runs bt_service_off_cmd.
+/// For void-hardened: "doas /usr/local/sbin/vh-bluetooth on" / "… off". null — not used.
+pub const bt_service_on_cmd: ?[*:0]const u8 = null;
+pub const bt_service_off_cmd: ?[*:0]const u8 = null;
 
 // ---------------------------------------------------------------- launcher (zrun)
 
