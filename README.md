@@ -405,7 +405,7 @@ A seccomp violation shows up in `dmesg` (`audit: type=1326 ... syscall=N`). For 
 
 ## Requirements
 
-- **Zig 0.16** (tested on 0.16.0).
+- **Zig 0.17** (tested on 0.17.0).
 - **Linux ≥ 5.13** for Landlock (optional), x86_64, aarch64, riscv64.
 - **MangoWM ≥ 0.14** — IPC via `$MANGO_INSTANCE_SIGNATURE`. The old `dwl-ipc` was removed from mango in 0.15 and is not supported.
 - A TrueType font for the clock and menus (DejaVu Sans or Noto Sans are almost everywhere; path lists — `clock_font_paths` and `font_paths` in `config.zig`).
@@ -432,30 +432,30 @@ The menu doesn't need `bluez-utils` — it's only for diagnostics (`bluetoothctl
 or through iwd alone when NetworkManager isn't running; if Wi‑Fi used to be brought up with netctl or a hand-started
 wpa_supplicant, turn that off.
 
-### 2. Zig 0.16
+### 2. Zig 0.17
 
-It has to be 0.16 (if `zig version` already shows `0.16.x`, you can skip this step):
+It has to be 0.17 (if `zig version` already shows `0.17.x`, you can skip this step):
 
 ```sh
 cd ~
 ```
 
 ```sh
-curl -LO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+curl -LO https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
 ```
 
 ```sh
-tar -xf zig-x86_64-linux-0.16.0.tar.xz
+tar -xf zig-x86_64-linux-0.17.0.tar.xz
 ```
 
 Add it to `PATH` — in fish:
 
 ```sh
-fish_add_path ~/zig-x86_64-linux-0.16.0
+fish_add_path ~/zig-x86_64-linux-0.17.0
 ```
 
-in bash/zsh — with the line `export PATH="$HOME/zig-x86_64-linux-0.16.0:$PATH"` in `~/.bashrc` or `~/.zshrc`.
-Check: `zig version` should print `0.16.0`. On ARM use `aarch64` instead of `x86_64`.
+in bash/zsh — with the line `export PATH="$HOME/zig-x86_64-linux-0.17.0:$PATH"` in `~/.bashrc` or `~/.zshrc`.
+Check: `zig version` should print `0.17.0`. On ARM use `aarch64` instead of `x86_64`.
 
 ### 3. Clone
 

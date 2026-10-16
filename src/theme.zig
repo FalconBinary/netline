@@ -83,9 +83,9 @@ fn applyLine(th: *cfg.Theme, raw: []const u8, ln: usize) void {
         sys.log("theme, line {d}: invalid color", .{ln});
         return;
     };
-    inline for (@typeInfo(cfg.Theme).@"struct".fields) |f| {
-        if (std.mem.eql(u8, key, f.name)) {
-            @field(th, f.name) = c;
+    inline for (@typeInfo(cfg.Theme).@"struct".field_names) |name| {
+        if (std.mem.eql(u8, key, name)) {
+            @field(th, name) = c;
             return;
         }
     }

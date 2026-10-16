@@ -46,7 +46,7 @@ pub const Entry = struct {
 
 pub fn parse(data: []const u8, loc: Locale) Entry {
     var e = Entry{};
-    var rank = [_]u8{0} ** 4; // Name, GenericName, Comment, Keywords: 1 — no language, 2 — ru, 3 — ru_RU
+    var rank = @as([4]u8, @splat(0)); // Name, GenericName, Comment, Keywords: 1 — no language, 2 — ru, 3 — ru_RU
     var in_group = false;
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
@@ -590,7 +590,7 @@ test "score: a far match and long gaps between fuzzy letters" {
     try tt.expect(scoreWord("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxtail", "ail", true, null) > 0);
     try tt.expect(scoreWord("generic app000 settings", "ab", true, null) == 0);
     try tt.expect(scoreWord("a-very-long-gap-before-b", "ab", true, null) > 0);
-    try tt.expect(scoreWord("apple" ++ "x" ** 200 ++ "banana", "ab", true, null) > 0);
+    try tt.expect(scoreWord("apple" ++ @as([200]u8, @splat('x')) ++ "banana", "ab", true, null) > 0);
 }
 
 test "query words and highlighting" {

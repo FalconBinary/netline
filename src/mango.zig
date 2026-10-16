@@ -19,7 +19,7 @@ pub const Mon = struct {
     seen: bool = false, // present in the snapshot being parsed
     name_buf: [64]u8 = undefined,
     name_len: usize = 0,
-    tags: [MAX_TAGS]Tag = [_]Tag{.{}} ** MAX_TAGS,
+    tags: [MAX_TAGS]Tag = @as([MAX_TAGS]Tag, @splat(.{})),
     ntags: u8 = 0,
 
     pub fn name(self: *const Mon) []const u8 {
@@ -28,7 +28,7 @@ pub const Mon = struct {
 };
 
 pub var fd: i32 = -1;
-pub var mons: [MAX_MONS]Mon = [_]Mon{.{}} ** MAX_MONS;
+pub var mons: [MAX_MONS]Mon = @as([MAX_MONS]Mon, @splat(.{}));
 
 var buf: [64 * 1024]u8 = undefined;
 var len: usize = 0;

@@ -75,7 +75,7 @@ const Bar = struct {
     opaque_on: bool = false,
     opaque_w: u32 = 0,
     opaque_h: u32 = 0,
-    tags: [mango.MAX_TAGS]mango.Tag = [_]mango.Tag{.{}} ** mango.MAX_TAGS,
+    tags: [mango.MAX_TAGS]mango.Tag = @as([mango.MAX_TAGS]mango.Tag, @splat(.{})),
     ntags: u8 = 0,
     hits: [48]Hit = undefined,
     nhits: usize = 0,
@@ -111,8 +111,8 @@ fn actionIndex(item: cfg.Item) ?u8 {
 }
 
 var conn: wl.Conn = .{};
-var kinds: [wl.MAX_IDS]Kind = [_]Kind{.none} ** wl.MAX_IDS;
-var owner: [wl.MAX_IDS]u8 = [_]u8{0} ** wl.MAX_IDS;
+var kinds: [wl.MAX_IDS]Kind = @as([wl.MAX_IDS]Kind, @splat(.none));
+var owner: [wl.MAX_IDS]u8 = @as([wl.MAX_IDS]u8, @splat(0));
 // filled in main: with defaults here (scale = 1) the whole array would sit in the file's .data
 var bars: [MAX_BARS]Bar = undefined;
 
@@ -133,7 +133,7 @@ var ptr_bar: ?u8 = null;
 var ptr_x: f32 = 0;
 var ptr_y: f32 = 0;
 var scroll_acc: f32 = 0;
-var last_click: [commands.len]?u32 = [_]?u32{null} ** commands.len;
+var last_click: [commands.len]?u32 = @as([commands.len]?u32, @splat(null));
 
 var wifi_state: status.Wifi = .{};
 var bt_state: status.Bt = .none;
@@ -936,7 +936,7 @@ fn sameTags(a: []const mango.Tag, b: []const mango.Tag) bool {
 fn applyTags() void {
     for (&bars) |*b| {
         if (!b.used) continue;
-        var tags: [mango.MAX_TAGS]mango.Tag = [_]mango.Tag{.{}} ** mango.MAX_TAGS;
+        var tags: [mango.MAX_TAGS]mango.Tag = @as([mango.MAX_TAGS]mango.Tag, @splat(.{}));
         var n: u8 = 0;
         if (mango.find(b.monName())) |m| {
             n = @min(m.ntags, mango.MAX_TAGS);

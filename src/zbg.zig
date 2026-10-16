@@ -54,9 +54,9 @@ const Out = struct {
 };
 
 var conn: wl.Conn = .{};
-var kinds: [wl.MAX_IDS]Kind = [_]Kind{.none} ** wl.MAX_IDS;
-var owner: [wl.MAX_IDS]u8 = [_]u8{0} ** wl.MAX_IDS;
-var outs: [MAX_OUT]Out = [_]Out{.{}} ** MAX_OUT;
+var kinds: [wl.MAX_IDS]Kind = @as([wl.MAX_IDS]Kind, @splat(.none));
+var owner: [wl.MAX_IDS]u8 = @as([wl.MAX_IDS]u8, @splat(0));
+var outs: [MAX_OUT]Out = @as([MAX_OUT]Out, @splat(.{}));
 var registry: u32 = 0;
 var compositor: u32 = 0;
 var compositor_ver: u32 = 0;
@@ -82,7 +82,7 @@ const Client = struct {
     buf: [600]u8 = undefined,
     len: usize = 0,
 };
-var clients: [MAX_CLIENTS]Client = [_]Client{.{}} ** MAX_CLIENTS;
+var clients: [MAX_CLIENTS]Client = @as([MAX_CLIENTS]Client, @splat(.{}));
 
 pub fn main(init: std.process.Init.Minimal) void {
     sys.init(init);

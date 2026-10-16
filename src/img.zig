@@ -88,12 +88,12 @@ pub fn decode(d: []const u8, need_w: u32, need_h: u32) Error!Image {
 const FAST = 9;
 
 const Huff = struct {
-    count: [16]u16 = [_]u16{0} ** 16,
+    count: [16]u16 = @as([16]u16, @splat(0)),
     sym: [320]u16 = undefined,
     fast: [1 << FAST]u16 = undefined, // (symbol << 4) | length; 0 — a long code
 
     fn build(h: *Huff, lens: []const u8) Error!void {
-        h.count = [_]u16{0} ** 16;
+        h.count = @as([16]u16, @splat(0));
         for (lens) |l| {
             if (l > 15) return error.Invalid;
             h.count[l] += 1;
@@ -270,11 +270,11 @@ const Inflate = struct {
                     const ncode = try s.bits(4) + 4;
                     if (nlen > 286 or ndist > 30) return error.Invalid;
                     const order = [_]u8{ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-                    var cl = [_]u8{0} ** 19;
+                    var cl = @as([19]u8, @splat(0));
                     for (0..ncode) |i| cl[order[i]] = @intCast(try s.bits(3));
                     var ch: Huff = .{};
                     try ch.build(&cl);
-                    var lens = [_]u8{0} ** 320;
+                    var lens = @as([320]u8, @splat(0));
                     var i: usize = 0;
                     while (i < nlen + ndist) {
                         const sym = try s.decode(&ch);
@@ -334,7 +334,7 @@ fn decodePng(d: []const u8) Error!Image {
     var depth: u8 = 0;
     var ctype: u8 = 0;
     var interlace: u8 = 0;
-    var pal: [256]u32 = [_]u32{0xff000000} ** 256;
+    var pal: [256]u32 = @as([256]u32, @splat(0xff000000));
     var npal: usize = 0;
     var trns_key: ?[3]u16 = null;
     var idat_total: usize = 0;
@@ -575,12 +575,12 @@ const zz = [64]u8{
 };
 
 const JHuff = struct {
-    fast: [512]u16 = [_]u16{0} ** 512, // (length << 8) | value
+    fast: [512]u16 = @as([512]u16, @splat(0)), // (length << 8) | value
     // a whole AC in one lookup: (coefficient << 8) | (run << 4) | (code length + value bits)
-    fast_ac: [512]i16 = [_]i16{0} ** 512,
-    maxcode: [18]i32 = [_]i32{-1} ** 18,
-    valptr: [17]i32 = [_]i32{0} ** 17,
-    vals: [256]u8 = [_]u8{0} ** 256,
+    fast_ac: [512]i16 = @as([512]i16, @splat(0)),
+    maxcode: [18]i32 = @as([18]i32, @splat(-1)),
+    valptr: [17]i32 = @as([17]i32, @splat(0)),
+    vals: [256]u8 = @as([256]u8, @splat(0)),
     ok: bool = false,
 
     fn build(h: *JHuff, counts: []const u8, vals: []const u8) Error!void {
@@ -642,10 +642,10 @@ const TRUNC = 64;
 const Jpeg = struct {
     d: []const u8,
     pos: usize = 0,
-    qt: [4][64]u16 = [_][64]u16{[_]u16{1} ** 64} ** 4,
-    dc: [4]JHuff = [_]JHuff{.{}} ** 4,
-    ac: [4]JHuff = [_]JHuff{.{}} ** 4,
-    comps: [3]Comp = [_]Comp{.{}} ** 3,
+    qt: [4][64]u16 = @as([4][64]u16, @splat(@splat(1))),
+    dc: [4]JHuff = @as([4]JHuff, @splat(.{})),
+    ac: [4]JHuff = @as([4]JHuff, @splat(.{})),
+    comps: [3]Comp = @as([3]Comp, @splat(.{})),
     ncomp: usize = 0,
     width: u32 = 0,
     height: u32 = 0,
@@ -990,7 +990,7 @@ const Jpeg = struct {
     /// for a 24-megapixel photo that's 72 MB), progressive into the coefficient accumulator.
     fn unit(j: *Jpeg, c: *Comp, bx: u32, by: u32, ss: u32, se: u32, ah: u5, al: u5) Error!void {
         if (!j.progressive) {
-            var blk = [_]i16{0} ** 64;
+            var blk = @as([64]i16, @splat(0));
             try j.baselineBlock(c, &blk);
             j.putBlock(c, &blk, bx, by);
             return;
@@ -1313,7 +1313,7 @@ fn decodeJpeg(d: []const u8, need_w0: u32, need_h0: u32) Error!Image {
             for (0..c.bh) |by| for (0..c.bw) |bx| {
                 const blk = j.block(c, @intCast(bx), @intCast(by));
                 if (j.ncoef == 1) {
-                    var b64 = [_]i16{0} ** 64;
+                    var b64 = @as([64]i16, @splat(0));
                     b64[0] = blk[0];
                     j.putBlock(c, &b64, @intCast(bx), @intCast(by));
                 } else j.putBlock(c, blk, @intCast(bx), @intCast(by));

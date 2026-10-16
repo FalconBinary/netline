@@ -321,7 +321,7 @@ pub fn bluetooth() Bt {
 fn hciUp(id: u16) ?bool {
     if (hci_sock < 0) return null;
     // struct hci_dev_info: u16 dev_id; char name[8]; bdaddr[6]; u32 flags; ...
-    var info: [128]u8 align(8) = [_]u8{0} ** 128;
+    var info: [128]u8 align(8) = @as([128]u8, @splat(0));
     std.mem.writeInt(u16, info[0..2], id, .little);
     _ = sys.ioctl(hci_sock, HCIGETDEVINFO, @intFromPtr(&info)) catch return null;
     const flags = std.mem.readInt(u32, info[16..20], .little);

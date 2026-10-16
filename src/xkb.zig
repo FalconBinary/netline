@@ -9,7 +9,7 @@ const std = @import("std");
 
 pub const Keymap = struct {
     syms: [256][4][2]u32 = std.mem.zeroes([256][4][2]u32),
-    ngroups: [256]u8 = [_]u8{0} ** 256,
+    ngroups: [256]u8 = @as([256]u8, @splat(0)),
 
     /// The symbol (Unicode code point) for an evdev key, or 0.
     pub fn char(km: *const Keymap, evdev: u32, group: u32, shift: bool, caps: bool) u32 {
@@ -109,13 +109,13 @@ const MAX_NAMES = 768;
 /// Key names (<AE01>, <LFSH> — up to 8 bytes) → codes: the name is packed into a u64,
 /// open addressing. Previously every name in xkb_symbols was looked up by a linear scan.
 const Names = struct {
-    keys: [1024]u64 = [_]u64{0} ** 1024, // 0 — empty (a name has at least one nonzero byte)
+    keys: [1024]u64 = @as([1024]u64, @splat(0)), // 0 — empty (a name has at least one nonzero byte)
     codes: [1024]u16 = undefined,
     n: usize = 0,
 
     fn pack(s: []const u8) ?u64 {
         if (s.len == 0 or s.len > 8) return null;
-        var b = [_]u8{0} ** 8;
+        var b = @as([8]u8, @splat(0));
         @memcpy(b[0..s.len], s);
         const k = std.mem.readInt(u64, &b, .little);
         return if (k == 0) null else k;

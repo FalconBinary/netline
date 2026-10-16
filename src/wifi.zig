@@ -42,7 +42,7 @@ var loaded = false; // the list isn't loaded yet: the window shows right away, t
 var ticks: u32 = 0;
 
 const F = enum(u8) { ssid, password, identity, anon, ca, domain, cert, key, keypass };
-var fields: [9]ui.Field = [_]ui.Field{.{}} ** 9;
+var fields: [9]ui.Field = @as([9]ui.Field, @splat(.{}));
 var reveal = false;
 var method: nm.Eap = .peap;
 var phase2: u8 = 0;

@@ -121,7 +121,7 @@ fn getProp(path: []const u8, iface: []const u8, name: []const u8) ?struct { r: d
 
 // ================================================================= initialization
 
-const Devices = struct { paths: [32]Path = undefined, n: usize = 0, types: [32]u32 = [_]u32{0} ** 32, ok: bool = false, enabled: ?bool = null, iwd_owner: Path = .{} };
+const Devices = struct { paths: [32]Path = undefined, n: usize = 0, types: [32]u32 = @as([32]u32, @splat(0)), ok: bool = false, enabled: ?bool = null, iwd_owner: Path = .{} };
 
 pub fn init() bool {
     bus.connectSystem() catch {
@@ -160,7 +160,7 @@ pub fn init() bool {
         var w = dbus.W{ .buf = &body_buf };
         w.str(DEV);
         w.str("DeviceType");
-        var serials = [_]u32{0} ** 33;
+        var serials = @as([33]u32, @splat(0));
         for (devs.paths[0..devs.n], 0..) |*p, i| serials[i] = bus.sendCall(NM, p.get(), PROPS, "Get", "ss", w.bytes()) catch 0;
         w = .{ .buf = &body_buf };
         w.str(NM);
@@ -321,7 +321,7 @@ pub fn loadSaved() void {
     var start: usize = 0;
     while (start < n) : (start += BATCH) {
         const stop = @min(n, start + BATCH);
-        var serials = [_]u32{0} ** BATCH;
+        var serials = @as([BATCH]u32, @splat(0));
         for (paths[start..stop], 0..) |*p, i| {
             serials[i] = bus.sendCall(NM, p.get(), CONN, "GetSettings", "", "") catch 0;
         }
@@ -422,7 +422,7 @@ pub fn networks(out: []Net) usize {
     var start: usize = 0;
     while (start < naps) : (start += BATCH) {
         const stop = @min(naps, start + BATCH);
-        var serials = [_]u32{0} ** BATCH;
+        var serials = @as([BATCH]u32, @splat(0));
         var w = dbus.W{ .buf = &body_buf };
         w.str(AP);
         for (aps[start..stop], 0..) |*ap, i| {

@@ -120,8 +120,8 @@ var nexes: usize = 0;
 
 // index hash tables (filled at most halfway): a cell holds index + 1, 0 is empty —
 // so the tables are zeroed .bss and not 36 KB of 0xff in the file
-var app_tab = [_]u16{0} ** (MAX_APPS * 2);
-var exe_tab = [_]u16{0} ** (MAX_EXES * 2);
+var app_tab = @as([MAX_APPS * 2]u16, @splat(0));
+var exe_tab = @as([MAX_EXES * 2]u16, @splat(0));
 
 fn hash(s: []const u8) usize {
     var h: u32 = 2166136261;
@@ -471,9 +471,9 @@ const layout_key: u64 = blk: {
     var h: u64 = 0xcbf29ce484222325;
     for (.{ Str, App, Exe, IconDir, Watch, sys.Stamp }) |T| {
         h = (h ^ @sizeOf(T)) *% 0x100000001b3;
-        for (std.meta.fields(T)) |f| {
-            for (f.name) |c| h = (h ^ c) *% 0x100000001b3;
-            h = (h ^ @offsetOf(T, f.name)) *% 0x100000001b3;
+        for (@typeInfo(T).@"struct".field_names) |name| {
+            for (name) |c| h = (h ^ c) *% 0x100000001b3;
+            h = (h ^ @offsetOf(T, name)) *% 0x100000001b3;
         }
     }
     break :blk h;
@@ -590,9 +590,10 @@ fn readList(fd: i32) bool {
 
     // reference checks: a broken file means a rebuild, not a buffer overrun
     for (apps[0..h.napps]) |*a| {
-        inline for (std.meta.fields(App)) |f| {
-            if (f.type == Str) {
-                if (!validStr(@field(a, f.name), end)) return false;
+        const info = @typeInfo(App).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            if (T == Str) {
+                if (!validStr(@field(a, name), end)) return false;
             }
         }
         if (!validZ(a.icon, end) or !validZ(a.dir, end)) return false;

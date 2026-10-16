@@ -290,7 +290,7 @@ pub const Canvas = struct {
 
 const MaskSlot = struct { key: u64 = 0, x0: i32 = 0, y0: i32 = 0, w: u16 = 0, h: u16 = 0, off: u32 = 0, used: u32 = 0 };
 const MASK_SLOTS = 128;
-var mask_slots: [MASK_SLOTS]MaskSlot = [_]MaskSlot{.{}} ** MASK_SLOTS;
+var mask_slots: [MASK_SLOTS]MaskSlot = @as([MASK_SLOTS]MaskSlot, @splat(.{}));
 var mask_pool: [128 * 1024]u8 = undefined;
 var mask_used: usize = 0;
 var mask_tick: u32 = 0;

@@ -112,8 +112,8 @@ const OKind = enum(u8) {
 };
 
 var conn: wl.Conn = .{};
-var kinds: [wl.MAX_IDS]OKind = [_]OKind{.none} ** wl.MAX_IDS;
-var owner: [wl.MAX_IDS]u8 = [_]u8{0} ** wl.MAX_IDS;
+var kinds: [wl.MAX_IDS]OKind = @as([wl.MAX_IDS]OKind, @splat(.none));
+var owner: [wl.MAX_IDS]u8 = @as([wl.MAX_IDS]u8, @splat(0));
 
 var registry: u32 = 0;
 var compositor: u32 = 0;
@@ -135,7 +135,7 @@ var sync_done = false;
 // clipboard: data offers are created by the server (id >= 0xff000000)
 const SRV_BASE: u32 = 0xff000000;
 const Offer = struct { id: u32 = 0, mime: u8 = 0 };
-var offers: [16]Offer = [_]Offer{.{}} ** 16;
+var offers: [16]Offer = @as([16]Offer, @splat(.{}));
 var selection: u32 = 0;
 const mimes = [_][]const u8{ "", "text/plain;charset=utf-8", "UTF8_STRING", "text/plain" };
 

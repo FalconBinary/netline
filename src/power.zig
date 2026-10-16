@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     } else |_| {}
     if (sys.getenv("MANGO_INSTANCE_SIGNATURE")) |p| mango_fd = sys.connectUnix(p) catch -1;
 
-    var can = [_]bool{false} ** all.len;
+    var can = @as([all.len]bool, @splat(false));
     queryAvailable(&can);
     nacts = 0;
     for (all, can) |a, ok| {

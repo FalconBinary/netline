@@ -208,7 +208,7 @@ pub fn socket(domain: usize, kind: usize, proto: usize) Error!i32 {
 pub fn connectUnix(path: []const u8) Error!i32 {
     const SockaddrUn = extern struct { family: u16, path: [108]u8 };
     if (path.len >= 108) return error.Failed;
-    var addr = SockaddrUn{ .family = 1, .path = [_]u8{0} ** 108 };
+    var addr = SockaddrUn{ .family = 1, .path = @as([108]u8, @splat(0)) };
     @memcpy(addr.path[0..path.len], path);
     const fd = try socket(1, 1, 0); // AF_UNIX, SOCK_STREAM
     _ = check(linux.syscall3(.connect, ufd(fd), @intFromPtr(&addr), 2 + path.len + 1)) catch |e| {
@@ -290,7 +290,7 @@ pub fn sendmsgFds(fd: i32, data: []const u8, fds: []const i32) Error!usize {
 pub fn recvmsgFd(fd: i32, buf: []u8, out_fd: *i32) Error!usize {
     out_fd.* = -1;
     const iov = [1]Iovec{.{ .base = buf.ptr, .len = buf.len }};
-    var cbuf: [CMSG_HDR + 16]u8 align(8) = [_]u8{0} ** (CMSG_HDR + 16);
+    var cbuf: [CMSG_HDR + 16]u8 align(8) = @as([CMSG_HDR + 16]u8, @splat(0));
     var msg = Msghdr{ .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len };
     const MSG_CMSG_CLOEXEC = 0x40000000;
     const n = try check(linux.syscall3(.recvmsg, ufd(fd), @intFromPtr(&msg), MSG_CMSG_CLOEXEC));
@@ -312,7 +312,7 @@ pub fn recvmsgFd(fd: i32, buf: []u8, out_fd: *i32) Error!usize {
 pub fn recvmsgFds(fd: i32, buf: []u8, out_fds: []i32, nfds: *usize) Error!usize {
     nfds.* = 0;
     const iov = [1]Iovec{.{ .base = buf.ptr, .len = buf.len }};
-    var cbuf: [CMSG_HDR + 4 * 16]u8 align(8) = [_]u8{0} ** (CMSG_HDR + 4 * 16);
+    var cbuf: [CMSG_HDR + 4 * 16]u8 align(8) = @as([CMSG_HDR + 4 * 16]u8, @splat(0));
     var msg = Msghdr{ .iov = &iov, .iovlen = 1, .control = &cbuf, .controllen = cbuf.len };
     const MSG_CMSG_CLOEXEC = 0x40000000;
     const n = try check(linux.syscall3(.recvmsg, ufd(fd), @intFromPtr(&msg), MSG_CMSG_CLOEXEC));
@@ -346,7 +346,7 @@ pub fn pipe() Error![2]i32 {
 const SockaddrAbs = extern struct { family: u16, path: [108]u8 };
 
 fn abstractAddr(name: []const u8, out: *SockaddrAbs) usize {
-    out.* = .{ .family = 1, .path = [_]u8{0} ** 108 };
+    out.* = .{ .family = 1, .path = @as([108]u8, @splat(0)) };
     const k: usize = @min(name.len, 100);
     @memcpy(out.path[1 .. 1 + k], name[0..k]); // path[0] = 0 — an abstract name
     return 2 + 1 + k;

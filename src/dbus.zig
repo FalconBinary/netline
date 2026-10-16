@@ -330,8 +330,8 @@ pub const Conn = struct {
     ilen: usize = 0,
     consumed: usize = 0, // length of the last returned reply at `head`
     out: *[64 * 1024]u8 = &out_buf,
-    waiting: [MAX_ASYNC]u32 = [_]u32{0} ** MAX_ASYNC,
-    done: [MAX_ASYNC]Done = [_]Done{.{}} ** MAX_ASYNC,
+    waiting: [MAX_ASYNC]u32 = @as([MAX_ASYNC]u32, @splat(0)),
+    done: [MAX_ASYNC]Done = @as([MAX_ASYNC]Done, @splat(.{})),
     /// The unique bus name (":1.23") of the service we talk to. Signals are accepted only from it:
     /// match rules filter broadcasts, but any local process may send a signal straight to us
     /// (a fake network or device in the list, or a flood that keeps the menu busy).

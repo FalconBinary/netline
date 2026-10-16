@@ -525,7 +525,7 @@ pub const Glyph = struct {
 };
 
 const CACHE_N = 512;
-var cache: [CACHE_N]Glyph = [_]Glyph{.{}} ** CACHE_N;
+var cache: [CACHE_N]Glyph = @as([CACHE_N]Glyph, @splat(.{}));
 var pool: [512 * 1024]u8 = undefined;
 var pool_used: usize = 0;
 var acc_buf: [128 * 128]f32 = undefined;
@@ -636,7 +636,7 @@ pub const Utf8 = struct {
 /// "Character → glyph index" cache: a cmap lookup for every character of every frame.
 /// The slot holds cp + 1 so that the empty (zero) table lives in .bss rather than in the file.
 const CpSlot = struct { cp1: u32 = 0, gid: u32 = 0 };
-var cp_cache: [512]CpSlot = [_]CpSlot{.{}} ** 512;
+var cp_cache: [512]CpSlot = @as([512]CpSlot, @splat(.{}));
 
 fn glyphFor(cp: u32) u32 {
     const f = fnt() orelse return 0;

@@ -6,7 +6,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const release = optimize != .Debug;
+    const release = optimize != .debug;
     // timing output (NETLINE_TRACE=1) only in a -Dtrace=true build; a normal build has none of that code
     const trace = b.option(bool, "trace", "compile in timing output: NETLINE_TRACE=1 prints wakeups and frame times") orelse false;
     const opts = b.addOptions();
