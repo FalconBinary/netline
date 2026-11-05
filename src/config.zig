@@ -8,13 +8,48 @@ const hex = @import("color.zig").hex;
 
 pub const Position = enum { top, bottom };
 pub const TagStyle = enum { dots, numbers };
-pub const ClockFormat = enum { hm, hms, date_hm, full };
+pub const ClockFormat = enum { hm, hms, date_hm, short, full };
+pub const PanelMode = enum { always, autohide };
 
-/// Panel items. The clock is always in the center.
-pub const Item = enum { launcher, tags, clock, wifi, bluetooth, wallpaper, power };
+/// Panel items. The clock is always in the center. An item with nothing to show takes no
+/// room: no battery on a desktop, no backlight on an external monitor, no sound server running.
+pub const Item = enum { launcher, tags, clock, sound, brightness, battery, wifi, bluetooth, wallpaper, power };
 
 pub const left = [_]Item{ .launcher, .tags };
-pub const right = [_]Item{ .wifi, .bluetooth, .wallpaper, .power };
+pub const right = [_]Item{ .sound, .brightness, .battery, .wifi, .bluetooth, .wallpaper, .power };
+
+/// Whether the panel has this item: the code and the events for an unused one are not there at all.
+pub fn hasItem(comptime item: Item) bool {
+    for (left) |it| if (it == item) return true;
+    for (right) |it| if (it == item) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------- how the panel appears
+
+/// .autohide — like the macOS menu bar: windows get the whole screen, and the panel slides out
+/// when the pointer reaches the screen edge, slides back when it leaves. It also comes out for a
+/// moment when the volume, brightness or power source changes, and stays while its menu is open.
+/// .always — always on screen, windows are placed below it.
+pub const panel_mode: PanelMode = .autohide;
+/// Duration of the slide in ms (0 — no animation). It follows the display's refresh and costs one
+/// small message per frame: the picture itself is not redrawn.
+pub const slide_ms: u32 = 260;
+/// Same for the menus that come out from under the panel.
+pub const menu_slide_ms: u32 = 200;
+/// Pointer on the edge for this long before the panel comes out: reaching for a browser tab doesn't flash it.
+pub const reveal_delay_ms: u32 = 40;
+/// Pointer gone for this long before the panel goes back.
+pub const hide_delay_ms: u32 = 400;
+/// How long the panel and the level bar stay out after a change of volume or brightness.
+pub const peek_ms: u32 = 1500;
+/// The invisible strip of the hidden panel on the screen edge that catches the pointer (logical pixels).
+pub const edge_strip: u32 = 2;
+
+/// The percent next to the battery icon.
+pub const battery_percent = true;
+/// At or below this charge, while on battery, the icon turns red and the panel comes out once.
+pub const battery_low: u8 = 15;
 
 // ---------------------------------------------------------------- geometry (logical pixels)
 
@@ -46,8 +81,8 @@ pub const clock_font_paths = [_][]const u8{
     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", // Fedora
 };
 /// .hm — 13:31, .hms — 13:31:05 (wakes the panel every second), .date_hm — 12.10  13:31,
-/// .full — Mon, 12 October 2026  13:31
-pub const clock_format: ClockFormat = .full;
+/// .short — Mon 12 Oct  13:31, .full — Mon, 12 October 2026  13:31
+pub const clock_format: ClockFormat = .short;
 
 pub const tag_style: TagStyle = .dots;
 pub const hide_empty_tags = false; // hide empty inactive tags
@@ -58,12 +93,13 @@ pub const tag_number_size: f32 = 10;
 
 // ---------------------------------------------------------------- load and security
 
-/// Wi‑Fi/Bluetooth are updated on kernel events (netlink). This poll is only a fallback:
-/// kernel events don't report signal level or adapter power through BlueZ.
-pub const status_poll_s: u32 = 30;
+/// Wi‑Fi, Bluetooth, power and backlight are updated on kernel events (netlink), and what sends no
+/// events (Wi‑Fi signal, battery percent on many laptops) is read when the clock wakes the panel anyway.
+/// This poll is only for reconnecting to mango and the sound server, and for kernels without the events.
+pub const status_poll_s: u32 = 60;
 
 /// Sandbox: seccomp (no exec, network sockets or file writes) + Landlock (read-only access to
-/// /sys, /proc, tzdata and the theme folder). External commands are run by a separate broker process,
+/// the device folders of /sys, the panel's own /proc entry, tzdata and the theme folder). External commands are run by a separate broker process,
 /// and only from the list below. Turning it off only makes sense for debugging.
 pub const sandbox = true;
 
@@ -100,6 +136,18 @@ pub const Theme = struct {
     // wallpaper and power
     wallpaper: u32,
     power: u32,
+    // sound
+    sound: u32,
+    sound_muted: u32,
+    // brightness
+    brightness: u32,
+    // battery
+    battery: u32,
+    battery_low: u32,
+    battery_charging: u32,
+    // the level bar that shows up with a change of volume or brightness
+    level_track: u32,
+    level_fill: u32,
     // Wi‑Fi menu (zwifi)
     menu_background: u32,
     menu_backdrop: u32, // screen dimming around the menu
@@ -134,6 +182,14 @@ pub const theme = Theme{
     .bluetooth_off = hex("#585b70"),
     .wallpaper = hex("#cdd6f4"),
     .power = hex("#f38ba8"),
+    .sound = hex("#cdd6f4"),
+    .sound_muted = hex("#f38ba8"),
+    .brightness = hex("#cdd6f4"),
+    .battery = hex("#cdd6f4"),
+    .battery_low = hex("#f38ba8"),
+    .battery_charging = hex("#a6e3a1"),
+    .level_track = hex("#585b70"),
+    .level_fill = hex("#cdd6f4"),
     .menu_background = hex("#1e1e2ef2"),
     .menu_backdrop = hex("#00000059"),
     .menu_text = hex("#cdd6f4"),
@@ -147,7 +203,7 @@ pub const theme = Theme{
     .desktop = hex("#11111b"),
 };
 
-// ---------------------------------------------------------------- menus (zwifi, zbt, zwall, zpower, zcal)
+// ---------------------------------------------------------------- menus (zctl, zwifi, zbt, zwall, zpower, zcal)
 
 /// TrueType fonts (.ttf, glyf outlines) — the first one found is used.
 /// CFF/OTF are not supported. Put your own path first.
@@ -164,6 +220,8 @@ pub const font_paths = [_][]const u8{
 pub const menu_width: u32 = 400;
 pub const menu_height: u32 = 500;
 pub const menu_radius: f32 = 16;
+/// Gap between the panel and a menu that comes out from under it.
+pub const menu_gap: i32 = 6;
 
 /// Power: ask for confirmation to log out, reboot and power off.
 pub const power_confirm = true;
@@ -213,13 +271,19 @@ pub const terminal = [_][:0]const u8{"foot"};
 // Commands are run by the broker process: simple ones ("zwifi toggle") directly, without a shell,
 // ones with special characters (quotes, |, ;, $, ~ …) via /bin/sh -c. The panel itself cannot
 // launch programs — the broker only runs commands built in here at compile time.
-// zrun, zwifi, zbt, zwall, zpower and zcal live next to netline — the broker finds them itself.
+// zrun, zctl, zwifi, zbt, zwall, zpower and zcal live next to netline — the broker finds them itself.
 // null — do nothing.
 
 pub const Action = struct {
     left: ?[*:0]const u8 = null,
     right: ?[*:0]const u8 = null,
     middle: ?[*:0]const u8 = null,
+    /// the wheel over the item
+    up: ?[*:0]const u8 = null,
+    down: ?[*:0]const u8 = null,
+    /// `left` opens a menu: an auto-hiding panel stays out until the menu closes. false for a
+    /// program that runs for long, otherwise the panel would stay out all that time.
+    left_is_menu: bool = true,
 };
 
 pub const launcher = Action{
@@ -232,3 +296,6 @@ pub const wifi = Action{ .left = "zwifi", .right = "zwifi toggle" };
 pub const bluetooth = Action{ .left = "zbt", .right = "zbt toggle" };
 pub const wallpaper = Action{ .left = "zwall", .right = "zwall random" };
 pub const power = Action{ .left = "zpower", .right = lock_cmd };
+pub const sound = Action{ .left = "zctl", .right = "zctl mute", .up = "zctl vol +5", .down = "zctl vol -5" };
+pub const brightness = Action{ .left = "zctl", .up = "zctl bright +5", .down = "zctl bright -5" };
+pub const battery = Action{ .left = "zctl" };

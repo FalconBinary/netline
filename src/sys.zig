@@ -34,6 +34,7 @@ pub const O_NONBLOCK: usize = 0o4000;
 const O_PATH: usize = 0o10000000;
 const SOCK_CLOEXEC: usize = 0o2000000;
 pub const MSG_NOSIGNAL: usize = 0x4000;
+pub const MSG_DONTWAIT: usize = 0x40;
 pub const ECANCELED: usize = 125;
 
 // ---------------------------------------------------------------- files
@@ -68,6 +69,12 @@ pub fn lseek(fd: i32, off: usize) Error!usize {
 pub fn accept(fd: i32) ?i32 {
     const c = check(linux.syscall4(.accept4, ufd(fd), 0, 0, SOCK_CLOEXEC)) catch return null;
     return @intCast(c);
+}
+
+/// Writes go to the end of the file, wherever the file was cut to meanwhile.
+pub fn openAppend(path: [*:0]const u8) Error!i32 {
+    const rc = try check(linux.syscall4(.openat, ufd(AT_FDCWD), @intFromPtr(path), 2 | 0o2000 | O_CLOEXEC, 0)); // O_RDWR | O_APPEND
+    return @intCast(rc);
 }
 
 pub fn openRW(path: [*:0]const u8) Error!i32 {
@@ -247,6 +254,13 @@ pub fn sendAll(fd: i32, data: []const u8) Error!void {
         };
         off += n;
     }
+}
+
+/// Send without waiting: a peer that has stopped reading must not stop the caller. A short send
+/// would break a stream, so it counts as a failure.
+pub fn sendNoWait(fd: i32, data: []const u8) Error!void {
+    const n = try check(linux.syscall6(.sendto, ufd(fd), @intFromPtr(data.ptr), data.len, MSG_NOSIGNAL | MSG_DONTWAIT, 0, 0));
+    if (n != data.len) return error.Failed;
 }
 
 const Iovec = extern struct { base: [*]const u8, len: usize };
@@ -591,6 +605,43 @@ pub fn spawnArgv(av: [*:null]const ?[*:0]const u8, dir: ?[*:0]const u8, alt: ?[*
             execvp(av);
             if (alt) |a| execvp(a);
             exit(127);
+        }
+        exit(0);
+    }
+    var status: u32 = 0;
+    _ = linux.syscall4(.wait4, pid, @intFromPtr(&status), 0, 0);
+}
+
+/// Runs a program detached and sends `note` over `sock` when it ends. A small watcher process stays
+/// for that time; if the program can't be started, the note is sent at once.
+pub fn spawnWatched(av: ?[*:null]const ?[*:0]const u8, shell: ?[*:0]const u8, alt: ?[*:null]const ?[*:0]const u8, sock: i32, note: []const u8) void {
+    const pid = fork() catch {
+        sendAll(sock, note) catch {};
+        return;
+    };
+    if (pid == 0) {
+        _ = linux.syscall0(.setsid);
+        const watcher = fork() catch {
+            sendAll(sock, note) catch {};
+            exit(1);
+        };
+        if (watcher == 0) {
+            if (fork()) |program| {
+                if (program == 0) {
+                    if (av) |a| {
+                        execvp(a);
+                        if (alt) |b| execvp(b);
+                    } else if (shell) |sh| {
+                        const sh_argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", sh };
+                        _ = linux.syscall3(.execve, @intFromPtr("/bin/sh"), @intFromPtr(&sh_argv), @intFromPtr(envp()));
+                    }
+                    exit(127);
+                }
+                var status: u32 = 0;
+                _ = linux.syscall4(.wait4, program, @intFromPtr(&status), 0, 0);
+            } else |_| {}
+            sendAll(sock, note) catch {};
+            exit(0);
         }
         exit(0);
     }

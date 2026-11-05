@@ -717,6 +717,56 @@ pub const icon_bt = [_]Prim{
 };
 pub const icon_bt_dots = [_]Prim{ dot(2.2, 8, 1.2), dot(13.8, 8, 1.2) };
 
+pub const icon_sound_body = [_]Prim{
+    seg(1.5, 6.2, 4, 6.2),
+    seg(4, 6.2, 7.5, 3),
+    seg(7.5, 3, 7.5, 13),
+    seg(7.5, 13, 4, 9.8),
+    seg(4, 9.8, 1.5, 9.8),
+    seg(1.5, 9.8, 1.5, 6.2),
+};
+/// One arc for a quiet level, three for a loud one.
+pub const icon_sound_arcs = [_][1]Prim{
+    .{arc(7.5, 8, 2.6, -48, 48)},
+    .{arc(7.5, 8, 4.9, -48, 48)},
+    .{arc(7.5, 8, 7.2, -48, 48)},
+};
+pub const icon_sound_muted = [_]Prim{ seg(10.5, 6, 14.5, 10), seg(14.5, 6, 10.5, 10) };
+
+pub const icon_sun_core = [_]Prim{ring(8, 8, 2.9)};
+pub const icon_sun_rays = [_]Prim{
+    seg(8, 1, 8, 2.8),
+    seg(8, 13.2, 8, 15),
+    seg(1, 8, 2.8, 8),
+    seg(13.2, 8, 15, 8),
+    seg(3.05, 3.05, 4.32, 4.32),
+    seg(11.68, 11.68, 12.95, 12.95),
+    seg(3.05, 12.95, 4.32, 11.68),
+    seg(11.68, 4.32, 12.95, 3.05),
+};
+/// Shorter rays: a dim screen.
+pub const icon_sun_rays_low = [_]Prim{
+    seg(8, 2.2, 8, 2.8),
+    seg(8, 13.2, 8, 13.8),
+    seg(2.2, 8, 2.8, 8),
+    seg(13.2, 8, 13.8, 8),
+    seg(3.9, 3.9, 4.32, 4.32),
+    seg(11.68, 11.68, 12.1, 12.1),
+    seg(3.9, 12.1, 4.32, 11.68),
+    seg(11.68, 4.32, 12.1, 3.9),
+};
+
+pub const icon_battery = [_]Prim{ box(0.6, 4.3, 12.8, 7.4, 2), seg(15.1, 6.8, 15.1, 9.2) };
+pub const icon_bolt = [_]Prim{ seg(8, 2.6, 5, 8.4), seg(5, 8.4, 8.6, 7.6), seg(8.6, 7.6, 6, 13.4) };
+
+/// The charge inside the battery icon. Rounded to a tenth: the icon's mask is then cached
+/// for good, and a whole percent of change often costs no new pixels at all.
+pub fn batteryFill(percent: u8) [1]Prim {
+    const tenth: f32 = @floatFromInt((@as(u32, @min(percent, 100)) + 5) / 10);
+    const w: f32 = 1.2 + 9.2 * tenth / 10;
+    return .{.{ .fbox = .{ .x = 2.2, .y = 5.9, .w = w, .h = 4.2, .r = 0.8 } }};
+}
+
 pub const icon_wall = [_]Prim{
     box(1, 2.5, 14, 11, 2.5),
     seg(3.8, 11, 6.8, 7.3),

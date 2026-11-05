@@ -84,6 +84,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (!can_start) ui.setMsg(bz.lastError());
     }
     ui.run(.{
+        .place = .top_right,
         .width = cfg.menu_width,
         .height = cfg.menu_height,
         .layout = layout,

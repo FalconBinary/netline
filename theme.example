@@ -36,12 +36,28 @@ bluetooth_off       = #585b70
 wallpaper = #cdd6f4
 power     = #f38ba8
 
+# sound
+sound       = #cdd6f4
+sound_muted = #f38ba8
+
+# brightness
+brightness = #cdd6f4
+
+# battery
+battery          = #cdd6f4
+battery_low      = #f38ba8
+battery_charging = #a6e3a1
+
+# the level bar that shows up with a change of volume or brightness
+level_track = #585b70
+level_fill  = #cdd6f4
+
 # desktop: color under the wallpaper (until one is chosen, and the borders in fit mode)
 desktop = #11111b
 
-# all menus: zwifi, zbt, zwall, zpower, zcal
+# all menus: zctl, zwifi, zbt, zwall, zpower, zcal
 menu_background  = #1e1e2ef2
-menu_backdrop    = #00000059    # screen dimming around the menu
+menu_backdrop    = #00000059    # screen dimming around the menus in the center of the screen
 menu_text        = #cdd6f4
 menu_muted       = #7f849c
 menu_accent      = #89b4fa

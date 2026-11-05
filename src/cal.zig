@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     year = t.year;
     month = t.month;
     ui.run(.{
+        .place = .top_center,
         .width = @intFromFloat(2 * PAD + 7 * CELL_W),
         .height = @intFromFloat(GRID_Y + 6 * CELL_H + 16),
         .layout = layout,

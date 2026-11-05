@@ -81,6 +81,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     nm_ok = nm.init();
     if (!nm_ok) ui.setMsg(nm.lastError());
     ui.run(.{
+        .place = .top_right,
         .width = cfg.menu_width,
         .height = cfg.menu_height,
         .layout = layout,

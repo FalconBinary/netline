@@ -224,3 +224,35 @@ fn jump(at: anytype, l: anytype, i: usize) u8 {
     if (l == .none) return 0;
     return @intCast(at.get(l) - (i + 1));
 }
+
+// ================================================================= tests
+
+const NO_LANDLOCK = 77;
+
+/// What a process locked down with the panel's rules can reach. In a child: this can't be undone.
+fn probe() noreturn {
+    if (sys.raw(.landlock_create_ruleset, 0, 0, 1)) |_| {} else |_| sys.exit(NO_LANDLOCK);
+    apply(&.{ "/sys/class", "/sys/devices", "/proc/self" }, &.{}, .{});
+    // the panel's own data: /proc/net is a link into /proc/self, and /sys/class links into /sys/devices
+    if (!sys.exists("/proc/net/dev")) sys.exit(1);
+    if (!sys.exists("/proc/self/status")) sys.exit(2);
+    if (!sys.exists("/sys/class")) sys.exit(3);
+    // other processes, the rest of /sys, the rest of the file system
+    if (sys.exists("/proc/1/cmdline")) sys.exit(4);
+    if (sys.exists("/proc/1/environ")) sys.exit(5);
+    if (sys.exists("/proc/cpuinfo")) sys.exit(6);
+    if (sys.exists("/sys/kernel/mm")) sys.exit(7);
+    if (sys.exists("/etc/passwd")) sys.exit(8);
+    sys.exit(0);
+}
+
+test "the panel's rules open its own data and nothing else" {
+    const pid = try sys.fork();
+    if (pid == 0) probe();
+    var status: u32 = 0;
+    _ = linux.syscall4(.wait4, pid, @intFromPtr(&status), 0, 0);
+    const code = (status >> 8) & 0xff;
+    if (code == NO_LANDLOCK) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), status & 0x7f); // not killed by seccomp
+    try std.testing.expectEqual(@as(u32, 0), code);
+}

@@ -4,9 +4,11 @@
 //! netline — a minimalist panel for MangoWM in pure Zig.
 //! A Wayland client without libwayland: wl_shm + wlr-layer-shell + wl_pointer (+ cursor-shape).
 //!
-//! Load: the process sleeps in ppoll and wakes only on events — once a minute for the clock,
-//! on kernel netlink events for Wi‑Fi/Bluetooth, on input and on a rare fallback timer.
+//! Load: the process sleeps in ppoll and wakes only on events — once a minute for the clock (what sends
+//! no events is read then too), on kernel netlink events for Wi‑Fi, Bluetooth, power and backlight,
+//! on sound server events, on input and on a rare fallback timer.
 //! A frame is drawn only on change, and only the changed rectangle is handed to the compositor.
+//! Sliding out moves the surface and doesn't redraw it.
 
 const std = @import("std");
 const sys = @import("sys.zig");
@@ -21,11 +23,25 @@ const sandbox = @import("sandbox.zig");
 const theme = @import("theme.zig");
 const cfg = @import("config.zig");
 const rt = @import("rt.zig");
+const anim = @import("anim.zig");
+const audio = @import("audio.zig");
 
 pub const panic = rt.panic;
 pub const std_options = rt.std_options;
 
 const MAX_BARS = mango.MAX_MONS;
+
+const autohide = cfg.panel_mode == .autohide;
+/// Rows of the surface below the panel (above it, for a bottom panel): transparent, they are what
+/// stays on screen when the panel is hidden, and they catch the pointer.
+const STRIP: u32 = if (autohide) cfg.edge_strip else 0;
+const STRIP_TOP: u32 = if (cfg.position == .bottom) STRIP else 0;
+const SHOWN_Y: i32 = cfg.margin_edge;
+const HIDDEN_Y: i32 = -@as(i32, @intCast(cfg.height));
+const SLIDE_PATH: u32 = @intCast(SHOWN_Y - HIDDEN_Y);
+/// Frame callbacks don't come for a surface that is fully off screen: time moves the slide on then.
+const SLIDE_FALLBACK_MS: u64 = 33;
+const LEVEL_W: f32 = 72;
 
 const Kind = enum(u8) {
     none,
@@ -44,6 +60,7 @@ const Kind = enum(u8) {
     output,
     cursor_mgr,
     cursor_dev,
+    frame,
 };
 
 const Buf = struct { id: u32 = 0, busy: bool = false };
@@ -80,6 +97,18 @@ const Bar = struct {
     hits: [48]Hit = undefined,
     nhits: usize = 0,
     hover: ?Hit = null,
+    level_x: f32 = 0, // where the level bar goes: left of the right-hand items
+
+    // sliding: `y` is the current margin from the screen edge, `shown` — where it is heading
+    y: i32 = HIDDEN_Y,
+    shown: bool = false,
+    started: bool = false, // the first frame is on the surface
+    slide: ?anim.Slide = null,
+    frame_pending: bool = false,
+    last_step_ms: u64 = 0,
+    show_at: u64 = 0, // pointer on the edge: when to come out; 0 — not waiting
+    hide_at: u64 = 0, // pointer gone: when to go back; 0 — not waiting
+    exclusive: bool = false, // windows were told to keep clear (always mode, after the slide)
 
     fn monName(self: *const Bar) []const u8 {
         return self.mon_buf[0..self.mon_len];
@@ -87,13 +116,19 @@ const Bar = struct {
 };
 
 // Command table for the broker: [item][button]. Built at compile time from config.zig.
-const actions = [_]cfg.Action{ cfg.launcher, cfg.clock, cfg.wifi, cfg.bluetooth, cfg.wallpaper, cfg.power };
+const actions = [_]cfg.Action{ cfg.launcher, cfg.clock, cfg.wifi, cfg.bluetooth, cfg.wallpaper, cfg.power, cfg.sound, cfg.brightness, cfg.battery };
+const BUTTONS = 5; // left, right, middle, wheel up, wheel down
+const WHEEL_UP = 3;
+const WHEEL_DOWN = 4;
 const commands = blk: {
-    var c: [actions.len * 3]?broker.Cmd = undefined;
+    @setEvalBranchQuota(100000);
+    var c: [actions.len * BUTTONS]?broker.Cmd = undefined;
     for (actions, 0..) |a, i| {
-        c[i * 3] = broker.compile(a.left);
-        c[i * 3 + 1] = broker.compile(a.right);
-        c[i * 3 + 2] = broker.compile(a.middle);
+        c[i * BUTTONS] = broker.compile(a.left);
+        c[i * BUTTONS + 1] = broker.compile(a.right);
+        c[i * BUTTONS + 2] = broker.compile(a.middle);
+        c[i * BUTTONS + WHEEL_UP] = broker.compile(a.up);
+        c[i * BUTTONS + WHEEL_DOWN] = broker.compile(a.down);
     }
     break :blk c;
 };
@@ -106,6 +141,9 @@ fn actionIndex(item: cfg.Item) ?u8 {
         .bluetooth => 3,
         .wallpaper => 4,
         .power => 5,
+        .sound => 6,
+        .brightness => 7,
+        .battery => 8,
         .tags => null,
     };
 }
@@ -140,6 +178,18 @@ var bt_state: status.Bt = .none;
 var clock_buf: [64]u8 = undefined;
 var clock_len: usize = 0;
 var clock_hour: u32 = 99;
+var clock_sec: u32 = 0;
+
+var snd: audio.Client = .{};
+var bat: status.Battery = .{};
+var light: status.Backlight = .{};
+
+const Level = enum { sound, brightness };
+var level_kind: Level = .sound;
+var level_until: u64 = 0; // until when the level bar is drawn; 0 — it isn't
+var peek_until: u64 = 0; // until when an auto-hiding panel stays out without the pointer
+var holds: u32 = 0; // menus opened from the panel that are still open
+var hold_bar: u8 = 0;
 
 var clock_timer: i32 = -1;
 var poll_timer: i32 = -1;
@@ -186,6 +236,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     if (mango.connect()) applyTags() else burst = 5; // mango may not have its IPC up yet — retry
+    connectAudio();
+    if (cfg.hasItem(.sound) and snd.fd < 0) burst = 10; // nor the sound server, it starts after the panel
+    refreshPower(false);
+    refreshLight(false);
+    peek_until = sys.monoMs() + cfg.peek_ms; // show where the panel is, then get out of the way
 
     clock_timer = sys.timerfdCreate(sys.CLOCK_REALTIME) catch fatal("timerfd");
     poll_timer = sys.timerfdCreate(sys.CLOCK_MONOTONIC) catch fatal("timerfd");
@@ -194,7 +249,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     refreshStatus(true, true); // also arms the fallback poll if it's needed
 
     if (cfg.sandbox) {
-        const paths = [_][:0]const u8{ "/sys", "/proc", "/usr/share/zoneinfo", "/etc/localtime", tz.path, theme.dir };
+        // /proc/self: /proc/net/wireless is a link into it; other processes' /proc entries stay closed
+        const paths = [_][:0]const u8{ "/sys/class", "/sys/devices", "/proc/self", "/usr/share/zoneinfo", "/etc/localtime", tz.path, theme.dir, status.root };
         sandbox.apply(&paths, &.{}, .{ .ioctl = status.HCIGETDEVINFO });
     }
 
@@ -204,7 +260,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
         conn.flush() catch fatal("writing to the Wayland socket");
 
-        var fds = [8]sys.PollFd{
+        var fds = [10]sys.PollFd{
             .{ .fd = conn.fd, .events = sys.POLLIN },
             .{ .fd = clock_timer, .events = sys.POLLIN },
             .{ .fd = poll_timer, .events = sys.POLLIN },
@@ -213,8 +269,10 @@ pub fn main(init: std.process.Init.Minimal) void {
             .{ .fd = status.uevent_fd, .events = sys.POLLIN },
             .{ .fd = theme.inotify_fd, .events = sys.POLLIN },
             .{ .fd = status.mgmt_fd, .events = sys.POLLIN },
+            .{ .fd = snd.fd, .events = sys.POLLIN },
+            .{ .fd = broker.fd(), .events = sys.POLLIN },
         };
-        _ = sys.poll(&fds, theme.timeout()) catch continue;
+        _ = sys.poll(&fds, pollTimeout()) catch continue;
         if (sys.tracing()) traceWake(&fds);
 
         if (fds[0].revents != 0) readWayland();
@@ -227,18 +285,142 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (fds[4].revents != 0 or fds[5].revents != 0) {
             const ch = status.drainEvents(fds[4].revents != 0, fds[5].revents != 0);
             refreshStatus(ch.wifi, ch.bt);
+            if (ch.power) refreshPower(true);
+            if (ch.light) refreshLight(true);
         }
         if (fds[6].revents != 0 and theme.inotify_fd >= 0) theme.onInotify();
         if (theme.settle()) markAllDirty();
         if (fds[7].revents != 0 and status.mgmt_fd >= 0) {
             if (status.drainMgmt()) refreshStatus(false, true);
         }
+        if (fds[8].revents != 0 and snd.fd >= 0) onAudio();
+        if (fds[9].revents != 0 and broker.fd() >= 0) broker.onReadable();
+        onMenusClosed(broker.takeDone());
+        onTimers(sys.monoMs());
     }
+}
+
+/// How long the event loop may sleep: until the nearest deadline, or until an event when there is none.
+noinline fn pollTimeout() i32 {
+    const now = sys.monoMs();
+    var t = theme.timeout();
+    const until = struct {
+        fn f(cur: i32, at: u64, from: u64) i32 {
+            if (at == 0) return cur;
+            const left: i32 = @intCast(@min(at -| from, 60_000));
+            return if (cur < 0) left else @min(cur, left);
+        }
+    }.f;
+    t = until(t, level_until, now);
+    if (autohide) t = until(t, peek_until, now);
+    for (&bars) |*b| {
+        if (!b.used) continue;
+        t = until(t, b.show_at, now);
+        t = until(t, b.hide_at, now);
+        if (b.slide != null) t = until(t, b.last_step_ms + SLIDE_FALLBACK_MS, now);
+    }
+    return t;
+}
+
+noinline fn onTimers(now: u64) void {
+    if (level_until != 0 and now >= level_until) {
+        level_until = 0;
+        markAllDirty();
+    }
+    const peek_over = autohide and peek_until != 0 and now >= peek_until;
+    if (peek_over) peek_until = 0;
+    for (&bars, 0..) |*b, k| {
+        if (!b.used) continue;
+        const i: u8 = @intCast(k);
+        if (b.show_at != 0 and now >= b.show_at) setShown(i, true);
+        if (b.hide_at != 0 and now >= b.hide_at) {
+            b.hide_at = 0;
+            if (!wantShown(i)) setShown(i, false);
+        }
+        if (peek_over and !wantShown(i)) setShown(i, false);
+        if (b.slide != null and now -| b.last_step_ms >= SLIDE_FALLBACK_MS) stepSlide(i);
+    }
+}
+
+// ================================================================= sliding
+
+fn wantShown(i: u8) bool {
+    if (!autohide) return true;
+    if (ptr_bar != null and ptr_bar.? == i) return true;
+    if (holds > 0 and hold_bar == i) return true;
+    return sys.monoMs() < peek_until;
+}
+
+fn setMargin(b: *Bar, y: i32) void {
+    b.y = y;
+    const top: i32 = if (cfg.position == .top) y else 0;
+    const bottom: i32 = if (cfg.position == .bottom) y else 0;
+    conn.send(b.layer, 3, .{ top, cfg.margin_side, bottom, cfg.margin_side }); // set_margin
+}
+
+noinline fn setShown(i: u8, on: bool) void {
+    const b = &bars[i];
+    b.show_at = 0;
+    b.hide_at = 0;
+    if (!b.started or b.shown == on) return;
+    b.shown = on;
+    const to: i32 = if (on) SHOWN_Y else HIDDEN_Y;
+    const ms: u32 = if (on) cfg.slide_ms else cfg.slide_ms * 3 / 4;
+    b.slide = anim.slide(b.y, to, SLIDE_PATH, ms, if (on) .out else .in, sys.monoMs());
+    stepSlide(i);
+}
+
+/// One step of the slide. Only the surface's position changes: the compositor moves the picture
+/// it already has, and this process draws nothing. Runs from the frame callback, so at the display's rate.
+noinline fn stepSlide(i: u8) void {
+    const b = &bars[i];
+    const s = b.slide orelse return;
+    const now = sys.monoMs();
+    b.last_step_ms = now;
+    const y = s.at(now);
+    if (y != b.y) setMargin(b, y);
+    sys.tracef("slide {d}: y {d}", .{ i, y });
+    if (s.done(now)) {
+        b.slide = null;
+        if (!autohide and b.shown and !b.exclusive) {
+            // only now: during the slide this would move the windows on every frame
+            b.exclusive = true;
+            conn.send(b.layer, 2, .{@as(i32, @intCast(cfg.height))}); // exclusive zone
+        }
+    } else if (!b.frame_pending) {
+        b.frame_pending = true;
+        conn.send(b.surface, 3, .{create(.frame, i)}); // wl_surface.frame
+    }
+    conn.send(b.surface, 6, .{}); // commit
+}
+
+/// Come out for a moment and go back on our own.
+noinline fn peek() void {
+    if (!autohide) return;
+    peek_until = sys.monoMs() + cfg.peek_ms;
+    for (&bars, 0..) |*b, k| {
+        if (b.used) setShown(@intCast(k), true);
+    }
+}
+
+noinline fn showLevel(kind: Level) void {
+    level_kind = kind;
+    level_until = sys.monoMs() + cfg.peek_ms;
+    markAllDirty();
+    peek();
+}
+
+noinline fn onMenusClosed(n: u32) void {
+    if (n == 0) return;
+    holds -|= n;
+    if (holds > 0 or !autohide) return;
+    const b = &bars[hold_bar];
+    if (b.used and b.shown and !wantShown(hold_bar)) b.hide_at = sys.monoMs() + cfg.hide_delay_ms;
 }
 
 /// NETLINE_TRACE: why the panel woke up (when idle there should be no lines except the clock).
 fn traceWake(fds: []const sys.PollFd) void {
-    const names = [_][]const u8{ " wayland", " clock", " poll", " mango", " net", " devices", " theme", " bluetooth" };
+    const names = [_][]const u8{ " wayland", " clock", " poll", " mango", " net", " devices", " theme", " bluetooth", " sound", " broker" };
     var buf: [128]u8 = undefined;
     var n: usize = 0;
     for (fds, names) |f, nm| {
@@ -285,6 +467,63 @@ fn readWayland() void {
 
 // ================================================================= timers and status
 
+noinline fn connectAudio() void {
+    if (!cfg.hasItem(.sound) or snd.fd >= 0) return;
+    const fd = broker.requestAudio();
+    if (fd < 0) return;
+    if (!snd.start(fd)) snd.close();
+}
+
+noinline fn onAudio() void {
+    if (snd.onReadable()) markAllDirty();
+    if (snd.moved) {
+        snd.moved = false;
+        // with zctl open, its slider already shows the level
+        if (holds == 0) showLevel(.sound);
+    }
+    if (snd.fd < 0) { // the server went away: it usually comes straight back
+        burst = 10;
+        armPoll();
+    }
+}
+
+fn pluggedIn(s: status.BatState) bool {
+    return s != .discharging and s != .none;
+}
+
+/// `report`: come out if the change is worth a look — power cable, a low charge.
+noinline fn refreshPower(report: bool) void {
+    if (!cfg.hasItem(.battery)) return;
+    const old = bat;
+    bat = status.battery();
+    if (bat.state != old.state or bat.percent != old.percent) markAllDirty();
+    if (!report or old.state == .none or bat.state == .none) return;
+    const low_now = bat.state == .discharging and bat.percent <= cfg.battery_low and old.percent > cfg.battery_low;
+    if (pluggedIn(bat.state) != pluggedIn(old.state) or low_now) peek();
+}
+
+noinline fn refreshLight(report: bool) void {
+    if (!cfg.hasItem(.brightness)) return;
+    const old = light;
+    light = status.backlight();
+    if (report and old.present and light.present and light.raw != old.raw) return showLevel(.brightness);
+    if (light.present != old.present or light.percent != old.percent) markAllDirty();
+}
+
+/// The things that send no events are read here: the clock wakes the panel anyway,
+/// so they don't add a single wakeup.
+noinline fn readWithoutEvents() void {
+    if (wifi_state.state == .connected) {
+        const lvl = status.signalLevel();
+        if (lvl != wifi_state.level) {
+            wifi_state.level = lvl;
+            markAllDirty();
+        }
+    }
+    refreshPower(true);
+    refreshLight(true);
+}
+
 fn armClock() void {
     const step: i64 = if (cfg.clock_format == .hms) 1 else 60;
     const now = sys.realtime();
@@ -292,12 +531,13 @@ fn armClock() void {
     sys.timerfdArm(clock_timer, sys.TFD_TIMER_ABSTIME | sys.TFD_TIMER_CANCEL_ON_SET, next, @intCast(step)) catch {};
 }
 
-/// The fallback poll is only for things that send no events: Wi‑Fi signal level,
-/// Bluetooth power (if the kernel gives no mgmt channel) and reconnecting to mango.
+/// The fallback poll is only for reconnecting to mango and the sound server, and for what the
+/// kernel gives no events about here: Bluetooth power without an mgmt channel, everything without netlink.
 /// Nothing to poll — the timer is off and the panel sleeps until an event.
 fn pollPeriod() u32 {
     if (burst > 0) return 1;
-    if (mango.fd < 0 or wifi_state.state == .connected) return cfg.status_poll_s;
+    if (mango.fd < 0 or !status.events()) return cfg.status_poll_s;
+    if (cfg.hasItem(.sound) and snd.fd < 0) return cfg.status_poll_s;
     if (bt_state != .none and !status.btEvents()) return cfg.status_poll_s;
     return 0;
 }
@@ -320,6 +560,7 @@ fn drainTimer(fd: i32) bool {
 fn onClockTimer() void {
     if (drainTimer(clock_timer)) armClock();
     if (updateClock()) markAllDirty();
+    if (cfg.clock_format != .hms or clock_sec == 0) readWithoutEvents();
 }
 
 fn onPollTimer() void {
@@ -328,18 +569,15 @@ fn onPollTimer() void {
         burst -= 1;
         refreshStatus(true, true);
     } else if (status.events()) {
-        // state changes arrive as kernel events: the regular poll only reads what sends none —
-        // the Wi‑Fi signal level and, without the mgmt channel, Bluetooth power
-        if (wifi_state.state == .connected) {
-            const lvl = status.signalLevel();
-            if (lvl != wifi_state.level) {
-                wifi_state.level = lvl;
-                markAllDirty();
-            }
-        }
+        // state changes arrive as kernel events; without the mgmt channel, Bluetooth power doesn't
         if (!status.btEvents()) refreshStatus(false, true);
-    } else refreshStatus(true, true);
+    } else {
+        refreshStatus(true, true);
+        refreshPower(true);
+        refreshLight(true);
+    }
     if (mango.fd < 0 and mango.connect()) applyTags();
+    connectAudio();
     armPoll();
 }
 
@@ -377,6 +615,7 @@ fn updateClock() bool {
         }
         clock_hour = t.hour;
     }
+    clock_sec = t.sec;
     var buf: [64]u8 = undefined;
     var n: usize = 0;
     if (cfg.clock_format == .full) {
@@ -393,7 +632,11 @@ fn updateClock() bool {
             n = 6 + y.len;
         }
     }
-    if (cfg.clock_format == .date_hm) {
+    if (cfg.clock_format == .short and ttf.font != null) {
+        const d = std.fmt.bufPrint(&buf, "{s} {d} {s}  ", .{ wshort[t.wday % 7], t.day, months[(t.month -% 1) % 12][0..3] }) catch "";
+        n = d.len;
+    }
+    if (cfg.clock_format == .date_hm or (cfg.clock_format == .short and ttf.font == null)) {
         two(buf[0..], t.day);
         buf[2] = '.';
         two(buf[3..], t.month);
@@ -464,6 +707,10 @@ fn dispatch(ev: wl.Event) void {
         },
         .callback => if (ev.op == 0) {
             sync_done = true;
+        },
+        .frame => if (ev.op == 0) {
+            bars[own].frame_pending = false;
+            stepSlide(own);
         },
         .seat => if (ev.op == 0) onSeatCaps(a.uint()),
         .pointer => onPointer(ev.op, &a),
@@ -579,7 +826,7 @@ fn onLayer(own: u8, op: u16, a: *wl.Args) void {
             conn.send(b.layer, 6, .{serial}); // ack_configure
             // clamp the sizes from the compositor to sane limits
             b.w = if (w > 0) @min(w, 16384) else 1280;
-            b.h = if (h > 0) @min(h, 512) else cfg.height;
+            b.h = if (h > 0) @min(h, 512) else cfg.height + STRIP;
             b.configured = true;
             b.dirty = true;
         },
@@ -603,19 +850,32 @@ fn onPointer(op: u16, a: *wl.Args) void {
             const serial = a.uint();
             const surf = a.uint();
             ptr_x = a.fixed();
-            ptr_y = a.fixed();
+            ptr_y = a.fixed() - @as(f32, @floatFromInt(STRIP_TOP));
             ptr_bar = barBySurface(surf);
             if (cursor_dev != 0) conn.send(cursor_dev, 1, .{ serial, @as(u32, 1) }); // shape: default
             updateHover();
+            if (autohide) {
+                if (ptr_bar) |i| {
+                    bars[i].hide_at = 0;
+                    if (!bars[i].shown) bars[i].show_at = sys.monoMs() + cfg.reveal_delay_ms;
+                }
+            }
         },
         1 => { // leave
+            const left_bar = ptr_bar;
             if (ptr_bar) |i| setHover(i, null);
             ptr_bar = null;
+            if (autohide) {
+                if (left_bar) |i| {
+                    bars[i].show_at = 0;
+                    if (bars[i].shown and !wantShown(i)) bars[i].hide_at = sys.monoMs() + cfg.hide_delay_ms;
+                }
+            }
         },
         2 => { // motion
             _ = a.uint();
             ptr_x = a.fixed();
-            ptr_y = a.fixed();
+            ptr_y = a.fixed() - @as(f32, @floatFromInt(STRIP_TOP));
             updateHover();
         },
         3 => { // button
@@ -683,7 +943,8 @@ fn click(i: u8, button: u32, time: u32) void {
         BTN_MIDDLE => 2,
         else => return,
     };
-    const slot = (actionIndex(h.item) orelse return) * 3 + btn;
+    const action = actionIndex(h.item) orelse return;
+    const slot = action * BUTTONS + btn;
     if (commands[slot] == null) return;
     // double-click guard: the same command no more than once per 400 ms
     if (last_click[slot]) |prev| {
@@ -691,7 +952,12 @@ fn click(i: u8, button: u32, time: u32) void {
     }
     last_click[slot] = time;
     sys.tracef("click: command {d}", .{slot});
-    broker.run(slot);
+    if (autohide and btn == 0 and actions[action].left_is_menu) {
+        // the panel stays out until this menu closes; the broker reports that
+        holds += 1;
+        hold_bar = i;
+        broker.runWatched(slot);
+    } else broker.run(slot);
     // Wi‑Fi/Bluetooth toggles (right click) don't always produce an event — check more often
     // for a few seconds; Bluetooth power from the menu without an mgmt channel is also learned only by polling
     const toggle = btn == 1 and (h.item == .wifi or h.item == .bluetooth);
@@ -726,6 +992,12 @@ fn scroll(i: u8, v: f32) void {
     const dir: i32 = if (scroll_acc > 0) 1 else -1;
     scroll_acc = 0;
     const b = &bars[i];
+    if (hitAt(b, ptr_x, ptr_y)) |h| {
+        if (actionIndex(h.item)) |action| {
+            const slot = action * BUTTONS + @as(u8, if (dir < 0) WHEEL_UP else WHEEL_DOWN);
+            if (commands[slot] != null) return broker.run(slot);
+        }
+    }
     if (b.ntags == 0) return;
     var cur: i32 = 0;
     for (b.tags[0..b.ntags], 0..) |t, k| {
@@ -747,16 +1019,14 @@ fn setupBar(i: u8) void {
     b.layer = create(.layer_surface, i);
     // get_layer_surface(id, surface, output, layer = top, namespace)
     conn.send(layer_shell, 0, .{ b.layer, b.surface, b.output, @as(u32, 2), wl.str("netline") });
-    conn.send(b.layer, 0, .{ @as(u32, 0), cfg.height }); // set_size (the compositor sets the width)
+    conn.send(b.layer, 0, .{ @as(u32, 0), cfg.height + STRIP }); // set_size (the compositor sets the width)
     const anchor: u32 = switch (cfg.position) {
         .top => 1 | 4 | 8,
         .bottom => 2 | 4 | 8,
     };
     conn.send(b.layer, 1, .{anchor});
-    conn.send(b.layer, 2, .{@as(i32, @intCast(cfg.height))}); // exclusive zone
-    const top: i32 = if (cfg.position == .top) cfg.margin_edge else 0;
-    const bottom: i32 = if (cfg.position == .bottom) cfg.margin_edge else 0;
-    conn.send(b.layer, 3, .{ top, cfg.margin_side, bottom, cfg.margin_side }); // set_margin
+    // starts off screen and comes out once it has a picture; the exclusive zone comes after that
+    setMargin(b, HIDDEN_Y);
     conn.send(b.surface, 6, .{}); // commit without a buffer -> a configure will come
 }
 
@@ -882,14 +1152,18 @@ fn render(i: u8) void {
     if (b.bufs[k].busy) return; // the compositor is still reading — finish after release
 
     layout(b);
-    var cv = draw.Canvas{ .px = pixels(b, k), .w = @intCast(b.pw), .h = @intCast(b.ph) };
+    // the panel's own rows: the strip stays as it was created, transparent
+    const whole = pixels(b, k);
+    const off = STRIP_TOP * b.scale;
+    const rows = @min(cfg.height * b.scale, b.ph -| off);
+    var cv = draw.Canvas{ .px = whole[off * b.pw ..][0 .. rows * b.pw], .w = @intCast(b.pw), .h = @intCast(rows) };
     paint(b, &cv);
 
     var rects: [MAX_RECTS]Rect = undefined;
     var nr: usize = 1;
     rects[0] = .{ .x0 = 0, .y0 = 0, .x1 = b.pw, .y1 = b.ph };
     if (b.last) |l| {
-        nr = diffRects(cv.px, pixels(b, l), b.pw, b.ph, &rects);
+        nr = diffRects(whole, pixels(b, l), b.pw, b.ph, &rects);
         if (nr == 0) {
             b.dirty = false; // nothing changed — don't touch the compositor at all
             return;
@@ -910,18 +1184,23 @@ fn render(i: u8) void {
     b.bufs[k].busy = true;
     b.last = k;
     b.dirty = false;
+    if (!b.started) {
+        b.started = true;
+        if (wantShown(i)) setShown(i, true);
+    }
 }
 
 /// With an opaque background (alpha ff in the theme) the compositor gets an opaque region — the panel
 /// without its rounded corners — and doesn't draw or blend what is under it. Sent with the next commit,
 /// only when the size or the background's opacity changed.
 fn syncOpaque(b: *Bar) void {
-    const want = theme.solid(theme.t.background);
-    if (want == b.opaque_on and (!want or (b.opaque_w == b.w and b.opaque_h == b.h))) return;
+    // (the region starts at the surface's first row, and a bottom panel's strip is there)
+    const want = theme.solid(theme.t.background) and STRIP_TOP == 0;
+    if (want == b.opaque_on and (!want or (b.opaque_w == b.w and b.opaque_h == cfg.height))) return;
     b.opaque_on = want;
     b.opaque_w = b.w;
-    b.opaque_h = b.h;
-    conn.setOpaque(compositor, b.surface, want, b.w, b.h, cfg.radius);
+    b.opaque_h = cfg.height;
+    conn.setOpaque(compositor, b.surface, want, b.w, cfg.height, cfg.radius);
 }
 
 fn sameTags(a: []const mango.Tag, b: []const mango.Tag) bool {
@@ -964,7 +1243,13 @@ fn addHit(b: *Bar, item: cfg.Item, idx: u8, x: f32, y: f32, w: f32, h: f32) void
 }
 
 fn itemWidth(b: *const Bar, item: cfg.Item) f32 {
-    if (item != .tags) return cfg.button;
+    switch (item) {
+        .tags => {},
+        .sound => return if (snd.sink.present) cfg.button else 0,
+        .brightness => return if (light.present) cfg.button else 0,
+        .battery => return if (bat.state == .none) 0 else cfg.button + batteryTextW(@floatFromInt(b.scale)),
+        else => return cfg.button,
+    }
     var w: f32 = 0;
     for (b.tags[0..b.ntags]) |t| {
         if (cfg.hide_empty_tags and !t.active and t.clients == 0) continue;
@@ -990,14 +1275,14 @@ fn place(b: *Bar, item: cfg.Item, x0: f32, by: f32) void {
             x += w;
         }
     } else {
-        addHit(b, item, 0, x0, by, cfg.button, cfg.button);
+        addHit(b, item, 0, x0, by, itemWidth(b, item), cfg.button);
     }
 }
 
 fn layout(b: *Bar) void {
     b.nhits = 0;
     const W: f32 = @floatFromInt(b.w);
-    const H: f32 = @floatFromInt(b.h);
+    const H: f32 = @floatFromInt(cfg.height);
     const by = (H - cfg.button) / 2;
 
     var x: f32 = cfg.padding;
@@ -1016,14 +1301,18 @@ fn layout(b: *Bar) void {
         place(b, it, rx, by);
         rx -= cfg.spacing;
     }
+    b.level_x = rx - LEVEL_W - 8;
     const tw = clockWidth(@floatFromInt(b.scale));
     addHit(b, .clock, 0, (W - tw) / 2 - 8, by, tw + 16, cfg.button);
+    if (sys.tracing()) {
+        for (b.hits[0..b.nhits]) |h| sys.tracef("item {s} {d} {d}", .{ @tagName(h.item), @as(i32, @intFromFloat(h.x)), @as(i32, @intFromFloat(h.w)) });
+    }
 }
 
 fn paint(b: *const Bar, cv: *draw.Canvas) void {
     const S: f32 = @floatFromInt(b.scale);
     const W: f32 = @floatFromInt(b.w);
-    const H: f32 = @floatFromInt(b.h);
+    const H: f32 = @floatFromInt(cfg.height);
     const c = &theme.t;
 
     cv.clear(0);
@@ -1053,6 +1342,44 @@ fn paint(b: *const Bar, cv: *draw.Canvas) void {
             else => paintIcon(cv, h, S),
         }
     }
+    if (level_until != 0) paintLevel(b, cv, S, W, H);
+}
+
+/// A thin bar in the free space left of the icons: what the volume or brightness keys just did.
+noinline fn paintLevel(b: *const Bar, cv: *draw.Canvas, S: f32, W: f32, H: f32) void {
+    const c = &theme.t;
+    // no room next to the clock on a narrow screen: the icons still show the state
+    const clock_end = (W + clockWidth(S)) / 2 + 8;
+    if (b.level_x < clock_end) return;
+    const pct: u32 = switch (level_kind) {
+        .sound => if (snd.sink.muted) 0 else snd.sink.percent,
+        .brightness => light.percent,
+    };
+    const h: f32 = 6;
+    const y = (H - h) / 2;
+    cv.fillRoundRect(b.level_x * S, y * S, LEVEL_W * S, h * S, h / 2 * S, c.level_track);
+    if (pct == 0) return;
+    const w = @max(h, LEVEL_W * @as(f32, @floatFromInt(pct)) / 100);
+    cv.fillRoundRect(b.level_x * S, y * S, w * S, h * S, h / 2 * S, c.level_fill);
+}
+
+/// The vector digits have no percent sign.
+fn batteryText(buf: []u8) []const u8 {
+    if (!cfg.battery_percent) return "";
+    const s = if (ttf.font != null) std.fmt.bufPrint(buf, "{d}%", .{bat.percent}) else std.fmt.bufPrint(buf, "{d}", .{bat.percent});
+    return s catch "";
+}
+
+fn batteryFontSize(S: f32) u16 {
+    return @intFromFloat(@round(cfg.clock_size * 1.15 * S));
+}
+
+fn batteryTextW(S: f32) f32 {
+    var buf: [8]u8 = undefined;
+    const s = batteryText(&buf);
+    if (s.len == 0) return 0;
+    if (ttf.font != null) return ttf.width(s, batteryFontSize(S)) / S + 3;
+    return draw.textWidth(s, cfg.tag_number_size) + 3;
 }
 
 fn paintTag(b: *const Bar, cv: *draw.Canvas, h: Hit, S: f32) void {
@@ -1090,7 +1417,7 @@ fn paintTag(b: *const Bar, cv: *draw.Canvas, h: Hit, S: f32) void {
 fn paintIcon(cv: *draw.Canvas, h: Hit, S: f32) void {
     const c = &theme.t;
     const s = cfg.icon / 16.0 * S;
-    const ox = @round((h.x + (h.w - cfg.icon) / 2) * S);
+    const ox = @round((h.x + (cfg.button - cfg.icon) / 2) * S);
     const oy = @round((h.y + (h.h - cfg.icon) / 2) * S);
     const st = cfg.icon_stroke * S;
     switch (h.item) {
@@ -1116,6 +1443,47 @@ fn paintIcon(cv: *draw.Canvas, h: Hit, S: f32) void {
             cv.icon(&draw.icon_bt, ox, oy, s, st, col);
             if (bt_state == .connected) cv.icon(&draw.icon_bt_dots, ox, oy, s, st, col);
         },
+        .sound => {
+            const p = snd.sink.percent;
+            if (snd.sink.muted) {
+                cv.icon(&draw.icon_sound_body, ox, oy, s, st, c.sound_muted);
+                cv.icon(&draw.icon_sound_muted, ox, oy, s, st, c.sound_muted);
+            } else {
+                cv.icon(&draw.icon_sound_body, ox, oy, s, st, c.sound);
+                const arcs: usize = if (p == 0) 0 else if (p < 34) 1 else if (p < 67) 2 else 3;
+                for (draw.icon_sound_arcs[0..arcs]) |*arc| cv.icon(arc, ox, oy, s, st, c.sound);
+            }
+        },
+        .brightness => {
+            cv.icon(&draw.icon_sun_core, ox, oy, s, st, c.brightness);
+            cv.icon(if (light.percent >= 50) &draw.icon_sun_rays else &draw.icon_sun_rays_low, ox, oy, s, st, c.brightness);
+        },
+        .battery => paintBattery(cv, h, ox, oy, s, st, S),
         .tags, .clock => {},
+    }
+}
+
+noinline fn paintBattery(cv: *draw.Canvas, h: Hit, ox: f32, oy: f32, s: f32, st: f32, S: f32) void {
+    const c = &theme.t;
+    const low = bat.state == .discharging and bat.percent <= cfg.battery_low;
+    const col = if (bat.state == .charging) c.battery_charging else if (low) c.battery_low else c.battery;
+    const fill = draw.batteryFill(bat.percent);
+    cv.icon(&draw.icon_battery, ox, oy, s, st, col);
+    cv.icon(&fill, ox, oy, s, st, col);
+    if (bat.state == .charging) {
+        // the bolt stands out from the charge by a rim of the panel's color
+        cv.icon(&draw.icon_bolt, ox, oy, s, st * 2.2, c.background | 0xff000000);
+        cv.icon(&draw.icon_bolt, ox, oy, s, st * 0.8, col);
+    }
+    var buf: [8]u8 = undefined;
+    const txt = batteryText(&buf);
+    if (txt.len == 0) return;
+    const x = @round((h.x + cfg.button) * S);
+    const size = cfg.tag_number_size;
+    if (ttf.font != null) {
+        const baseline = @round((h.y + h.h / 2) * S + @as(f32, @floatFromInt(batteryFontSize(S))) * 0.36);
+        _ = ttf.drawText(cv, txt, x, baseline, batteryFontSize(S), col, x + 64 * S);
+    } else {
+        draw.text(cv, txt, x, @round((h.y + h.h / 2 - size / 2) * S), size * S, col);
     }
 }

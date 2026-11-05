@@ -4,19 +4,25 @@
 //! The broker process — privilege separation.
 //!
 //! It forks off first of all, before connecting to Wayland and before the sandbox,
-//! and can do exactly three things:
+//! and can do exactly these things:
 //!   'C' <number>  — run a command from the table built in at compile time (config.zig):
 //!                   a simple one ("zwifi toggle") directly via execve, one with shell
 //!                   special characters (quotes, |, ;, $ …) via /bin/sh -c;
+//!   'H' <number>  — the same, and tell the panel with 'E' when it ends (a menu is closed);
 //!   'D' <command> — send mango a `dispatch` of a strictly checked form;
-//!   'W'           — connect to the mango IPC and hand the panel the ready socket.
+//!   'W'           — connect to the mango IPC and hand the panel the ready socket;
+//!   'A'           — connect to the sound server and hand the panel the ready socket.
 //! After that the panel itself lives in a sandbox without exec, fork, socket and connect:
 //! even if it is compromised, it can only run what you wrote into the config yourself.
 
 const std = @import("std");
 const sys = @import("sys.zig");
+const audio = @import("audio.zig");
 
 var sock: i32 = -1;
+
+/// Commands started with runWatched that have ended and were not yet collected with takeDone.
+var done: u32 = 0;
 
 /// A command parsed at compile time.
 pub const Cmd = struct {
@@ -94,6 +100,37 @@ pub fn run(slot: u8) void {
     sys.sendAll(sock, &m) catch {};
 }
 
+/// Like run, and `takeDone` will count it once the command has ended.
+pub fn runWatched(slot: u8) void {
+    const m = [2]u8{ 'H', slot };
+    sys.sendAll(sock, &m) catch {
+        done += 1; // nobody will report it
+    };
+}
+
+/// The socket to watch while waiting for ended commands (for the event loop).
+pub fn fd() i32 {
+    return sock;
+}
+
+/// Read a message about an ended command; the event loop calls it when the socket is readable.
+pub fn onReadable() void {
+    var buf: [16]u8 = undefined;
+    const n = sys.read(sock, &buf) catch return;
+    if (n == 0) { // the broker is gone: stop waking up for it, and nothing will report anymore
+        sys.close(sock);
+        sock = -1;
+        return;
+    }
+    if (buf[0] == 'E') done += 1;
+}
+
+pub fn takeDone() u32 {
+    const d = done;
+    done = 0;
+    return d;
+}
+
 pub fn dispatch(cmd: []const u8) void {
     var buf: [200]u8 = undefined;
     if (cmd.len + 1 > buf.len) return;
@@ -104,22 +141,41 @@ pub fn dispatch(cmd: []const u8) void {
 
 /// Ask the broker for a `watch all-tags` socket. -1 — mango is unavailable.
 pub fn requestWatch() i32 {
-    sys.sendAll(sock, "W") catch return -1;
-    var pfd = [1]sys.PollFd{.{ .fd = sock, .events = sys.POLLIN }};
-    const ready = sys.poll(&pfd, 1500) catch return -1;
-    if (ready == 0) return -1;
-    var buf: [16]u8 = undefined;
-    var fd: i32 = -1;
-    _ = sys.recvmsgFd(sock, &buf, &fd) catch return -1;
-    return fd;
+    return request("W");
+}
+
+/// Ask the broker for a socket to the sound server. -1 — none is running.
+pub fn requestAudio() i32 {
+    return request("A");
+}
+
+fn request(what: []const u8) i32 {
+    sys.sendAll(sock, what) catch return -1;
+    const deadline = sys.monoMs() + 1500;
+    while (true) {
+        const now = sys.monoMs();
+        if (now >= deadline) return -1;
+        var pfd = [1]sys.PollFd{.{ .fd = sock, .events = sys.POLLIN }};
+        const ready = sys.poll(&pfd, @intCast(deadline - now)) catch continue;
+        if (ready == 0) return -1;
+        var buf: [16]u8 = undefined;
+        var out: i32 = -1;
+        const n = sys.recvmsgFd(sock, &buf, &out) catch return -1;
+        if (n == 0) return -1;
+        if (buf[0] == 'E') { // a menu closed while we were asking: not the answer
+            done += 1;
+            continue;
+        }
+        return out;
+    }
 }
 
 // ---------------------------------------------------------------- broker side
 
-fn serve(fd: i32, cmds: []const ?Cmd) noreturn {
+fn serve(own: i32, cmds: []const ?Cmd) noreturn {
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = sys.read(fd, &buf) catch sys.exit(0);
+        const n = sys.read(own, &buf) catch sys.exit(0);
         if (n == 0) sys.exit(0); // the panel has exited
         const msg = buf[0..n];
         switch (msg[0]) {
@@ -128,8 +184,12 @@ fn serve(fd: i32, cmds: []const ?Cmd) noreturn {
                     if (c.argv) |av| sys.spawnArgv(av, null, c.alt) else if (c.shell) |sh| sys.spawnShell(sh);
                 }
             },
+            'H' => if (n == 2 and msg[1] < cmds.len) {
+                if (cmds[msg[1]]) |c| sys.spawnWatched(c.argv, c.shell, c.alt, own, "E") else sys.sendAll(own, "E") catch {};
+            } else sys.sendAll(own, "E") catch {},
             'D' => if (validDispatch(msg[1..])) mangoDispatch(msg[1..]),
-            'W' => sendWatch(fd),
+            'W' => sendWatch(own),
+            'A' => sendAudio(own),
             else => {},
         }
     }
@@ -151,17 +211,31 @@ fn mangoDispatch(cmd: []const u8) void {
     _ = sys.read(s, &tmp) catch {};
 }
 
-fn sendWatch(fd: i32) void {
+fn sendWatch(own: i32) void {
     const s = sys.connectUnix(mangoPath() orelse "") catch {
-        _ = sys.sendmsgFds(fd, "W", &.{}) catch {};
+        _ = sys.sendmsgFds(own, "W", &.{}) catch {};
         return;
     };
     defer sys.close(s);
     sys.sendAll(s, "watch all-tags\n") catch {
-        _ = sys.sendmsgFds(fd, "W", &.{}) catch {};
+        _ = sys.sendmsgFds(own, "W", &.{}) catch {};
         return;
     };
-    _ = sys.sendmsgFds(fd, "W", &.{s}) catch {};
+    _ = sys.sendmsgFds(own, "W", &.{s}) catch {};
+}
+
+fn sendAudio(own: i32) void {
+    var buf: [128]u8 = undefined;
+    const path = audio.socketPath(&buf) orelse {
+        _ = sys.sendmsgFds(own, "A", &.{}) catch {};
+        return;
+    };
+    const s = sys.connectUnix(path) catch {
+        _ = sys.sendmsgFds(own, "A", &.{}) catch {};
+        return;
+    };
+    defer sys.close(s);
+    _ = sys.sendmsgFds(own, "A", &.{s}) catch {};
 }
 
 fn isNum(s: []const u8) bool {

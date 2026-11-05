@@ -1,10 +1,11 @@
 // Copyright (c) 2026 Denys (FalconBinary)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Shared menu framework for netline (zrun, zwifi, zbt, zwall, zpower, zcal).
+//! Shared menu framework for netline (zrun, zctl, zwifi, zbt, zwall, zpower, zcal).
 //!
-//! A card centered on screen over a light dimming, pointer, keyboard (XKB, key
-//! repeat), clipboard, input fields, buttons, a live-reloading theme, the sandbox.
+//! A card centered on screen over a light dimming, or one that slides out from under the panel,
+//! pointer, keyboard (XKB, key repeat), clipboard, input fields, buttons, sliders, a live-reloading
+//! theme, the sandbox.
 //! Each menu describes only its own screens: the widget layout, drawing and reactions.
 //! Launching the same menu again closes the one already open.
 
@@ -18,8 +19,12 @@ const theme = @import("theme.zig");
 const cfg = @import("config.zig");
 const xkb = @import("xkb.zig");
 const sandbox = @import("sandbox.zig");
+const anim = @import("anim.zig");
 
 // ================================================================= menu description
+
+/// Where the card goes. The ones below the panel slide out from under it, with no dimming.
+pub const Place = enum { center, top_right, top_center };
 
 /// How a widget behaves with the keyboard and pointer.
 pub const Kind = enum(u8) {
@@ -29,6 +34,7 @@ pub const Kind = enum(u8) {
     field, // input field
     select, // choice among options: ←/→/Space
     toggle, // switch: click only
+    slider, // press and drag: App.drag
 };
 
 pub const Widget = struct { id: u8, idx: u16 = 0, kind: Kind = .plain, x: f32, y: f32, w: f32, h: f32 };
@@ -38,6 +44,7 @@ pub const Key = struct { code: u32, ch: u32, shift: bool, ctrl: bool };
 pub const App = struct {
     width: u32,
     height: u32,
+    place: Place = .center,
     layout: *const fn () void,
     paint: *const fn (cv: *draw.Canvas) void,
     /// click or Enter on a widget
@@ -50,6 +57,8 @@ pub const App = struct {
     key: ?*const fn (k: Key) bool = null,
     /// wheel over the card: +1 down, -1 up
     scroll: ?*const fn (dir: i32) void = null,
+    /// pointer pressed on a slider and moving; `final` — the button was released
+    drag: ?*const fn (w: Widget, x: f32, final: bool) void = null,
     /// a timer armed via setTimer
     tick: ?*const fn () void = null,
     /// input field by the field widget's index
@@ -59,6 +68,8 @@ pub const App = struct {
     /// an extra descriptor in the event loop (e.g. D-Bus)
     extra_fd: ?*const fn () i32 = null,
     on_extra: ?*const fn () void = null,
+    extra2_fd: ?*const fn () i32 = null,
+    on_extra2: ?*const fn () void = null,
     /// after the sandbox is on, before the first frame
     start: ?*const fn () void = null,
     /// before exiting: wipe secrets
@@ -109,6 +120,7 @@ const OKind = enum(u8) {
     data_device,
     cursor_mgr,
     cursor_dev,
+    frame,
 };
 
 var conn: wl.Conn = .{};
@@ -170,6 +182,16 @@ var card: Surf = .{}; // owner 0
 var back: Surf = .{}; // owner 1 — the dimming, catches clicks around the card
 var back_buffer: u32 = 0;
 var back_viewport: u32 = 0;
+
+var card_viewport: u32 = 0;
+var card_started = false; // the first frame went out
+var card_slide: ?anim.Slide = null;
+var card_frame_pending = false;
+var card_last_step: u64 = 0;
+var closing = false;
+var dragging: ?Widget = null;
+/// Frame callbacks may not come for a surface being moved off screen: time moves the slide on then.
+const SLIDE_FALLBACK_MS: u64 = 33;
 
 var km: xkb.Keymap = .{};
 var mods: u32 = 0;
@@ -294,18 +316,26 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
         if (card.configured and card.dirty) render();
         conn.flush() catch fatal("writing to the Wayland socket");
         const xfd: i32 = if (app.extra_fd) |f| f() else -1;
-        var fds = [6]sys.PollFd{
+        const xfd2: i32 = if (app.extra2_fd) |f| f() else -1;
+        var fds = [7]sys.PollFd{
             .{ .fd = conn.fd, .events = sys.POLLIN },
             .{ .fd = app_timer, .events = sys.POLLIN },
             .{ .fd = repeat_timer, .events = sys.POLLIN },
             .{ .fd = lock_fd, .events = sys.POLLIN },
             .{ .fd = theme.inotify_fd, .events = sys.POLLIN },
             .{ .fd = xfd, .events = sys.POLLIN },
+            .{ .fd = xfd2, .events = sys.POLLIN },
         };
-        _ = sys.poll(&fds, theme.timeout()) catch continue;
+        var timeout = theme.timeout();
+        if (card_slide != null) timeout = if (timeout < 0) SLIDE_FALLBACK_MS else @min(timeout, SLIDE_FALLBACK_MS);
+        _ = sys.poll(&fds, timeout) catch continue;
         if (fds[0].revents != 0) readWayland();
+        if (card_slide != null and sys.monoMs() -| card_last_step >= SLIDE_FALLBACK_MS) stepCardSlide();
         if (fds[5].revents != 0) {
             if (app.on_extra) |f| f();
+        }
+        if (fds[6].revents != 0) {
+            if (app.on_extra2) |f| f();
         }
         if (fds[1].revents != 0) {
             drainTimer(app_timer);
@@ -331,7 +361,71 @@ pub fn run(a: App, access: Access, comptime sb: Sandbox) noreturn {
 
 pub fn quit() noreturn {
     if (app.cleanup) |f| f();
+    slideAway();
     sys.exit(0);
+}
+
+fn slides() bool {
+    return viewporter != 0 and app.place != .center and cfg.menu_slide_ms > 0;
+}
+
+/// Shows `vis` rows of the card, as if the rest were still behind the panel: the source rectangle
+/// and the surface's size change, and the buffer stays as it is, so nothing is redrawn or copied.
+/// (The compositor places a surface by its configured size. Under a top panel that keeps the card's
+/// edge at the panel, a bottom panel needs the margin to follow.)
+fn cropCard(vis: i32) void {
+    const h: i32 = @intCast(card.h);
+    const w: i32 = @intCast(card.w);
+    const bottom = cfg.position == .bottom;
+    if (vis >= h) {
+        const unset: i32 = -256; // wl_fixed -1
+        conn.send(card_viewport, 1, .{ unset, unset, unset, unset }); // set_source
+        conn.send(card_viewport, 2, .{ @as(i32, -1), @as(i32, -1) }); // set_destination
+        if (bottom) setCardMargin(0);
+        return;
+    }
+    const src_y: i32 = if (bottom) 0 else h - vis;
+    conn.send(card_viewport, 1, .{ @as(i32, 0), src_y * 256, w * 256, vis * 256 });
+    conn.send(card_viewport, 2, .{ w, vis });
+    if (bottom) setCardMargin(vis - h);
+}
+
+fn requestCardFrame() void {
+    if (card_frame_pending) return;
+    card_frame_pending = true;
+    conn.send(card.surface, 3, .{create(.frame, 0)}); // wl_surface.frame
+}
+
+fn stepCardSlide() void {
+    const s = card_slide orelse return;
+    const now = sys.monoMs();
+    card_last_step = now;
+    sys.tracef("card slide: {d}", .{s.at(now)});
+    cropCard(s.at(now));
+    if (s.done(now)) card_slide = null else requestCardFrame();
+    conn.send(card.surface, 6, .{});
+}
+
+/// The card goes back the way it came. Nothing is read meanwhile: the process is on its way out.
+fn slideAway() void {
+    if (closing or !slides() or card.last == null) return;
+    closing = true;
+    const h: i32 = @intCast(card.h);
+    const s = anim.slide(h, 1, card.h, cfg.menu_slide_ms * 3 / 4, .in, sys.monoMs());
+    while (true) {
+        const now = sys.monoMs();
+        cropCard(s.at(now));
+        conn.send(card.surface, 6, .{});
+        conn.flush() catch return;
+        if (s.done(now)) return;
+        var none = [1]sys.PollFd{.{ .fd = -1, .events = 0 }};
+        _ = sys.poll(&none, 8) catch {};
+    }
+}
+
+/// The slider being dragged, if any.
+pub fn draggedId() u8 {
+    return if (dragging) |w| w.id else 0;
 }
 
 fn fatal(what: []const u8) noreturn {
@@ -455,6 +549,10 @@ fn dispatch(ev: wl.Event) void {
         .callback => if (ev.op == 0) {
             sync_done = true;
         },
+        .frame => if (ev.op == 0) {
+            card_frame_pending = false;
+            stepCardSlide();
+        },
         .seat => if (ev.op == 0) onSeatCaps(a.uint()),
         .pointer => onPointer(ev.op, &a),
         .keyboard => onKeyboard(ev.op, &a),
@@ -529,9 +627,32 @@ fn setupCard() void {
     // get_layer_surface(id, surface, output = any, layer = overlay, namespace)
     conn.send(layer_shell, 0, .{ card.layer, card.surface, @as(u32, 0), @as(u32, 3), wl.str(name) });
     conn.send(card.layer, 0, .{ app.width, app.height }); // set_size
-    conn.send(card.layer, 1, .{@as(u32, 0)}); // no anchors — centered
+    const edge: u32 = if (cfg.position == .bottom) 2 else 1; // bottom or top
+    const anchor: u32 = switch (app.place) {
+        .center => 0, // no anchors — centered
+        .top_right => edge | 8,
+        .top_center => edge,
+    };
+    conn.send(card.layer, 1, .{anchor});
+    if (app.place != .center) {
+        conn.send(card.layer, 2, .{@as(i32, -1)}); // margins count from the screen edge, whatever panels reserve
+        setCardMargin(0);
+        if (viewporter != 0) {
+            card_viewport = create(.viewport, 0);
+            conn.send(viewporter, 1, .{ card_viewport, card.surface });
+        }
+    }
     conn.send(card.layer, 4, .{@as(u32, 1)}); // keyboard: exclusive
     conn.send(card.surface, 6, .{});
+}
+
+/// Below the panel; `shift` moves it towards the screen edge the panel is on.
+fn setCardMargin(shift: i32) void {
+    const gap: i32 = @as(i32, @intCast(cfg.height)) + cfg.margin_edge + cfg.menu_gap;
+    const top: i32 = if (cfg.position == .top) gap + shift else 0;
+    const bottom: i32 = if (cfg.position == .bottom) gap + shift else 0;
+    const right: i32 = if (app.place == .top_right) cfg.margin_side else 0;
+    conn.send(card.layer, 3, .{ top, right, bottom, @as(i32, 0) }); // set_margin
 }
 
 fn setupBackdrop() void {
@@ -553,7 +674,8 @@ fn setupBackdrop() void {
 /// The dimming is one pixel stretched over the whole screen: almost no memory or GPU.
 fn paintBackdrop() void {
     if (!back.configured or back_viewport == 0) return;
-    const c = theme.t.menu_backdrop;
+    // a menu under the panel dims nothing: the surface is only there to catch clicks around the card
+    const c: u32 = if (app.place == .center) theme.t.menu_backdrop else 0;
     const a: u64 = c >> 24;
     if (back_buffer != 0) conn.send(back_buffer, 0, .{});
     back_buffer = 0;
@@ -684,6 +806,16 @@ fn render() void {
     } else {
         conn.send(card.surface, 2, .{ @as(i32, 0), @as(i32, 0), @as(i32, @intCast(card.w)), @as(i32, @intCast(card.h)) });
     }
+    if (!card_started) {
+        card_started = true;
+        if (slides()) {
+            // in the same commit as the first picture: the card must not flash at full size
+            card_last_step = sys.monoMs();
+            card_slide = anim.slide(1, @intCast(card.h), card.h, cfg.menu_slide_ms, .out, card_last_step);
+            cropCard(1);
+            requestCardFrame();
+        }
+    }
     conn.send(card.surface, 6, .{});
     card.bufs[k].busy = true;
     card.last = k;
@@ -802,11 +934,17 @@ fn onPointer(op: u16, a: *wl.Args) void {
         1 => { // leave
             ptr_on_card = false;
             setHover(.{});
+            endDrag();
         },
         2 => {
             _ = a.uint();
             ptr_x = a.fixed();
             ptr_y = a.fixed();
+            if (dragging) |w| {
+                if (app.drag) |f| f(w, ptr_x, false);
+                redraw();
+                return;
+            }
             if (kbd_nav) {
                 kbd_nav = false;
                 redraw();
@@ -818,7 +956,7 @@ fn onPointer(op: u16, a: *wl.Args) void {
             _ = a.uint();
             const btn = a.uint();
             const state = a.uint();
-            if (state == 1) onClick(btn);
+            if (state == 1) onClick(btn) else endDrag();
         },
         4 => { // axis
             _ = a.uint();
@@ -833,6 +971,13 @@ fn onPointer(op: u16, a: *wl.Args) void {
         },
         else => {},
     }
+}
+
+fn endDrag() void {
+    const w = dragging orelse return;
+    dragging = null;
+    if (app.drag) |f| f(w, ptr_x, true);
+    redraw();
 }
 
 fn hitAt(x: f32, y: f32) ?Widget {
@@ -881,8 +1026,16 @@ fn updateHover() void {
 
 fn onClick(btn: u32) void {
     if (!ptr_on_card) return quit(); // a click outside the card
+    if (card_slide != null) return; // still sliding: the pointer's coordinates aren't the widgets' yet
     const w = hitAt(ptr_x, ptr_y) orelse return;
     const right = btn == 0x111;
+    if (w.kind == .slider) {
+        if (right) return;
+        dragging = w;
+        if (app.drag) |f| f(w, ptr_x, false);
+        redraw();
+        return;
+    }
     if (focusable(w)) focus = .{ .id = w.id, .idx = w.idx };
     if (w.kind == .field) {
         if (fieldOf(w.idx)) |f| f.caret = f.len; // caret to the end of the field

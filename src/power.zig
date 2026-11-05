@@ -100,6 +100,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     const n: f32 = @floatFromInt(@max(nacts, 4));
     const width: u32 = @intFromFloat(2 * PAD + n * CELL + (n - 1) * GAP);
     ui.run(.{
+        .place = .top_right,
         .width = width,
         .height = 200,
         .layout = layout,

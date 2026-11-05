@@ -15,6 +15,7 @@ Every icon opens its own menu in the same style — and every menu has its own c
 | **zbg** | wallpaper daemon (instead of swaybg) | Wayland |
 | **zpower** | lock, log out, sleep, hibernate, reboot, power off | systemd-logind over D-Bus or doas/sudo rules, mango IPC |
 | **zcal** | calendar on a click on the clock | — |
+| **zctl** | sound, brightness and battery, also a command for hotkeys | the sound server's socket, the kernel, logind |
 
 ![netline panel](docs/panel.png)
 
@@ -26,6 +27,9 @@ Every icon opens its own menu in the same style — and every menu has its own c
 | mango tags | go to tag | toggleview |
 | Wheel over the panel | — | next / previous tag |
 | Clock (centered) | calendar **zcal** | — |
+| Sound | **zctl** menu | mute; wheel — volume |
+| Brightness | **zctl** menu | — ; wheel — brightness |
+| Battery and charge | **zctl** menu | — |
 | Wi‑Fi | **zwifi** menu | Wi‑Fi on/off |
 | Bluetooth | **zbt** menu | Bluetooth on/off |
 | Wallpaper | **zwall** picker | random wallpaper |
@@ -34,9 +38,33 @@ Every icon opens its own menu in the same style — and every menu has its own c
 Tags: active — a "pill", occupied — a bright dot, empty — a dim one, urgent — red.
 Can be switched to numbers (`tag_style = .numbers`).
 
+An item with nothing to show takes no room: no battery on a desktop, no backlight on an external monitor, no sound server running.
+
+## How the panel appears
+
+By default the panel behaves like the macOS menu bar (`panel_mode = .autohide`): windows get the whole screen,
+and the panel slides out when the pointer touches the screen edge and slides back when it leaves. It stays out while
+a menu opened from it is open, and comes out on its own for a moment when there's something to see:
+
+- volume or brightness changed, from the keys or anywhere else: a thin level bar appears next to the icons;
+- the power cable was plugged in or pulled, or the charge dropped to `battery_low`.
+
+`panel_mode = .always` keeps it on screen, with windows placed below it.
+
+The slide costs almost nothing, because nothing is redrawn: each display frame moves the surface the compositor already has
+(one small message per frame), and it follows the display's refresh rate, 60 Hz or 240 Hz alike. Hidden, the panel
+is a two-pixel transparent strip and a process asleep in `ppoll`. Nothing here polls the pointer.
+
+If mango's own layer animations are on, they would animate each step of the slide. Turn them off for the panel:
+
+```ini
+layer_rule=no_animation:1,layer_name:netline
+```
+
 ## Menus
 
-All menus work the same way: a card in the center of the screen with a light dimming around it.
+Menus for the panel's icons (Sound, Wi‑Fi, Bluetooth, Power, the calendar) slide out from under the panel, as in macOS, with no dimming.
+The launcher and the wallpaper picker are a card in the center of the screen with a light dimming around it.
 A click outside the card or `Esc` closes the menu, and so does another click on the icon.
 While a menu is closed, its program isn't running and uses nothing.
 Keyboard control: `Tab`/`Shift+Tab` — through buttons and fields, arrows — through lists, `Enter`, `Esc` — back/close.
@@ -177,11 +205,43 @@ If the command didn't take the system down in 4 s, the menu says "Not allowed �
 The month with "today" highlighted, weeks start on Monday, weekends are colored.
 `←`/`→` (or `PgUp`/`PgDn`, the wheel) — month, `↑`/`↓` — year, `Home` or a click on the month name — back to today.
 
+### Sound, brightness, battery: zctl
+
+Sliders for the volume and the brightness, the output's name, the charge with the time left and the power draw.
+`↑`/`↓` or the wheel over its slider — volume, `←`/`→` or the wheel — brightness, `M` or a click on the speaker — mute.
+A tile for something the machine doesn't have isn't there.
+
+It is also a command for hotkeys. A volume change takes 2.1 ms from start to exit, against 3.7 ms for `pactl` and 4.7 ms for `wpctl` (measured on the same aarch64 machine,
+process start included, against pipewire-pulse):
+
+```sh
+zctl vol +5      # also vol -5, vol 40; raising the volume unmutes
+zctl mute
+zctl bright +5   # also bright -5, bright 40
+zctl status      # the state as text, one line per item
+```
+
+**Sound** goes over the native socket of pipewire-pulse or PulseAudio (`$XDG_RUNTIME_DIR/pulse/native`), without libpulse, `pactl` or `wpctl`.
+The server reports changes, so nothing is polled. The volume stops at 100 %: there's no software amplification.
+
+**Brightness** is written to the kernel's file if it's writable (the `video` group, with the udev rule that `brightnessctl` or `light` installs), otherwise
+logind or elogind does it for the active session: no setuid helper and no root. The slider follows the eye (equal steps look equal) and never reaches zero, which on many panels
+switches the backlight off altogether. Only internal panels: external monitors have no `/sys/class/backlight` entry.
+
+**Battery** comes from `/sys/class/power_supply`. Several batteries count as one, weighted by their energy; a wireless mouse or
+headset (scope `Device`) doesn't count.
+
 ### Hotkeys in mango
 
 Every menu can also be opened from the keyboard, e.g. in `~/.config/mango/config.conf`:
 
 ```ini
+bind=NONE,XF86AudioRaiseVolume,spawn,zctl vol +5
+bind=NONE,XF86AudioLowerVolume,spawn,zctl vol -5
+bind=NONE,XF86AudioMute,spawn,zctl mute
+bind=NONE,XF86MonBrightnessUp,spawn,zctl bright +5
+bind=NONE,XF86MonBrightnessDown,spawn,zctl bright -5
+bind=SUPER,A,spawn,zctl
 bind=SUPER,D,spawn,zrun
 bind=SUPER,R,spawn,zrun run
 bind=SUPER,W,spawn,zwifi
@@ -194,8 +254,8 @@ bind=SUPER,C,spawn,zcal
 ## Colors
 
 Every item has its own color: panel background, border, highlight, launcher, each tag state, clock,
-Wi‑Fi (lit/unlit arcs, strike-through), Bluetooth (on/connected/off), wallpaper, power, the desktop color under the wallpaper
-and all menu colors.
+Wi‑Fi (lit/unlit arcs, strike-through), Bluetooth (on/connected/off), wallpaper, power, sound, brightness, battery (normal/low/charging), the level bar,
+the desktop color under the wallpaper and all menu colors.
 
 Two ways to change them:
 
@@ -226,15 +286,15 @@ the panel's vector digits, and the date is shown in numbers: `12.10.2026  13:31`
 The panel uses practically nothing while nothing changes (measured: 0 wakeups and 0 CPU ticks over 8 seconds idle).
 
 - **No once-a-second polling.** The clock is woken by a timer exactly at the minute boundary (`CLOCK_REALTIME`, re-armed when the clock is changed).
-  Wi‑Fi and Bluetooth are updated from kernel events: interface changes (netlink), rfkill/bluetooth uevents
-  and Bluetooth adapter power (the mgmt control channel, no root needed).
-- **The kernel drops unneeded events.** BPF filters are attached to the event sockets: the panel doesn't wake up for the battery
-  (an event for every percent of charge), USB, sound, backlight or Wi‑Fi scans — only for what
-  changes the icons. udevd signs the subsystem in its events with a hash (libudev filters the same way); without udevd the panel listens
-  to kernel events as before.
-- **The fallback poll runs only when needed**: every 30 s (`status_poll_s`) while Wi‑Fi is connected (signal level
-  sends no events), while there is no connection to mango, and if the kernel gave no mgmt channel for Bluetooth.
-  Otherwise the panel sleeps until an event.
+  Wi‑Fi, Bluetooth, power and backlight are updated from kernel events: interface changes (netlink), uevents
+  and Bluetooth adapter power (the mgmt control channel, no root needed). Volume comes from the sound server's own events.
+- **What sends no events costs no extra wakeups.** The Wi‑Fi signal and, on the many laptops that don't report it,
+  the battery percent are read when the clock wakes the panel anyway.
+- **The kernel drops unneeded events.** BPF filters are attached to the event sockets: the panel doesn't wake up for USB, sound devices
+  or Wi‑Fi scans — only for what changes the icons, and an item removed from `config.zig` takes its events with it. udevd signs the subsystem in its events with a
+  hash (libudev filters the same way); without udevd the panel listens to kernel events as before.
+- **The fallback poll runs only when needed**: every 60 s (`status_poll_s`) while there is no connection to mango or the sound server,
+  and if the kernel gave no netlink events or no mgmt channel for Bluetooth. Otherwise the panel sleeps until an event.
 - **Only what changed is drawn.** A new frame is compared to the previous one. If the pixels match, the compositor isn't touched at all.
   If not, only the changed rectangles are sent to it (when the minute changes — only the rectangle with the changed digits, not the whole panel).
   That's the minimum of work for both the CPU and the compositor's GPU.
@@ -248,8 +308,8 @@ The panel uses practically nothing while nothing changes (measured: 0 wakeups an
   Every line of `watch all-tags` is a full snapshot of all monitors, so of the lines that arrived together only the last one
   is parsed; monitors missing from the snapshot (unplugged) free their slot.
 - **Small binaries.** Our own panic handler instead of the standard one (stack printing and formatting),
-  buffers and zero-initialized tables in `.bss` (no space in the file, no memory until touched): all eight programs together
-  are about 1.5 MB (ReleaseSafe, x86_64), the panel in memory is ~0.9 MB
+  buffers and zero-initialized tables in `.bss` (no space in the file, no memory until touched): all nine programs together
+  are about 1.75 MB (ReleaseSafe, x86_64; the panel is 165 KB), the panel in memory is ~0.9 MB
   on a 1600-pixel-wide screen, 0.4 MB of which are the two frame buffers the compositor reads.
 
 Measured (aarch64, headless sway): 10 s idle — 0 wakeups and 0 µs of CPU; 400 mouse movements
@@ -354,20 +414,24 @@ is always opaque (XRGB). With a translucent background nothing extra is sent.
 
 The panel is split into two processes.
 
-**The broker** forks off first, before connecting to Wayland, and can do only three things:
+**The broker** forks off first, before connecting to Wayland, and can do only these things:
 - run a command from the table **built in at compile time** from `config.zig` (simple ones directly via `execve`,
-  ones with shell special characters via `/bin/sh -c`);
+  ones with shell special characters via `/bin/sh -c`), and say when a menu has closed;
 - send mango a `dispatch` of a strictly checked form (`viewcrossmon,N,MONITOR`, `view,N,0`, `toggleview,N`);
-- open the mango IPC socket and hand it to the panel.
+- open the mango IPC socket or the sound server's socket and hand it to the panel.
 
 **The panel** locks itself down after initialization:
 - **seccomp** — a system call allowlist. No `exec`, `fork`, `socket`, `connect`, `ptrace`, `mprotect`, and no signal
   handlers or masks (`rt_sigaction`, `rt_sigprocmask` — checked with strace: no program needs them once locked down).
   `mmap` is allowed only without `PROT_EXEC`, `openat` read-only, `ioctl` only the Bluetooth state request.
   Any other call kills the process immediately.
-- **Landlock** — read access only to `/sys`, `/proc`, tzdata and the theme folder. Writing is forbidden everywhere, TCP is forbidden,
-  signals and abstract sockets only within the sandbox.
+- **Landlock** — read access only to `/sys/class`, `/sys/devices`, the panel's own `/proc` entry, tzdata and the theme folder. Writing is forbidden everywhere, TCP is forbidden,
+  signals and abstract sockets only within the sandbox. The environment and command lines of your other programs in `/proc` stay out of reach.
 - `no_new_privs`, `dumpable=0` (no ptrace attach), running as root is not allowed.
+- **A random load address** on every start (static PIE), so an attacker who finds a memory bug doesn't know where the code to reuse is.
+
+The panel never changes anything itself: the volume and brightness keys and the wheel go through commands from the table above, so what a compromised panel could do to the
+sound server is limited to the socket it already holds, and it has no way to write the brightness at all.
 
 Even if a vulnerability is found in the panel, the compromised process can't launch a program (other than the ones you wrote in), open the network, write a file or read your keys.
 The broker is deliberately not sandboxed: the programs it launches (a terminal, sudo, the launcher) must work as usual.
@@ -378,6 +442,7 @@ the same seccomp without `exec`, `fork`, `socket`, `connect`, and Landlock where
 | | read | write |
 |---|---|---|
 | zwifi, zbt, zpower, zcal | theme folder | — |
+| zctl | theme folder, `/sys/class`, `/sys/devices` | — (the brightness file is opened up front, if allowed at all) |
 | zrun | theme folder and icon folders | — (the icon cache file is opened up front) |
 | zwall | theme and wallpaper folders | the thumbnail cache only |
 | zbg | theme and wallpaper folders | — (the choice file is opened up front) |
@@ -398,18 +463,20 @@ up to 2048×2048, so one huge PNG among them can't make the launcher take hundre
 broken files and "bombs" give an error, not a buffer overrun; they have been through mutation fuzzing.
 The font engine bounds composite glyphs (at most 64 outlines per glyph), so a crafted font can't hang the drawing.
 
-Parsing of all input data (the Wayland protocol, D-Bus, mango JSON, netlink, tzdata, the theme file, JPEG, PNG) is bounds-checked and protected against overflows.
+Parsing of all input data (the Wayland protocol, D-Bus, mango JSON, the sound server's protocol, netlink, tzdata, the theme file, JPEG, PNG) is bounds-checked and protected against overflows.
+Sending to the sound server never waits, so a server that hangs can't hang the panel.
 
 If the kernel has no Landlock, the programs run with seccomp alone and say so on stderr.
 A seccomp violation shows up in `dmesg` (`audit: type=1326 ... syscall=N`). For debugging the sandbox can be turned off: `sandbox = false` in `config.zig`.
 
 ## Requirements
 
-- **Zig 0.17** (tested on 0.17.0).
+- **Zig 0.17** (tested on 0.17.0 and 0.17.1).
 - **Linux ≥ 5.13** for Landlock (optional), x86_64, aarch64, riscv64.
 - **MangoWM ≥ 0.14** — IPC via `$MANGO_INSTANCE_SIGNATURE`. The old `dwl-ipc` was removed from mango in 0.15 and is not supported.
 - A TrueType font for the clock and menus (DejaVu Sans or Noto Sans are almost everywhere; path lists — `clock_font_paths` and `font_paths` in `config.zig`).
-- Services: **NetworkManager or iwd** (zwifi), **BlueZ** (zbt), **systemd-logind**, elogind or narrow doas/sudo rules (zpower).
+- Services: **NetworkManager or iwd** (zwifi), **BlueZ** (zbt), **systemd-logind**, elogind or narrow doas/sudo rules (zpower),
+  **pipewire-pulse or PulseAudio** (sound in the panel and zctl), logind/elogind or the `video` group's udev rule (brightness).
 - Programs: `swaylock` (or any other command in `lock_cmd`) and a terminal for `Shift+Enter` in zrun (`foot` by default).
   `rofi`, `nmcli`, `bluetoothctl` and `swaybg` are no longer needed.
 
@@ -476,10 +543,10 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 ```sh
-install -Dm755 zig-out/bin/zbg zig-out/bin/zbt zig-out/bin/zcal zig-out/bin/netline zig-out/bin/zpower zig-out/bin/zrun zig-out/bin/zwall zig-out/bin/zwifi -t ~/.local/bin/
+install -Dm755 zig-out/bin/zbg zig-out/bin/zbt zig-out/bin/zcal zig-out/bin/zctl zig-out/bin/netline zig-out/bin/zpower zig-out/bin/zrun zig-out/bin/zwall zig-out/bin/zwifi -t ~/.local/bin/
 ```
 
-`~/.local/bin` must be in `PATH` (in fish: `fish_add_path ~/.local/bin`). All eight programs must be
+`~/.local/bin` must be in `PATH` (in fish: `fish_add_path ~/.local/bin`). All nine programs must be
 in the same folder — the panel looks for the menus next to itself.
 
 `ReleaseSafe` keeps bounds checks at run time (extra protection for parsing files and network data)
@@ -558,11 +625,15 @@ The project used to be called zpanel. After installing netline:
 ## Configuration (`src/config.zig`)
 
 - `position` — `.top` / `.bottom`; `height`, `margin_edge`, `margin_side`, `radius`, `border_width` — geometry.
-- `left` / `right` — item order; the clock is always in the center.
-- `clock_format` — `.full` (default: `Mon, 12 October 2026  13:31`), `.hm`, `.hms` (wakes the panel every second) or `.date_hm`.
+- `left` / `right` — item order; the clock is always in the center. An item you remove takes its code and events with it.
+- `panel_mode` — `.autohide` (default) or `.always`; `slide_ms`, `menu_slide_ms` — how long the slides take (0 — no animation);
+  `reveal_delay_ms`, `hide_delay_ms`, `peek_ms`, `edge_strip` — see [How the panel appears](#how-the-panel-appears).
+- `battery_percent`, `battery_low` — the percent next to the icon; the charge at which the icon turns red.
+- `clock_format` — `.short` (default: `Mon 12 Oct  13:31`), `.full` (`Mon, 12 October 2026  13:31`), `.hm`, `.hms` (wakes the panel every second) or `.date_hm`.
 - `clock_size`, `clock_font_paths` — clock digit height and font (see [Clock font](#clock-font)).
 - `hover_effect` — highlight under the pointer.
-- `launcher`, `clock`, `wifi`, `bluetooth`, `wallpaper`, `power` — commands for the left/right/middle button.
+- `launcher`, `clock`, `sound`, `brightness`, `battery`, `wifi`, `bluetooth`, `wallpaper`, `power` — commands for the left/right/middle button and the wheel
+  (`left_is_menu = false` for a `left` that isn't a menu, otherwise an auto-hiding panel waits for it to end).
 - `font_paths`, `menu_width`, `menu_height`, `menu_radius` — menus.
 - `launcher_width`, `launcher_rows`, `launcher_icons`, `icon_theme`, `terminal` — the zrun launcher.
 - `wallpaper_dir`, `wallpaper_mode` — the wallpaper folder and how it's fitted.
@@ -570,7 +641,7 @@ The project used to be called zpanel. After installing netline:
 - `reboot_cmd`, `poweroff_cmd` (+ `*_fallback` if doas isn't installed) — reboot and power off without logind; `null` hides the buttons.
 - `bt_service_on_cmd`, `bt_service_off_cmd` — Bluetooth on demand: when bluetoothd isn't running, the zbt toggle (and
   `zbt toggle`) starts it with this command and waits for it; turning Bluetooth off stops it again. `null` — not used.
-- `status_poll_s`, `sandbox` — the fallback poll (only while Wi‑Fi is connected) and the sandbox.
+- `status_poll_s`, `sandbox` — the fallback poll (see [System load](#system-load)) and the sandbox.
 
 All programs must be in the same folder as `netline` (or in `PATH`) — the broker looks for them next to the panel.
 
@@ -589,6 +660,9 @@ src/
   img.zig      JPEG and PNG decoders (our own inflate) and high-quality scaling
   power.zig    zpower: logind actions, confirmations, locking
   cal.zig      zcal: calendar
+  ctl.zig      zctl: sound, brightness and battery, the menu and the command
+  audio.zig    client of the sound server's protocol (pipewire-pulse, PulseAudio)
+  anim.zig     the slide: easing, timing
   run.zig      zrun: apps and commands, icons, history, launch broker
   desktop.zig  .desktop and Exec parsing, search with highlighting, layout fixing (tests: zig test src/desktop.zig)
   dbus.zig     D-Bus client: authentication, marshalling, calls, async replies, signals, incoming calls
@@ -603,10 +677,23 @@ src/
   color.zig    color parsing
   draw.zig     antialiased rasterization (SDF), images, vector digits and icons
   mango.zig    mango tag stream + a tiny JSON tokenizer
-  status.zig   Wi‑Fi and Bluetooth from the kernel, netlink events
+  status.zig   Wi‑Fi, Bluetooth, battery and backlight from the kernel, netlink events
   tz.zig       TZif and POSIX TZ parsing
   config.zig   settings and default colors
+tests/
+  e2e.py       the panel and zctl under headless sway and a real sound server, on a fake /sys
+  vpointer.py  a pointer for it: a small Wayland client
 ```
+
+## Tests
+
+```sh
+zig build test
+```
+
+runs the unit tests: the sound server's protocol (with mutated and truncated packets), battery and brightness arithmetic, the slide, `.desktop` parsing.
+`tests/e2e.py` runs everything for real in a throwaway container, see [the workflow](.github/workflows/ci.yml): slides, the screen edge, the menu's sliders,
+real device events and sound servers, the sandbox being on, and that the hidden panel really wakes up zero times.
 
 ## License
 
