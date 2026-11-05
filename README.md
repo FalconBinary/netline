@@ -53,7 +53,8 @@ a menu opened from it is open, and comes out on its own for a moment when there'
 
 The slide costs almost nothing, because nothing is redrawn: each display frame moves the surface the compositor already has
 (one small message per frame), and it follows the display's refresh rate, 60 Hz or 240 Hz alike. Hidden, the panel
-is a two-pixel transparent strip and a process asleep in `ppoll`. Nothing here polls the pointer.
+is a two-pixel transparent strip and a process asleep in `ppoll`: nothing polls the pointer, and a change while it's hidden
+(the minute on the clock, say) draws nothing until the panel comes out.
 
 If mango's own layer animations are on, they would animate each step of the slide. Turn them off for the panel:
 

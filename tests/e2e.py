@@ -418,11 +418,24 @@ try:
     pointer.wheel(-1)
     check("the wheel over the sun raises the brightness", wait_for(lambda: int(read_fake("sys/class/backlight/test/brightness")) > light0, 2), read_fake("sys/class/backlight/test/brightness"))
 
-    # ------------------------------------------------------------ peek
+    # ------------------------------------------------------------ hidden, it doesn't draw
     pointer.move(W // 2, H // 2)
     wait_for(lambda: not panel_out(), 2.5)
     check("back in hiding", not panel_out(), "still out")
+    time.sleep(0.4)
+    mark = log.mark()
+    write_fake("sys/class/power_supply/BAT0/capacity", 8)
+    uevent("power_supply")
     time.sleep(0.3)
+    check("hidden, a change draws nothing", "frame" not in log.since(mark), log.since(mark)[-300:])
+    pointer.move(W // 2, 0)
+    check("and it is on the panel on the way out", wait_for(lambda: "frame" in log.since(mark), 1.5), log.since(mark)[-300:])
+    wait_for(panel_out, 1.5)
+    pointer.move(W // 2, H // 2)
+    wait_for(lambda: not panel_out(), 2.5)
+    time.sleep(0.3)
+
+    # ------------------------------------------------------------ peek
     run("pactl", "set-sink-volume", "@DEFAULT_SINK@", "33%")
     check("a volume change brings the panel out", wait_for(panel_out, 1.5), "stayed hidden")
     time.sleep(0.35)
@@ -504,7 +517,7 @@ try:
     print(out, flush=True)
     check("zctl status: sound", re.search(r"^sound \d+ on Test-Speakers", out, re.M), out)
     check("zctl status: brightness", re.search(r"^brightness 63 4000/10000 test", out, re.M), out)
-    check("zctl status: battery, not the mouse", re.search(r"^battery 7 charging", out, re.M), out)
+    check("zctl status: battery, not the mouse", re.search(r"^battery 8 charging", out, re.M), out)
 
     # ------------------------------------------------------------ the command
     zctl = os.path.join(args.bin, "zctl")
@@ -536,11 +549,11 @@ try:
     time.sleep(0.4)
     check("the panel survives the sound server stopping", panel.poll() is None, panel.poll())
     procs += start_sound()
-    mark = log.mark()
     # the panel retries once a second for a while after losing it
-    wait_for(lambda: "broker" in log.since(mark) or panel.poll() is not None, 3)
     time.sleep(12)
-    check("and finds the new server", "item sound" in log.since(mark), log.since(mark)[-300:])
+    wait_for(lambda: not panel_out(), 3)
+    run("pactl", "set-sink-volume", "@DEFAULT_SINK@", "61%")
+    check("and hears from the new server", wait_for(panel_out, 1.5), "no reaction to a volume change")
 
     # ------------------------------------------------------------ cost
     wait_for(lambda: not panel_out(), 3)

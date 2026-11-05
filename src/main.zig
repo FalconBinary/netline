@@ -256,7 +256,9 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     while (true) {
         for (&bars, 0..) |*b, i| {
-            if (b.used and b.configured and b.dirty) render(@intCast(i));
+            // hidden, nobody sees it: `dirty` stays set, and the frame is drawn on the way out
+            const hidden = b.started and !b.shown and b.slide == null;
+            if (b.used and b.configured and b.dirty and !hidden) render(@intCast(i));
         }
         conn.flush() catch fatal("writing to the Wayland socket");
 
@@ -521,7 +523,8 @@ noinline fn readWithoutEvents() void {
         }
     }
     refreshPower(true);
-    refreshLight(true);
+    // no level bar: the change may be a minute old by now, and the bar says "this just happened"
+    refreshLight(false);
 }
 
 fn armClock() void {
