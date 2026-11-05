@@ -208,6 +208,8 @@ The month with "today" highlighted, weeks start on Monday, weekends are colored.
 
 ### Sound, brightness, battery: zctl
 
+<img src="docs/zctl.png" alt="zctl under the panel" width="400">
+
 Sliders for the volume and the brightness, the output's name, the charge with the time left and the power draw.
 `↑`/`↓` or the wheel over its slider — volume, `←`/`→` or the wheel — brightness, `M` or a click on the speaker — mute.
 A tile for something the machine doesn't have isn't there.
