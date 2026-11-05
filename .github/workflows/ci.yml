@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build for every architecture, unit tests
+    runs-on: ubuntu-24.04
+    container: ghcr.io/void-linux/void-glibc-full:latest
+    env:
+      ZIG_VERSION: 0.17.1
+      ZIG_SHA256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+    steps:
+      - name: Tools
+        run: |
+          xbps-install -Syu xbps
+          xbps-install -Sy git tar xz curl
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Zig
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          echo "$ZIG_SHA256  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt/zig
+          tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+      - name: Unit tests
+        run: zig build test --summary all
+      - name: The programs, for each architecture
+        run: |
+          for target in x86_64-linux-none aarch64-linux-none riscv64-linux-none; do
+            zig build -Dtarget="$target" -Dcpu=baseline -Doptimize=ReleaseSafe --prefix "out/$target"
+          done
+          ls -l out/x86_64-linux-none/bin
+
+  e2e:
+    name: Under a real compositor and sound server (${{ matrix.server }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [pipewire, pulse]
+    container:
+      image: ghcr.io/void-linux/void-glibc-full:latest
+      # a compositor binary with a file capability; sending device events like the kernel does
+      options: --cap-add SYS_NICE --cap-add NET_ADMIN
+    env:
+      ZIG_VERSION: 0.17.1
+      ZIG_SHA256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
+    steps:
+      - name: Tools
+        run: |
+          xbps-install -Syu xbps
+          xbps-install -Sy git tar xz curl python3 sway grim pulseaudio pulseaudio-utils pipewire wireplumber procps-ng dejavu-fonts-ttf
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Zig
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          echo "$ZIG_SHA256  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt/zig
+          tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+      - name: Build with the test options
+        run: zig build -Doptimize=ReleaseSafe -Dtrace=true -Dtest_root=/tmp/netline-fake --prefix /opt/netline
+      - name: Run
+        run: |
+          chmod -R a+rX /opt/netline .
+          python3 tests/e2e.py --bin /opt/netline/bin --out /tmp/e2e --server ${{ matrix.server }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: e2e-${{ matrix.server }}
+          path: /tmp/e2e
