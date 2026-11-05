@@ -98,6 +98,43 @@ def uevent(subsystem):
     s.close()
 
 
+def murmur2(data):
+    """libudev's subsystem hash, written here apart from the panel's own."""
+    m = 0x5bd1e995
+    h = len(data) & 0xffffffff
+    i = 0
+    while len(data) - i >= 4:
+        k = struct.unpack_from("<I", data, i)[0]
+        k = (k * m) & 0xffffffff
+        k ^= k >> 24
+        k = (k * m) & 0xffffffff
+        h = (h * m) & 0xffffffff
+        h ^= k
+        i += 4
+    rest = data[i:]
+    if len(rest) == 3:
+        h ^= rest[2] << 16
+    if len(rest) >= 2:
+        h ^= rest[1] << 8
+    if len(rest) >= 1:
+        h ^= rest[0]
+        h = (h * m) & 0xffffffff
+    h ^= h >> 13
+    h = (h * m) & 0xffffffff
+    h ^= h >> 15
+    return h
+
+
+def udev_event(subsystem):
+    """What udevd broadcasts: the panel takes these when udevd is running, through a filter in the kernel."""
+    props = f"ACTION=change\0SUBSYSTEM={subsystem}\0".encode()
+    header = b"libudev\0" + struct.pack(">I", 0xfeedcafe) + struct.pack("<III", 40, 40, len(props))
+    header += struct.pack(">I", murmur2(subsystem.encode())) + struct.pack(">III", 0, 0, 0)
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 15)
+    s.sendto(header + props, (0, 2))
+    s.close()
+
+
 class Screen:
     """A screenshot as rows of (r, g, b)."""
 
@@ -107,11 +144,13 @@ class Screen:
         self.w, self.h, self.d = int(m[1]), int(m[2]), out[m.end():]
 
     def px(self, x, y):
-        i = (y * self.w + x) * 3
+        i = (y * args.scale * self.w + x * args.scale) * 3
         return tuple(self.d[i:i + 3])
 
     def band(self, x0, x1, y0, y1):
-        return b"".join(self.d[(y * self.w + x0) * 3:(y * self.w + x1) * 3] for y in range(y0, y1))
+        """Logical pixels, as everything else in this test."""
+        k = args.scale
+        return b"".join(self.d[(y * self.w + x0 * k) * 3:(y * self.w + x1 * k) * 3] for y in range(y0 * k, y1 * k))
 
     def save(self, name):
         with open(os.path.join(args.out, name + ".ppm"), "wb") as f:
@@ -194,7 +233,18 @@ def rss_kb(pid):
 
 
 def zctl_running():
-    return run("pgrep", "-x", "zctl").returncode == 0
+    """A finished one may linger as a zombie where PID 1 doesn't collect them, as in a CI container."""
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as f:
+                comm, state = re.match(r"\d+ \((.*)\) (\S)", f.read()).groups()
+        except OSError:
+            continue
+        if comm == "zctl" and state != "Z":
+            return True
+    return False
 
 
 def start_sound():
@@ -224,6 +274,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--bin", required=True)
 parser.add_argument("--out", default="/tmp/netline-e2e")
 parser.add_argument("--server", choices=["pulse", "pipewire"], default="pulse")
+parser.add_argument("--scale", type=int, default=1)
 args = parser.parse_args()
 
 os.makedirs(args.out, exist_ok=True)
@@ -236,7 +287,7 @@ os.chmod(args.out, 0o777)
 make_fake()
 
 with open(RUN + "/sway.conf", "w") as f:
-    f.write(f"output HEADLESS-1 mode {W}x{H} scale 1\nseat * hide_cursor 0\n")
+    f.write(f"output HEADLESS-1 mode {W * args.scale}x{H * args.scale} scale {args.scale}\nseat * hide_cursor 0\n")
 os.chown(RUN + "/sway.conf", UID, UID)
 
 procs = []
@@ -520,6 +571,54 @@ try:
     for _ in range(50):
         run(zctl, "vol", "50")
     print(f"zctl vol, through this test's process start: {(time.monotonic() - t0) * 1000 / 50:.1f} ms each", flush=True)
+
+    # ------------------------------------------------------------ with udevd, as on a real system
+    panel.terminate()
+    panel.wait(5)
+    procs.remove(panel)
+    os.makedirs("/run/udev", exist_ok=True)
+    open("/run/udev/control", "w").close()  # how the panel knows udevd is running
+    panel_log.close()
+    log_path = RUN + "/panel-udev.log"
+    panel_log = open(log_path, "w")
+    os.chmod(log_path, 0o666)
+    log = Log(log_path)
+    panel = spawn(os.path.join(args.bin, "netline"), stdout=panel_log, stderr=panel_log)
+    procs.append(panel)
+    pid = panel.pid
+    wait_for(panel_out, 3)
+    check("with udevd: the panel starts", wait_for(lambda: not panel_out(), 4), "not hidden")
+    time.sleep(0.4)
+
+    before = wakeups(pid)
+    for _ in range(20):
+        udev_event("usb")
+        udev_event("sound")
+        uevent("power_supply")  # the kernel's own form: udevd's listeners don't take these
+    time.sleep(0.5)
+    check("the kernel's filter drops other subsystems: not one wakeup", wakeups(pid) == before, wakeups(pid) - before)
+
+    pointer.move(W // 2, 0)
+    wait_for(panel_out, 1.5)
+    time.sleep(0.4)
+    pointer.move(W // 2, 20)
+    before = item_band("battery")
+    write_fake("sys/class/power_supply/BAT0/capacity", 42)
+    udev_event("power_supply")
+    time.sleep(0.4)
+    check("a battery event from udevd reaches the icon", item_band("battery") != before, "same pixels")
+    pointer.move(W // 2, H // 2)
+    wait_for(lambda: not panel_out(), 2.5)
+    time.sleep(0.3)
+    write_fake("sys/class/backlight/test/brightness", 7000)
+    udev_event("backlight")
+    check("a backlight event from udevd brings the panel out", wait_for(panel_out, 1.5), "stayed hidden")
+    wait_for(lambda: not panel_out(), 3)
+    before = wakeups(pid)
+    udev_event("rfkill")
+    time.sleep(0.2)
+    check("and rfkill still passes the filter", wakeups(pid) > before, "no wakeup")
+    check("the panel is running at the end", panel.poll() is None, panel.poll())
 finally:
     for p in reversed(procs):
         if p.poll() is None:
@@ -529,7 +628,7 @@ finally:
             p.wait(5)
         except subprocess.TimeoutExpired:
             p.kill()
-    for name in ("panel.log", "sway.log"):
+    for name in ("panel.log", "panel-udev.log", "sway.log"):
         if os.path.exists(os.path.join(RUN, name)):
             shutil.copy(os.path.join(RUN, name), args.out)
 

@@ -39,12 +39,15 @@ jobs:
           ls -l out/x86_64-linux-none/bin
 
   e2e:
-    name: Under a real compositor and sound server (${{ matrix.server }})
+    name: Under a real compositor and ${{ matrix.server }}, scale ${{ matrix.scale }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        server: [pipewire, pulse]
+        include:
+          - { server: pipewire, scale: 1 }
+          - { server: pulse, scale: 1 }
+          - { server: pipewire, scale: 2 }
     container:
       image: ghcr.io/void-linux/void-glibc-full:latest
       # a compositor binary with a file capability; sending device events like the kernel does
@@ -70,9 +73,9 @@ jobs:
       - name: Run
         run: |
           chmod -R a+rX /opt/netline .
-          python3 tests/e2e.py --bin /opt/netline/bin --out /tmp/e2e --server ${{ matrix.server }}
+          python3 tests/e2e.py --bin /opt/netline/bin --out /tmp/e2e --server ${{ matrix.server }} --scale ${{ matrix.scale }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: e2e-${{ matrix.server }}
+          name: e2e-${{ matrix.server }}-${{ matrix.scale }}
           path: /tmp/e2e
