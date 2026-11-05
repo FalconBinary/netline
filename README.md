@@ -43,8 +43,8 @@ An item with nothing to show takes no room: no battery on a desktop, no backligh
 ## How the panel appears
 
 By default the panel behaves like the macOS menu bar (`panel_mode = .autohide`): windows get the whole screen,
-and the panel slides out when the pointer touches the screen edge and slides back when it leaves. It stays out while
-a menu opened from it is open, and comes out on its own for a moment when there's something to see:
+and the panel slides out when the pointer touches the screen edge and slides back when it leaves. The icons can be clicked from the very edge of
+the screen. The panel stays out while a menu opened from it is open, and comes out on its own for a moment when there's something to see:
 
 - volume or brightness changed, from the keys or anywhere else: a thin level bar appears next to the icons;
 - the power cable was plugged in or pulled, or the charge dropped to `battery_low`.

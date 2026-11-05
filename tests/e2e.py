@@ -333,12 +333,12 @@ try:
     out = []
     for y in ys:
         out.append(y)
-        if y == 6:
+        if y == 0:
             break
     check("the slide out passes through many positions", len(set(out)) >= 8, out)
     check("the slide out only moves one way", out == sorted(out), out)
-    check("the slide ends at its place", out[-1:] == [6], out)
-    check("the slide back ends off screen", ys[-1:] == [-34], ys[-5:])
+    check("the slide ends at its place", out[-1:] == [0], out)
+    check("the slide back ends off screen", ys[-1:] == [-40], ys[-5:])
 
     # ------------------------------------------------------------ pointer
     moved = log.mark()
@@ -354,6 +354,13 @@ try:
     check("the slide takes the configured time", 0.2 <= span <= 0.35, f"{span:.3f} s, {len(steps)} steps")
     check("the frames follow the display", len(steps) >= 10, f"{len(steps)} steps in {span:.3f} s")
 
+    # a pointer pressed against the edge is above the panel's body: it must still count as on the panel,
+    # or the panel goes back, the strip brings it out, and so on forever
+    mark = log.mark()
+    for i in range(30):
+        pointer.move(W // 2 + (i % 3), 0)
+        time.sleep(0.05)
+    check("it stays with the pointer pressed against the edge", panel_out() and "slide" not in log.since(mark), log.since(mark)[-200:])
     pointer.move(W // 2, 20)
     time.sleep(0.8)
     check("it stays while the pointer is on it", panel_out(), "went away under the pointer")
@@ -398,6 +405,12 @@ try:
 
     # the wheel over an icon
     x = item_x("sound")
+    pointer.click(x, 0, BTN_RIGHT)  # from the very edge of the screen, above the icon
+    check("an icon can be clicked from the screen edge", wait_for(sink_mute, 2), "no reaction")
+    time.sleep(0.5)
+    pointer.click(x, 0, BTN_RIGHT)
+    wait_for(lambda: not sink_mute(), 2)
+    time.sleep(0.5)
     pointer.move(x, 20)
     time.sleep(0.2)
     start = sink_volume()

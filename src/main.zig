@@ -32,13 +32,18 @@ pub const std_options = rt.std_options;
 const MAX_BARS = mango.MAX_MONS;
 
 const autohide = cfg.panel_mode == .autohide;
-/// Rows of the surface below the panel (above it, for a bottom panel): transparent, they are what
-/// stays on screen when the panel is hidden, and they catch the pointer.
+/// The surface is more than the panel, with transparent rows on both sides of it:
+/// - the gap to the screen edge. It belongs to the surface so that a pointer pressed against the
+///   edge is on the panel: it can click the icons from there and, above all, doesn't leave the panel,
+///   which would send it back only for the strip to bring it out again, forever;
+/// - the strip on the far side: what stays on screen when the panel is hidden, and catches the pointer.
+const GAP: u32 = @intCast(cfg.margin_edge);
 const STRIP: u32 = if (autohide) cfg.edge_strip else 0;
-const STRIP_TOP: u32 = if (cfg.position == .bottom) STRIP else 0;
-const SHOWN_Y: i32 = cfg.margin_edge;
-const HIDDEN_Y: i32 = -@as(i32, @intCast(cfg.height));
-const SLIDE_PATH: u32 = @intCast(SHOWN_Y - HIDDEN_Y);
+const SURFACE_H: u32 = cfg.height + GAP + STRIP;
+const LEAD: u32 = if (cfg.position == .top) GAP else STRIP; // rows before the panel's own
+const SHOWN_Y: i32 = 0;
+const HIDDEN_Y: i32 = -@as(i32, @intCast(cfg.height + GAP));
+const SLIDE_PATH: u32 = cfg.height + GAP;
 /// Frame callbacks don't come for a surface that is fully off screen: time moves the slide on then.
 const SLIDE_FALLBACK_MS: u64 = 33;
 const LEVEL_W: f32 = 72;
@@ -169,7 +174,6 @@ var ready = false;
 
 var ptr_bar: ?u8 = null;
 var ptr_x: f32 = 0;
-var ptr_y: f32 = 0;
 var scroll_acc: f32 = 0;
 var last_click: [commands.len]?u32 = @as([commands.len]?u32, @splat(null));
 
@@ -387,7 +391,7 @@ noinline fn stepSlide(i: u8) void {
         if (!autohide and b.shown and !b.exclusive) {
             // only now: during the slide this would move the windows on every frame
             b.exclusive = true;
-            conn.send(b.layer, 2, .{@as(i32, @intCast(cfg.height))}); // exclusive zone
+            conn.send(b.layer, 2, .{@as(i32, @intCast(cfg.height + GAP))}); // exclusive zone
         }
     } else if (!b.frame_pending) {
         b.frame_pending = true;
@@ -829,7 +833,7 @@ fn onLayer(own: u8, op: u16, a: *wl.Args) void {
             conn.send(b.layer, 6, .{serial}); // ack_configure
             // clamp the sizes from the compositor to sane limits
             b.w = if (w > 0) @min(w, 16384) else 1280;
-            b.h = if (h > 0) @min(h, 512) else cfg.height + STRIP;
+            b.h = if (h > 0) @min(h, 512) else SURFACE_H;
             b.configured = true;
             b.dirty = true;
         },
@@ -853,7 +857,6 @@ fn onPointer(op: u16, a: *wl.Args) void {
             const serial = a.uint();
             const surf = a.uint();
             ptr_x = a.fixed();
-            ptr_y = a.fixed() - @as(f32, @floatFromInt(STRIP_TOP));
             ptr_bar = barBySurface(surf);
             if (cursor_dev != 0) conn.send(cursor_dev, 1, .{ serial, @as(u32, 1) }); // shape: default
             updateHover();
@@ -878,7 +881,6 @@ fn onPointer(op: u16, a: *wl.Args) void {
         2 => { // motion
             _ = a.uint();
             ptr_x = a.fixed();
-            ptr_y = a.fixed() - @as(f32, @floatFromInt(STRIP_TOP));
             updateHover();
         },
         3 => { // button
@@ -902,9 +904,12 @@ fn onPointer(op: u16, a: *wl.Args) void {
     }
 }
 
-fn hitAt(b: *const Bar, x: f32, y: f32) ?Hit {
+/// The panel is one row, and its whole height counts, up to the screen edge: the pointer thrown
+/// against the edge lands on the icon below it, as in the macOS menu bar.
+fn hitAt(b: *const Bar, x: f32) ?Hit {
+    if (!b.shown) return null;
     for (b.hits[0..b.nhits]) |h| {
-        if (x >= h.x and x < h.x + h.w and y >= h.y and y < h.y + h.h) return h;
+        if (x >= h.x and x < h.x + h.w) return h;
     }
     return null;
 }
@@ -925,7 +930,7 @@ fn setHover(i: u8, h: ?Hit) void {
 
 fn updateHover() void {
     const i = ptr_bar orelse return;
-    var h = hitAt(&bars[i], ptr_x, ptr_y);
+    var h = hitAt(&bars[i], ptr_x);
     if (h) |v| {
         if (v.item == .clock and cfg.clock.left == null and cfg.clock.right == null and cfg.clock.middle == null) h = null;
     }
@@ -938,7 +943,7 @@ const BTN_MIDDLE = 0x112;
 
 fn click(i: u8, button: u32, time: u32) void {
     const b = &bars[i];
-    const h = hitAt(b, ptr_x, ptr_y) orelse return;
+    const h = hitAt(b, ptr_x) orelse return;
     if (h.item == .tags) return tagClick(b, h.idx, button);
     const btn: u8 = switch (button) {
         BTN_LEFT => 0,
@@ -995,7 +1000,7 @@ fn scroll(i: u8, v: f32) void {
     const dir: i32 = if (scroll_acc > 0) 1 else -1;
     scroll_acc = 0;
     const b = &bars[i];
-    if (hitAt(b, ptr_x, ptr_y)) |h| {
+    if (hitAt(b, ptr_x)) |h| {
         if (actionIndex(h.item)) |action| {
             const slot = action * BUTTONS + @as(u8, if (dir < 0) WHEEL_UP else WHEEL_DOWN);
             if (commands[slot] != null) return broker.run(slot);
@@ -1022,7 +1027,7 @@ fn setupBar(i: u8) void {
     b.layer = create(.layer_surface, i);
     // get_layer_surface(id, surface, output, layer = top, namespace)
     conn.send(layer_shell, 0, .{ b.layer, b.surface, b.output, @as(u32, 2), wl.str("netline") });
-    conn.send(b.layer, 0, .{ @as(u32, 0), cfg.height + STRIP }); // set_size (the compositor sets the width)
+    conn.send(b.layer, 0, .{ @as(u32, 0), SURFACE_H }); // set_size (the compositor sets the width)
     const anchor: u32 = switch (cfg.position) {
         .top => 1 | 4 | 8,
         .bottom => 2 | 4 | 8,
@@ -1155,9 +1160,9 @@ fn render(i: u8) void {
     if (b.bufs[k].busy) return; // the compositor is still reading — finish after release
 
     layout(b);
-    // the panel's own rows: the strip stays as it was created, transparent
+    // the panel's own rows: the gap and the strip stay as they were created, transparent
     const whole = pixels(b, k);
-    const off = STRIP_TOP * b.scale;
+    const off = LEAD * b.scale;
     const rows = @min(cfg.height * b.scale, b.ph -| off);
     var cv = draw.Canvas{ .px = whole[off * b.pw ..][0 .. rows * b.pw], .w = @intCast(b.pw), .h = @intCast(rows) };
     paint(b, &cv);
@@ -1197,13 +1202,12 @@ fn render(i: u8) void {
 /// without its rounded corners — and doesn't draw or blend what is under it. Sent with the next commit,
 /// only when the size or the background's opacity changed.
 fn syncOpaque(b: *Bar) void {
-    // (the region starts at the surface's first row, and a bottom panel's strip is there)
-    const want = theme.solid(theme.t.background) and STRIP_TOP == 0;
+    const want = theme.solid(theme.t.background);
     if (want == b.opaque_on and (!want or (b.opaque_w == b.w and b.opaque_h == cfg.height))) return;
     b.opaque_on = want;
     b.opaque_w = b.w;
     b.opaque_h = cfg.height;
-    conn.setOpaque(compositor, b.surface, want, b.w, cfg.height, cfg.radius);
+    conn.setOpaque(compositor, b.surface, want, b.w, cfg.height, cfg.radius, LEAD);
 }
 
 fn sameTags(a: []const mango.Tag, b: []const mango.Tag) bool {

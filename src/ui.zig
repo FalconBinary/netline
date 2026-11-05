@@ -832,7 +832,7 @@ fn syncOpaque() void {
     card.solid = want;
     card.solid_w = card.w;
     card.solid_h = card.h;
-    conn.setOpaque(compositor, card.surface, want, card.w, card.h, cfg.menu_radius);
+    conn.setOpaque(compositor, card.surface, want, card.w, card.h, cfg.menu_radius, 0);
 }
 
 // ================================================================= widgets
