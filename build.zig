@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     // zig build test: the parts that can be checked without a compositor
     const test_step = b.step("test", "run the unit tests");
     const test_bin_step = b.step("test-bin", "only build them, into zig-out/bin (to run them on another machine)");
-    for ([_][]const u8{ "anim", "audio", "status", "desktop", "sandbox" }) |name| {
+    for ([_][]const u8{ "anim", "audio", "status", "desktop", "sandbox", "mango" }) |name| {
         const t = b.addTest(.{
             .name = b.fmt("test-{s}", .{name}),
             .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})), .target = target, .optimize = optimize }),

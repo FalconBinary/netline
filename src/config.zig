@@ -45,6 +45,15 @@ pub const hide_delay_ms: u32 = 400;
 pub const peek_ms: u32 = 1500;
 /// The invisible strip of the hidden panel on the screen edge that catches the pointer (logical pixels).
 pub const edge_strip: u32 = 2;
+/// Over a fullscreen window (a game, a video), with .autohide: the panel stays hidden, and pushing the
+/// pointer against the screen edge brings it out above the window, which keeps the whole screen.
+/// mango draws fullscreen windows above the panel's usual layer, so while one is on the screen the
+/// panel moves to the layer above (its strip, too, catches the pointer there); learned from the mango IPC.
+/// false — the panel stays under fullscreen windows.
+pub const over_fullscreen = true;
+/// Pointer on the edge for this long before the panel comes out over a fullscreen window: a game or a
+/// player used near the edge doesn't keep bringing it out.
+pub const fullscreen_reveal_delay_ms: u32 = 250;
 
 /// The percent next to the battery icon.
 pub const battery_percent = true;

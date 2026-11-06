@@ -32,6 +32,8 @@ pub const std_options = rt.std_options;
 const MAX_BARS = mango.MAX_MONS;
 
 const autohide = cfg.panel_mode == .autohide;
+/// Over a fullscreen window the panel waits in the overlay layer, hidden, for the pointer at the edge.
+const over_fullscreen = autohide and cfg.over_fullscreen;
 /// The surface is more than the panel, with transparent rows on both sides of it:
 /// - the gap to the screen edge. It belongs to the surface so that a pointer pressed against the
 ///   edge is on the panel: it can click the icons from there and, above all, doesn't leave the panel,
@@ -114,6 +116,7 @@ const Bar = struct {
     show_at: u64 = 0, // pointer on the edge: when to come out; 0 — not waiting
     hide_at: u64 = 0, // pointer gone: when to go back; 0 — not waiting
     exclusive: bool = false, // windows were told to keep clear (always mode, after the slide)
+    full: bool = false, // a fullscreen window is on this output: the panel is in the overlay layer
 
     fn monName(self: *const Bar) []const u8 {
         return self.mon_buf[0..self.mon_len];
@@ -164,6 +167,7 @@ var compositor: u32 = 0;
 var compositor_ver: u32 = 0;
 var shm: u32 = 0;
 var layer_shell: u32 = 0;
+var layer_shell_ver: u32 = 0;
 var seat: u32 = 0;
 var seat_ver: u32 = 0;
 var pointer: u32 = 0;
@@ -239,7 +243,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (b.used) setupBar(@intCast(i));
     }
 
-    if (mango.connect()) applyTags() else burst = 5; // mango may not have its IPC up yet — retry
+    if (mango.connect(over_fullscreen)) applyTags() else burst = 5; // mango may not have its IPC up yet — retry
     connectAudio();
     if (cfg.hasItem(.sound) and snd.fd < 0) burst = 10; // nor the sound server, it starts after the panel
     refreshPower(false);
@@ -266,17 +270,18 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
         conn.flush() catch fatal("writing to the Wayland socket");
 
-        var fds = [10]sys.PollFd{
+        var fds = [11]sys.PollFd{
             .{ .fd = conn.fd, .events = sys.POLLIN },
             .{ .fd = clock_timer, .events = sys.POLLIN },
             .{ .fd = poll_timer, .events = sys.POLLIN },
-            .{ .fd = mango.fd, .events = sys.POLLIN },
+            .{ .fd = mango.tagsFd(), .events = sys.POLLIN },
             .{ .fd = status.route_fd, .events = sys.POLLIN },
             .{ .fd = status.uevent_fd, .events = sys.POLLIN },
             .{ .fd = theme.inotify_fd, .events = sys.POLLIN },
             .{ .fd = status.mgmt_fd, .events = sys.POLLIN },
             .{ .fd = snd.fd, .events = sys.POLLIN },
             .{ .fd = broker.fd(), .events = sys.POLLIN },
+            .{ .fd = mango.wfd, .events = sys.POLLIN },
         };
         _ = sys.poll(&fds, pollTimeout()) catch continue;
         if (sys.tracing()) traceWake(&fds);
@@ -286,7 +291,15 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (fds[2].revents != 0) onPollTimer();
         if (fds[3].revents != 0 and mango.fd >= 0) {
             if (mango.onReadable()) applyTags();
-            if (mango.fd < 0) armPoll(); // mango closed the IPC — we'll reconnect
+        }
+        if (fds[10].revents != 0 and mango.wfd >= 0) {
+            const ch = mango.onWindowsReadable();
+            if (ch.tags) applyTags();
+            if (ch.fullscreen) applyFullscreen();
+        }
+        if ((fds[3].revents | fds[10].revents) != 0 and mango.fd < 0) {
+            applyFullscreen(); // nobody tells about fullscreen windows anymore
+            armPoll(); // mango closed the IPC — we'll reconnect
         }
         if (fds[4].revents != 0 or fds[5].revents != 0) {
             const ch = status.drainEvents(fds[4].revents != 0, fds[5].revents != 0);
@@ -426,7 +439,7 @@ noinline fn onMenusClosed(n: u32) void {
 
 /// NETLINE_TRACE: why the panel woke up (when idle there should be no lines except the clock).
 fn traceWake(fds: []const sys.PollFd) void {
-    const names = [_][]const u8{ " wayland", " clock", " poll", " mango", " net", " devices", " theme", " bluetooth", " sound", " broker" };
+    const names = [_][]const u8{ " wayland", " clock", " poll", " mango", " net", " devices", " theme", " bluetooth", " sound", " broker", " windows" };
     var buf: [128]u8 = undefined;
     var n: usize = 0;
     for (fds, names) |f, nm| {
@@ -583,7 +596,7 @@ fn onPollTimer() void {
         refreshPower(true);
         refreshLight(true);
     }
-    if (mango.fd < 0 and mango.connect()) applyTags();
+    if (mango.fd < 0 and mango.connect(over_fullscreen)) applyTags();
     connectAudio();
     armPoll();
 }
@@ -749,7 +762,8 @@ fn onGlobal(name: u32, iface: []const u8, ver: u32) void {
     } else if (eql(u8, iface, "wl_shm") and shm == 0) {
         shm = bind(name, iface, 1, .shm, 0);
     } else if (eql(u8, iface, "zwlr_layer_shell_v1") and layer_shell == 0) {
-        layer_shell = bind(name, iface, @min(ver, 3), .layer_shell, 0);
+        layer_shell_ver = @min(ver, 3);
+        layer_shell = bind(name, iface, layer_shell_ver, .layer_shell, 0);
     } else if (eql(u8, iface, "wl_seat") and seat == 0) {
         seat_ver = @min(ver, 5);
         seat = bind(name, iface, seat_ver, .seat, 0);
@@ -809,6 +823,7 @@ fn onOutput(own: u8, op: u16, a: *wl.Args) void {
             @memcpy(b.mon_buf[0..k], n[0..k]);
             b.mon_len = k;
             applyTags();
+            applyFullscreen();
         },
         else => {},
     }
@@ -862,8 +877,10 @@ fn onPointer(op: u16, a: *wl.Args) void {
             updateHover();
             if (autohide) {
                 if (ptr_bar) |i| {
-                    bars[i].hide_at = 0;
-                    if (!bars[i].shown) bars[i].show_at = sys.monoMs() + cfg.reveal_delay_ms;
+                    const b = &bars[i];
+                    b.hide_at = 0;
+                    const delay = if (b.full) cfg.fullscreen_reveal_delay_ms else cfg.reveal_delay_ms;
+                    if (!b.shown) b.show_at = sys.monoMs() + delay;
                 }
             }
         },
@@ -1232,6 +1249,24 @@ fn applyTags() void {
         b.tags = tags;
         b.ntags = n;
         b.dirty = true;
+    }
+}
+
+/// mango tells which outputs show a fullscreen window. mango draws such a window above the top layer,
+/// so the panel there moves to the overlay layer, and back once the window is gone; hidden or out, it
+/// goes on as before. Hidden, its strip on the edge is what catches the pointer above the window.
+/// An auto-hiding panel reserves no room: the window keeps the whole screen.
+fn applyFullscreen() void {
+    if (!over_fullscreen or layer_shell_ver < 2) return; // set_layer is in layer-shell v2
+    for (&bars, 0..) |*b, k| {
+        if (!b.used or b.layer == 0) continue;
+        const full = mango.fullscreen(b.monName());
+        if (full == b.full) continue;
+        b.full = full;
+        sys.tracef("layer {d}: {s}", .{ k, if (full) "overlay" else "top" });
+        conn.send(b.layer, 8, .{@as(u32, if (full) 3 else 2)}); // set_layer
+        // before its first frame the panel's own first commit carries it
+        if (b.started) conn.send(b.surface, 6, .{}); // commit
     }
 }
 

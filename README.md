@@ -51,6 +51,27 @@ the screen. The panel stays out while a menu opened from it is open, and comes o
 
 `panel_mode = .always` keeps it on screen, with windows placed below it.
 
+### Over a fullscreen window
+
+A game or a video in fullscreen keeps the whole screen: the panel stays hidden and reserves no room. Push the pointer
+against the panel's screen edge for a quarter of a second (`fullscreen_reveal_delay_ms`) and the panel comes out above the
+window, as it does on the desktop; when the pointer leaves, it goes back. A brush against the edge doesn't bring it out.
+The volume and brightness keys, the power cable and a low battery still bring it out for a moment, above the window.
+
+mango draws fullscreen windows above the `top` layer, where the panel lives, so the panel needs to know when one is there.
+It learns that from the mango IPC (`watch all-clients`: a visible window with `is_fullscreen`, per monitor) and moves to
+the `overlay` layer on that screen (`zwlr_layer_surface_v1.set_layer`), back to `top` once the window is gone or leaves fullscreen.
+Nothing else changes, so this costs nothing while there is no fullscreen window: mango sends the windows line right after
+the tags line the panel already listens to, from the same change, so the panel watches only the windows stream and reads
+the tags line along with it. That's one wakeup per change, as before. If a mango ever sent them in another order,
+the panel notices and watches both again.
+
+What it costs while a fullscreen window is on the screen: the panel's two-pixel strip on the edge is above the window, so
+the pointer in those two rows belongs to the panel and not to the game (a game that locks the pointer never gets there),
+and the compositor can't hand the window's frames to the display as they are (direct scanout): it draws the strip over
+each one. `over_fullscreen = false` leaves the panel under fullscreen windows. It's for `.autohide` only:
+`.always` stays under them too.
+
 The slide costs almost nothing, because nothing is redrawn: each display frame moves the surface the compositor already has
 (one small message per frame), and it follows the display's refresh rate, 60 Hz or 240 Hz alike. Hidden, the panel
 is a two-pixel transparent strip and a process asleep in `ppoll`: nothing polls the pointer, and a change while it's hidden
@@ -309,7 +330,8 @@ The panel uses practically nothing while nothing changes (measured: 0 wakeups an
   Text (the clock and the menus): a "character → glyph" cache, rasterized glyphs are cached, and a binary search over the font table (~40% faster).
 - **Tags are redrawn only if they changed** — the mango IPC also sends events for things the panel doesn't show.
   Every line of `watch all-tags` is a full snapshot of all monitors, so of the lines that arrived together only the last one
-  is parsed; monitors missing from the snapshot (unplugged) free their slot.
+  is parsed; monitors missing from the snapshot (unplugged) free their slot. The windows line of the same change
+  (`watch all-clients`, for fullscreen windows) comes right after it and wakes the panel for both: one wakeup, not two.
 - **Small binaries.** Our own panic handler instead of the standard one (stack printing and formatting),
   buffers and zero-initialized tables in `.bss` (no space in the file, no memory until touched): all nine programs together
   are about 1.75 MB (ReleaseSafe, x86_64; the panel is 165 KB), the panel in memory is ~0.9 MB
@@ -421,7 +443,7 @@ The panel is split into two processes.
 - run a command from the table **built in at compile time** from `config.zig` (simple ones directly via `execve`,
   ones with shell special characters via `/bin/sh -c`), and say when a menu has closed;
 - send mango a `dispatch` of a strictly checked form (`viewcrossmon,N,MONITOR`, `view,N,0`, `toggleview,N`);
-- open the mango IPC socket or the sound server's socket and hand it to the panel.
+- open the mango IPC sockets (`watch all-tags`, `watch all-clients`) or the sound server's socket and hand them to the panel.
 
 **The panel** locks itself down after initialization:
 - **seccomp** — a system call allowlist. No `exec`, `fork`, `socket`, `connect`, `ptrace`, `mprotect`, and no signal
@@ -679,13 +701,15 @@ src/
   theme.zig    theme file and its reloading (inotify)
   color.zig    color parsing
   draw.zig     antialiased rasterization (SDF), images, vector digits and icons
-  mango.zig    mango tag stream + a tiny JSON tokenizer
+  mango.zig    mango tag and window streams + a tiny JSON tokenizer (tests: zig build test)
   status.zig   Wi‑Fi, Bluetooth, battery and backlight from the kernel, netlink events
   tz.zig       TZif and POSIX TZ parsing
   config.zig   settings and default colors
 tests/
   e2e.py       the panel and zctl under headless sway and a real sound server, on a fake /sys
   vpointer.py  a pointer for it: a small Wayland client
+  window.py    a fullscreen window for it, over xdg-shell
+  fakemango.py the part of mango's IPC the panel uses, for the test under sway
 ```
 
 ## Tests

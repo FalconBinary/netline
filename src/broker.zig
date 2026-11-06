@@ -10,7 +10,8 @@
 //!                   special characters (quotes, |, ;, $ …) via /bin/sh -c;
 //!   'H' <number>  — the same, and tell the panel with 'E' when it ends (a menu is closed);
 //!   'D' <command> — send mango a `dispatch` of a strictly checked form;
-//!   'W'           — connect to the mango IPC and hand the panel the ready socket;
+//!   'W' / 'V'     — connect to the mango IPC and hand the panel the ready socket (`watch all-tags`);
+//!                   'V' adds a second one, `watch all-clients`, for fullscreen windows;
 //!   'A'           — connect to the sound server and hand the panel the ready socket.
 //! After that the panel itself lives in a sandbox without exec, fork, socket and connect:
 //! even if it is compromised, it can only run what you wrote into the config yourself.
@@ -139,31 +140,35 @@ pub fn dispatch(cmd: []const u8) void {
     sys.sendAll(sock, buf[0 .. cmd.len + 1]) catch {};
 }
 
-/// Ask the broker for a `watch all-tags` socket. -1 — mango is unavailable.
-pub fn requestWatch() i32 {
-    return request("W");
+/// Ask the broker for a `watch all-tags` socket and, with `windows`, a `watch all-clients` one.
+/// -1 — mango is unavailable, or this mango has no such watch.
+pub fn requestWatch(windows: bool) [2]i32 {
+    return request(if (windows) "V" else "W");
 }
 
 /// Ask the broker for a socket to the sound server. -1 — none is running.
 pub fn requestAudio() i32 {
-    return request("A");
+    return request("A")[0];
 }
 
-fn request(what: []const u8) i32 {
-    sys.sendAll(sock, what) catch return -1;
+fn request(what: []const u8) [2]i32 {
+    var out = [2]i32{ -1, -1 };
+    sys.sendAll(sock, what) catch return out;
     const deadline = sys.monoMs() + 1500;
     while (true) {
         const now = sys.monoMs();
-        if (now >= deadline) return -1;
+        if (now >= deadline) return out;
         var pfd = [1]sys.PollFd{.{ .fd = sock, .events = sys.POLLIN }};
         const ready = sys.poll(&pfd, @intCast(deadline - now)) catch continue;
-        if (ready == 0) return -1;
+        if (ready == 0) return out;
         var buf: [16]u8 = undefined;
-        var out: i32 = -1;
-        const n = sys.recvmsgFd(sock, &buf, &out) catch return -1;
-        if (n == 0) return -1;
+        var nfds: usize = 0;
+        const n = sys.recvmsgFds(sock, &buf, &out, &nfds) catch return out;
+        if (n == 0) return out;
         if (buf[0] == 'E') { // a menu closed while we were asking: not the answer
             done += 1;
+            for (out[0..nfds]) |f| sys.close(f);
+            out = .{ -1, -1 };
             continue;
         }
         return out;
@@ -188,7 +193,8 @@ fn serve(own: i32, cmds: []const ?Cmd) noreturn {
                 if (cmds[msg[1]]) |c| sys.spawnWatched(c.argv, c.shell, c.alt, own, "E") else sys.sendAll(own, "E") catch {};
             } else sys.sendAll(own, "E") catch {},
             'D' => if (validDispatch(msg[1..])) mangoDispatch(msg[1..]),
-            'W' => sendWatch(own),
+            'W' => sendWatch(own, false),
+            'V' => sendWatch(own, true),
             'A' => sendAudio(own),
             else => {},
         }
@@ -211,17 +217,38 @@ fn mangoDispatch(cmd: []const u8) void {
     _ = sys.read(s, &tmp) catch {};
 }
 
-fn sendWatch(own: i32) void {
-    const s = sys.connectUnix(mangoPath() orelse "") catch {
+fn sendWatch(own: i32, windows: bool) void {
+    const path = mangoPath() orelse "";
+    const tags = watch(path, "watch all-tags\n");
+    if (tags < 0) {
         _ = sys.sendmsgFds(own, "W", &.{}) catch {};
         return;
-    };
-    defer sys.close(s);
-    sys.sendAll(s, "watch all-tags\n") catch {
-        _ = sys.sendmsgFds(own, "W", &.{}) catch {};
+    }
+    defer sys.close(tags);
+    if (!windows) {
+        _ = sys.sendmsgFds(own, "W", &.{tags}) catch {};
         return;
+    }
+    // The tags watch is in place once its first line is there. Only then the windows watch: from
+    // then on every change brings a tags line, then a windows line (mango.zig counts on that).
+    var pfd = [1]sys.PollFd{.{ .fd = tags, .events = sys.POLLIN }};
+    _ = sys.poll(&pfd, 300) catch {};
+    const wins = watch(path, "watch all-clients\n");
+    if (wins < 0) {
+        _ = sys.sendmsgFds(own, "W", &.{tags}) catch {};
+        return;
+    }
+    defer sys.close(wins);
+    _ = sys.sendmsgFds(own, "W", &.{ tags, wins }) catch {};
+}
+
+fn watch(path: []const u8, cmd: []const u8) i32 {
+    const s = sys.connectUnix(path) catch return -1;
+    sys.sendAll(s, cmd) catch {
+        sys.close(s);
+        return -1;
     };
-    _ = sys.sendmsgFds(own, "W", &.{s}) catch {};
+    return s;
 }
 
 fn sendAudio(own: i32) void {

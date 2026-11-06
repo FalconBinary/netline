@@ -21,6 +21,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vpointer import Pointer, BTN_RIGHT  # noqa: E402
+from window import Window  # noqa: E402
+from fakemango import FakeMango  # noqa: E402
 
 W, H = 1280, 720
 FAKE = "/tmp/netline-fake"
@@ -644,6 +646,103 @@ try:
     udev_event("rfkill")
     time.sleep(0.2)
     check("and rfkill still passes the filter", wakeups(pid) > before, "no wakeup")
+
+    # ------------------------------------------------------------ over a fullscreen window
+    # sway, like mango, draws a fullscreen window above the panel's layer; mango's IPC is played here
+    panel.terminate()
+    panel.wait(5)
+    procs.remove(panel)
+    mango = FakeMango(RUN + "/mango.sock", "HEADLESS-1", UID)
+    os.environ["MANGO_INSTANCE_SIGNATURE"] = RUN + "/mango.sock"
+    panel_log.close()
+    log_path = RUN + "/panel-mango.log"
+    panel_log = open(log_path, "w")
+    os.chmod(log_path, 0o666)
+    log = Log(log_path)
+    panel = spawn(os.path.join(args.bin, "netline"), stdout=panel_log, stderr=panel_log)
+    procs.append(panel)
+    pid = panel.pid
+    wait_for(panel_out, 3)
+    check("with mango: the panel starts", wait_for(lambda: not panel_out(), 4), "not hidden")
+    check("and shows mango's tags", "tags" in items(log), items(log))
+    time.sleep(0.4)
+
+    # mango sends a tags line, then a windows line: the panel must wake for the pair once
+    mark = log.mark()
+    before = wakeups(pid)
+    for _ in range(20):
+        mango.changed(gap=0.005)
+        time.sleep(0.05)
+    time.sleep(0.2)
+    woke = wakeups(pid) - before
+    print(f"20 changes from mango: {woke} wakeups", flush=True)
+    check("a change from mango wakes the panel once, not once per stream", woke <= 21, woke)
+    check("a change of nothing it shows draws nothing", "frame" not in log.since(mark) and "layer" not in log.since(mark), log.since(mark)[-300:])
+
+    RED = (200, 40, 40)
+
+    def red(x, y):
+        return Screen().px(x, y) == RED
+
+    win = Window(display, RED)
+    check("a fullscreen window covers the screen", wait_for(lambda: red(*PROBE), 3), Screen().px(*PROBE))
+    pointer.move(W // 2, 0)
+    time.sleep(0.8)
+    check("the panel's usual layer is under it: the edge alone does nothing", red(*PROBE), Screen().px(*PROBE))
+    pointer.move(W // 2, H // 2)
+    time.sleep(0.3)
+
+    mark = log.mark()
+    mango.windows = [("game", True)]
+    mango.changed(gap=0.005)
+    check("mango says fullscreen: the panel moves above the window", wait_for(lambda: "layer 0: overlay" in log.since(mark), 2), log.since(mark)[-300:])
+    time.sleep(0.3)
+    check("hidden there: the window stays whole", red(*PROBE) and red(W // 2, 1), Screen().px(*PROBE))
+
+    pointer.move(W // 2, 0)
+    time.sleep(0.12)
+    pointer.move(W // 2, H // 2)
+    time.sleep(0.6)
+    check("a brush against the edge doesn't bring it out over the window", red(*PROBE), Screen().px(*PROBE))
+
+    t0 = time.monotonic()
+    pointer.move(W // 2, 0)
+    check("pushing the pointer against the edge brings it out above the window", wait_for(lambda: not red(*PROBE), 2), "no panel")
+    took = time.monotonic() - t0
+    check("after a moment, not at once", 0.2 <= took < 1.0, f"{took:.2f} s")
+    time.sleep(0.4)
+    Screen().save("9-over-fullscreen")
+    pointer.move(W // 2, 20)
+    time.sleep(0.6)
+    check("it stays while the pointer is on it", not red(*PROBE), "went away under the pointer")
+    pointer.move(W // 2, H // 2)
+    check("it goes back when the pointer leaves", wait_for(lambda: red(*PROBE), 2), Screen().px(*PROBE))
+    check("the window kept the whole screen", win.sizes[-1:] == [(W, H)], win.sizes)
+    time.sleep(1.0)
+    w0, c0 = wakeups(pid), cpu_ticks(pid)
+    time.sleep(3)
+    check("hidden over the window, the panel sleeps", wakeups(pid) - w0 <= 1 and cpu_ticks(pid) - c0 <= 1, f"{wakeups(pid) - w0} wakeups")
+
+    mark = log.mark()
+    mango.windows = [("game", False)]
+    mango.changed(gap=0.005)
+    check("the window leaves fullscreen: the panel goes back to its layer", wait_for(lambda: "layer 0: top" in log.since(mark), 2), log.since(mark)[-300:])
+    win.close()
+    mango.windows = []
+    mango.changed()
+    wait_for(lambda: not red(*PROBE), 2)
+    time.sleep(0.3)
+    pointer.move(W // 2, 0)
+    check("and comes out on the desktop as before", wait_for(panel_out, 1.5), "stayed hidden")
+
+    # a mango that sends the windows line first: the panel can't count on the order, and doesn't miss tags
+    pointer.move(W // 2, 20)
+    time.sleep(0.6)
+    mark = log.mark()
+    mango.active = 2
+    mango.changed(windows_first=True, gap=0.02)
+    check("lines in the other order: the tags still arrive at once", wait_for(lambda: "frame" in log.since(mark), 1), log.since(mark)[-300:])
+    pointer.move(W // 2, H // 2)
     check("the panel is running at the end", panel.poll() is None, panel.poll())
 finally:
     for p in reversed(procs):
@@ -654,7 +753,7 @@ finally:
             p.wait(5)
         except subprocess.TimeoutExpired:
             p.kill()
-    for name in ("panel.log", "panel-udev.log", "sway.log"):
+    for name in ("panel.log", "panel-udev.log", "panel-mango.log", "sway.log"):
         if os.path.exists(os.path.join(RUN, name)):
             shutil.copy(os.path.join(RUN, name), args.out)
 
