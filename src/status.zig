@@ -35,6 +35,7 @@ pub fn init() void {
     uevent_fd = openUevents();
     hci_sock = sys.socket(31, 3, 1) catch -1; // AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI
     mgmt_fd = openMgmt();
+    if (comptime cfg.hasItem(.wifi)) openNl80211();
 }
 
 // ---------------------------------------------------------------- filters
@@ -301,8 +302,10 @@ pub fn wifi() Wifi {
     return .{ .state = .connected, .level = signalLevel() };
 }
 
-/// Signal level 1..3 from link quality in /proc/net/wireless (usually out of 70).
+/// Signal level 1..3: from nl80211, or where that is missing from link quality in
+/// /proc/net/wireless (usually out of 70).
 pub fn signalLevel() u8 {
+    if (nl80211Signal()) |dbm| return levelOf(dbm);
     var buf: [2048]u8 = undefined;
     const d = sys.readFile("/proc/net/wireless", &buf) orelse return 3;
     var lines = std.mem.splitScalar(u8, d, '\n');
@@ -317,6 +320,189 @@ pub fn signalLevel() u8 {
         return if (pct >= 60) 3 else if (pct >= 30) 2 else 1;
     }
     return 3;
+}
+
+/// Link quality as /proc/net/wireless shows it, from the signal in dBm (cfg80211: dBm + 110,
+/// out of 70), so either way the bars mean the same.
+fn levelOf(dbm: i8) u8 {
+    const quality: u64 = @intCast(std.math.clamp(@as(i32, dbm) + 110, 0, 70));
+    const pct = quality * 100 / 70;
+    return if (pct >= 60) 3 else if (pct >= 30) 2 else 1;
+}
+
+// ---------------------------------------------------------------- nl80211
+
+// The signal of the access point, asked of nl80211 over generic netlink once a minute, when
+// the clock wakes the panel anyway. /proc/net/wireless goes through wireless extensions,
+// which the kernel warns about in its log ("uses wireless extensions which will stop working
+// for Wi-Fi 7 hardware") and which new drivers no longer have.
+
+var genl_fd: i32 = -1;
+var nl80211_id: u16 = 0;
+var genl_seq: u32 = 0;
+
+const NLMSG_ERROR = 2;
+const NLMSG_DONE = 3;
+const NLM_F_REQUEST = 1;
+const NLM_F_DUMP = 0x300;
+const GENL_ID_CTRL = 0x10;
+const CTRL_CMD_GETFAMILY = 3;
+const CTRL_ATTR_FAMILY_ID = 1;
+const CTRL_ATTR_FAMILY_NAME = 2;
+const NL80211_CMD_GET_STATION = 17;
+const NL80211_ATTR_IFINDEX = 3;
+const NL80211_ATTR_STA_INFO = 21;
+const NL80211_STA_INFO_SIGNAL = 7;
+const NL80211_STA_INFO_SIGNAL_AVG = 13;
+
+/// The socket and nl80211's family number, before the sandbox: it allows no new sockets.
+fn openNl80211() void {
+    const fd = sys.netlink(16, 0) catch return; // NETLINK_GENERIC
+    var msg: [32]u8 = undefined;
+    genl_seq +%= 1;
+    var reply: [4096]u8 = undefined;
+    const n = ask(fd, familyRequest(&msg, genl_seq), &reply) orelse {
+        sys.close(fd);
+        return;
+    };
+    nl80211_id = familyId(reply[0..n]) orelse {
+        sys.close(fd);
+        return;
+    };
+    genl_fd = fd;
+}
+
+/// One request and its answer. The kernel answers before send returns, so the socket stays
+/// non-blocking; what is left of a dump is read away, so the next answer starts clean.
+fn ask(fd: i32, request: []const u8, reply: []u8) ?usize {
+    drain(fd);
+    sys.sendAll(fd, request) catch return null;
+    const n = sys.read(fd, reply) catch return null;
+    drain(fd);
+    return n;
+}
+
+fn drain(fd: i32) void {
+    var spare: [4096]u8 = undefined;
+    while (sys.read(fd, &spare)) |got| {
+        if (got == 0) break;
+    } else |_| {}
+}
+
+fn nl80211Signal() ?i8 {
+    if (genl_fd < 0 or iface_len == 0) return null;
+    var path: [96]u8 = undefined;
+    var buf: [16]u8 = undefined;
+    const text = sys.readFile(sys.joinZ(&path, &.{ "/sys/class/net/", iface(), "/ifindex" }), &buf) orelse return null;
+    const ifindex = std.fmt.parseInt(u32, trim(text), 10) catch return null;
+    var msg: [32]u8 = undefined;
+    var reply: [4096]u8 = undefined;
+    genl_seq +%= 1;
+    const n = ask(genl_fd, stationRequest(&msg, nl80211_id, genl_seq, ifindex), &reply) orelse return null;
+    return stationSignal(reply[0..n]);
+}
+
+fn put16(b: []u8, at: usize, v: u16) void {
+    std.mem.writeInt(u16, b[at..][0..2], v, .little);
+}
+
+fn put32(b: []u8, at: usize, v: u32) void {
+    std.mem.writeInt(u32, b[at..][0..4], v, .little);
+}
+
+/// A netlink header, a generic netlink header and one attribute.
+fn genlRequest(buf: []u8, family: u16, flags: u16, seq: u32, cmd: u8, version: u8, attr: u16, value: []const u8) []const u8 {
+    const attr_len = 4 + value.len;
+    const total = 20 + ((attr_len + 3) & ~@as(usize, 3));
+    @memset(buf[0..total], 0);
+    put32(buf, 0, @intCast(total));
+    put16(buf, 4, family);
+    put16(buf, 6, flags);
+    put32(buf, 8, seq);
+    buf[16] = cmd;
+    buf[17] = version;
+    put16(buf, 20, @intCast(attr_len));
+    put16(buf, 22, attr);
+    @memcpy(buf[24..][0..value.len], value);
+    return buf[0..total];
+}
+
+fn familyRequest(buf: []u8, seq: u32) []const u8 {
+    return genlRequest(buf, GENL_ID_CTRL, NLM_F_REQUEST, seq, CTRL_CMD_GETFAMILY, 1, CTRL_ATTR_FAMILY_NAME, "nl80211\x00");
+}
+
+/// The stations of one interface: on a client, the access point it is connected to.
+fn stationRequest(buf: []u8, family: u16, seq: u32, ifindex: u32) []const u8 {
+    var index: [4]u8 = undefined;
+    std.mem.writeInt(u32, &index, ifindex, .little);
+    return genlRequest(buf, family, NLM_F_REQUEST | NLM_F_DUMP, seq, NL80211_CMD_GET_STATION, 0, NL80211_ATTR_IFINDEX, &index);
+}
+
+const Attr = struct { kind: u16, value: []const u8 };
+
+/// netlink attributes, one after the other, each padded to four bytes.
+const Attrs = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *Attrs) ?Attr {
+        if (self.pos + 4 > self.data.len) return null;
+        const len = std.mem.readInt(u16, self.data[self.pos..][0..2], .little);
+        const kind = std.mem.readInt(u16, self.data[self.pos + 2 ..][0..2], .little) & 0x3fff;
+        if (len < 4 or self.pos + len > self.data.len) return null;
+        const value = self.data[self.pos + 4 .. self.pos + len];
+        self.pos += (len + 3) & ~@as(usize, 3);
+        return .{ .kind = kind, .value = value };
+    }
+};
+
+/// The messages of a reply: the type of each and its attributes, after the generic netlink header.
+const Messages = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *Messages) ?struct { kind: u16, attrs: Attrs } {
+        if (self.pos + 20 > self.data.len) return null;
+        const len = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
+        const kind = std.mem.readInt(u16, self.data[self.pos + 4 ..][0..2], .little);
+        if (len < 16 or self.pos + len > self.data.len) return null;
+        const body = self.data[self.pos + @min(len, 20) .. self.pos + len];
+        self.pos += (len + 3) & ~@as(u32, 3);
+        return .{ .kind = kind, .attrs = .{ .data = body } };
+    }
+};
+
+fn familyId(reply: []const u8) ?u16 {
+    var msgs = Messages{ .data = reply };
+    while (msgs.next()) |m| {
+        if (m.kind == NLMSG_ERROR or m.kind == NLMSG_DONE) return null;
+        var attrs = m.attrs;
+        while (attrs.next()) |a| {
+            if (a.kind == CTRL_ATTR_FAMILY_ID and a.value.len >= 2) return std.mem.readInt(u16, a.value[0..2], .little);
+        }
+    }
+    return null;
+}
+
+/// The signal in dBm, the driver's average where it keeps one.
+fn stationSignal(reply: []const u8) ?i8 {
+    var msgs = Messages{ .data = reply };
+    while (msgs.next()) |m| {
+        if (m.kind == NLMSG_ERROR or m.kind == NLMSG_DONE) return null;
+        var attrs = m.attrs;
+        while (attrs.next()) |a| {
+            if (a.kind != NL80211_ATTR_STA_INFO) continue;
+            var info = Attrs{ .data = a.value };
+            var signal: ?i8 = null;
+            while (info.next()) |i| {
+                if (i.value.len < 1) continue;
+                if (i.kind == NL80211_STA_INFO_SIGNAL_AVG) return @bitCast(i.value[0]);
+                if (i.kind == NL80211_STA_INFO_SIGNAL) signal = @bitCast(i.value[0]);
+            }
+            if (signal) |dbm| return dbm;
+        }
+    }
+    return null;
 }
 
 pub fn bluetooth() Bt {
@@ -663,4 +849,60 @@ test "the event filter's jumps land on its two exits" {
     }
     try T.expectEqual(@as(u32, 0), udev_filter[n + 3].k);
     try T.expectEqual(KEEP, udev_filter[n + 4].k);
+}
+
+test "nl80211: the family is asked for by name, and its number read from the answer" {
+    var buf: [32]u8 = undefined;
+    const req = familyRequest(&buf, 7);
+    try std.testing.expectEqual(@as(usize, 32), req.len);
+    try std.testing.expectEqual(@as(u16, GENL_ID_CTRL), std.mem.readInt(u16, req[4..6], .little));
+    try std.testing.expectEqualStrings("nl80211\x00", req[24..32]);
+    // the answer: a header, the generic header, the name again and the number, 0x1c
+    var reply: [44]u8 = @splat(0);
+    put32(&reply, 0, 44);
+    put16(&reply, 4, GENL_ID_CTRL);
+    put16(&reply, 20, 12);
+    put16(&reply, 22, CTRL_ATTR_FAMILY_NAME);
+    @memcpy(reply[24..32], "nl80211\x00");
+    put16(&reply, 32, 6);
+    put16(&reply, 34, CTRL_ATTR_FAMILY_ID);
+    put16(&reply, 36, 0x1c);
+    try std.testing.expectEqual(@as(u16, 0x1c), familyId(&reply).?);
+    put16(&reply, 4, NLMSG_ERROR);
+    try std.testing.expect(familyId(&reply) == null);
+}
+
+test "nl80211: the station's signal, its average first, and the bars it makes" {
+    var buf: [32]u8 = undefined;
+    const req = stationRequest(&buf, 0x1c, 9, 3);
+    try std.testing.expectEqual(@as(usize, 28), req.len);
+    try std.testing.expectEqual(@as(u16, NLM_F_REQUEST | NLM_F_DUMP), std.mem.readInt(u16, req[6..8], .little));
+    try std.testing.expectEqual(@as(u8, NL80211_CMD_GET_STATION), req[16]);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, req[24..28], .little));
+    // STA_INFO holding SIGNAL -70 and SIGNAL_AVG -55, then the end of the dump
+    var reply: [60]u8 = @splat(0);
+    put32(&reply, 0, 40);
+    put16(&reply, 4, 0x1c);
+    put16(&reply, 20, 20); // STA_INFO, nested
+    put16(&reply, 22, NL80211_ATTR_STA_INFO | 0x8000);
+    put16(&reply, 24, 5);
+    put16(&reply, 26, NL80211_STA_INFO_SIGNAL);
+    reply[28] = @bitCast(@as(i8, -70));
+    put16(&reply, 32, 5);
+    put16(&reply, 34, NL80211_STA_INFO_SIGNAL_AVG);
+    reply[36] = @bitCast(@as(i8, -55));
+    put32(&reply, 40, 20);
+    put16(&reply, 44, NLMSG_DONE);
+    try std.testing.expectEqual(@as(i8, -55), stationSignal(&reply).?);
+    // without the average, the signal itself
+    put16(&reply, 34, 99);
+    try std.testing.expectEqual(@as(i8, -70), stationSignal(&reply).?);
+    // not connected: only the end of the dump
+    try std.testing.expect(stationSignal(reply[40..60]) == null);
+    // the same bars as /proc/net/wireless gave: quality dBm + 110, out of 70
+    try std.testing.expectEqual(@as(u8, 3), levelOf(-55));
+    try std.testing.expectEqual(@as(u8, 2), levelOf(-80));
+    try std.testing.expectEqual(@as(u8, 1), levelOf(-95));
+    try std.testing.expectEqual(@as(u8, 1), levelOf(-128));
+    try std.testing.expectEqual(@as(u8, 3), levelOf(-10));
 }

@@ -313,7 +313,9 @@ The panel uses practically nothing while nothing changes (measured: 0 wakeups an
   Wi‑Fi, Bluetooth, power and backlight are updated from kernel events: interface changes (netlink), uevents
   and Bluetooth adapter power (the mgmt control channel, no root needed). Volume comes from the sound server's own events.
 - **What sends no events costs no extra wakeups.** The Wi‑Fi signal and, on the many laptops that don't report it,
-  the battery percent are read when the clock wakes the panel anyway.
+  the battery percent are read when the clock wakes the panel anyway. The signal is asked of nl80211 over a netlink
+  socket opened before the sandbox, not read from `/proc/net/wireless`: that goes through wireless extensions, which
+  the kernel warns about in its log and new Wi‑Fi drivers no longer have. Without nl80211 the file is still read.
 - **The kernel drops unneeded events.** BPF filters are attached to the event sockets: the panel doesn't wake up for USB, sound devices
   or Wi‑Fi scans — only for what changes the icons, and an item removed from `config.zig` takes its events with it. udevd signs the subsystem in its events with a
   hash (libudev filters the same way); without udevd the panel listens to kernel events as before.
